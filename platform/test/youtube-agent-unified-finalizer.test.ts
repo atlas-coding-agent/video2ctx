@@ -62,7 +62,7 @@ function setup(responseIntent: 'context_answer' | 'clarification' | 'rejected', 
     finalize: vi.fn(async (_id, input) => buildAgentTurnResult(identity, { userId: 'user', creditsRemaining: 100 },
       input, cited ? [evidence] : [], 0)),
   };
-  return { options, decision, classifier, finalizer, output };
+  return { options, decision, classifier, finalizer, output, identity };
 }
 
 it.each(['context_answer', 'clarification', 'rejected'] as const)('routes %s through the finalizer without research', async intent => {
@@ -1442,7 +1442,7 @@ it.each(['supported_inline', 'inline_only_mismatch'] as const)('judges figures b
 });
 
 it('QA 027: the finalizer receives every retained playlist entry with its counts and may cite the last one', async () => {
-  const { options, finalizer } = setup('context_answer', true);
+  const { options, finalizer, identity } = setup('context_answer', true);
   const playlist: EvidencePacket = {
     packetId: 'packet:playlist', kind: 'youtube_playlist',
     sources: Array.from({ length: 12 }, (_, index) => ({ id: `youtube:playlist:PLcalc:v${String(index + 1).padStart(10, '0')}:${index}`,
@@ -1456,19 +1456,25 @@ it('QA 027: the finalizer receives every retained playlist entry with its counts
     continuation: 'page-two', warnings: [], usage: [],
   };
   options.conversationHistory = [{ ...options.conversationHistory![0]!, evidence: [playlist] }];
-  options.finalize = vi.fn(async (_id, input) => buildAgentTurnResult({ runId: options.runId, conversationId: options.conversationId,
-    userMessageId: options.userMessageId, agentMessageId: options.agentMessageId }, { userId: 'user', creditsRemaining: 100 }, input, [playlist], 0));
-  finalizer.doGenerate = async () => ({ content: [{ type: 'text', text: JSON.stringify({ confidence: 'medium', warnings: [], blocks: [{
-    text: 'Chapter 12 covers the fundamental theorem.', evidenceIds: ['ref_12'] }] }) }],
-  finishReason: { unified: 'stop', raw: 'stop' }, usage, warnings: [] });
+  vi.mocked(options.finalize).mockImplementation(async (_id, input) =>
+    buildAgentTurnResult(identity, { userId: 'user', creditsRemaining: 100 }, input, [playlist], 0));
+  // Replacing doGenerate bypasses the mock's own call recording, so record calls here.
+  const calls: typeof finalizer.doGenerateCalls = [];
+  finalizer.doGenerate = async call => {
+    calls.push(call);
+    return { content: [{ type: 'text', text: JSON.stringify({ confidence: 'medium', warnings: [], blocks: [{
+      text: 'Chapter 12 covers the fundamental theorem.', evidenceIds: ['ref_12'] }] }) }],
+    finishReason: { unified: 'stop', raw: 'stop' }, usage, warnings: [] };
+  };
   await executeResearchRun(options);
-  const prompt = JSON.stringify(finalizer.doGenerateCalls[0]!.prompt);
+  expect(calls).toHaveLength(1);
+  const prompt = JSON.stringify(calls[0]!.prompt);
   for (const topic of ['optimization', 'antiderivatives', 'riemann sums', 'fundamental theorem']) expect(prompt).toContain(topic);
   expect(prompt).toContain('All 12 entries retained in this packet are shown.');
   expect(prompt).toContain('18 more were not retained because of the agent item limit');
   expect(prompt).toContain('No provider-stated total is available');
   expect(prompt).not.toContain('page-two');
-  const format = finalizer.doGenerateCalls[0]!.responseFormat;
+  const format = calls[0]!.responseFormat;
   expect(JSON.stringify(format)).toContain('ref_12');
   expect(JSON.stringify(format)).not.toContain('ref_13');
   const result = await vi.mocked(options.finalize).mock.results[0]!.value;

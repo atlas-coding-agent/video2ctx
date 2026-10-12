@@ -942,7 +942,7 @@ async function runUnifiedFinalizer(options: {
           ].join('\n'),
           prompt: JSON.stringify({request:options.message,route:options.decision,
             conversationHistory:conversationHistoryForModel(options.conversationHistory),historyPage,
-            session:sessionBriefForModel(options.context.session!.brief()),evidence:prepared.evidence,
+            session:sessionBriefForModel(options.context.session!.brief()),evidence:prepared.evidence,evidenceOmittedFromContext:prepared.omitted,
             ...(options.prior && !historyOnly ? {priorEvidence:options.prior.pointers} : {})}),
           tools: traceToolSet(contextTools, options.context.traceToolCall),
           repairToolCall: traceToolCallRepair(options.context.traceToolCall),
@@ -1060,7 +1060,7 @@ async function runUnifiedFinalizer(options: {
           'Keep JSON compact. Use short ref_N citations rather than full evidence IDs. For specific-video comparisons cite every subject, or explicitly state the missing side and add ANSWER_SCOPE_SHORTFALL. If contextIncomplete is true, do not claim exhaustive coverage unless the supplied evidence establishes it.',
           'Recovery has a limited token budget. Preserve the requested count where evidence permits by shortening each item before reducing the count. If scope remains incomplete, state the shortfall and add ANSWER_SCOPE_SHORTFALL. Do not pad or invent findings.',
           'State important evidence gaps plainly. Do not claim that a failed provider operation succeeded.',
-          'For list evidence such as playlists, take counts from collection: entriesShown are the entries supplied here, and collection.coverage states what was not retained, not shown, or not stated by the provider. Never report fewer available entries than are shown. Describe unshown or unretained entries as a context limit, not as absent from the source. evidenceOmittedFromContext lists saved packets that did not fit at all.',
+          'For list evidence such as playlists, take counts from collection: entriesShown are the entries supplied here, and collection.coverage states what was not retained, not shown, or not stated by the provider. Never report fewer available entries than are shown. Describe unshown or unretained entries as a context limit, not as absent from the source. evidenceOmittedFromContext counts saved list packets that did not fit at all; notListed of them are counted but not named.',
           ...(currentDurationNotice() ? ['The application will prepend applicationDurationNotice to this answer. Do not repeat its duration or limit explanation. Answer the supported parts and retain required evidence-gap warnings. The notice is guardrail context, not evidence of video content.'] : []),
           'For visual questions, check each requested subject and attribute against analyzed image evidence, including every item in route.visualRequirements. Presenter names may come from introductions or on-screen labels; clothing requires visual observations. Identify missing subjects or attributes, add ANSWER_SCOPE_SHORTFALL for unanswered parts, and explain the actual failure or budget limit. Transcript silence does not establish that visual facts are unknowable. Never invent clothing details or imply images were inspected when only metadata was retrieved.',
           'If validationFeedback is present, repair the previousCandidate using its errors. Preserve valid content and return complete corrected JSON.',
@@ -1075,9 +1075,8 @@ async function runUnifiedFinalizer(options: {
           numberedItemCount,
           route: options.decision,
           evidence: prepared.evidence,
-          // Saved list packets that could not fit even as counts. Bounded and outside the evidence budget.
-          evidenceOmittedFromContext: prepared.omitted.length ? prepared.omitted.slice(0, 20).map(({ kind, title, entriesRetained, reason }) =>
-            ({ kind, title, entriesRetained, reason })) : undefined,
+          // Saved list packets that could not fit even as counts. Budgeted together with evidence.
+          evidenceOmittedFromContext: prepared.omitted,
           applicationDurationNotice: currentDurationNotice() || undefined,
           providerFailures: groupedToolFailures(options.toolFailures).map(failure => failure.durationLimit
             ? { ...failure, message: 'VIDEO_TOO_LONG: Transcript retrieval exceeded the configured Agent duration limit.' } : failure),

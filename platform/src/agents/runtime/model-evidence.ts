@@ -82,13 +82,25 @@ export const modelEvidencePacketSchema = z.object({
 
 export type ModelEvidencePacket = z.infer<typeof modelEvidencePacketSchema>;
 
-/** A packet that could not fit the model budget even with no entries shown. */
+const OMITTED_TITLE_CHARACTERS = 120;
+
+/** A list packet that could not fit the model budget even with no entries shown. */
 export interface OmittedModelEvidence {
   packetId: string;
   kind: string;
   title?: string;
   entriesRetained: number;
+}
+
+/** Model-facing notice of omitted list packets. Budgeted together with the evidence. */
+export interface OmittedEvidenceNotice {
   reason: 'context_budget';
+  /** Every omitted packet, listed or not. */
+  packets: number;
+  entriesRetained: number;
+  listed: Array<{ kind: string; title?: string; entriesRetained: number }>;
+  /** Omitted packets counted above but not listed because the budget ran out. */
+  notListed: number;
 }
 
 /**
@@ -213,30 +225,28 @@ function collectionPacketForModel(
 }
 
 /**
- * Shows as many retained entries as fit with the packets already selected,
- * shortening entry text before dropping entries. Undefined means not even the
- * counts fit.
+ * Reduced forms of one entry-list packet, most complete first: every entry
+ * without the continuation, then shorter entry text, then fewer entries. The
+ * coverage text and warning make size non-monotonic in the entry count (zero
+ * entries can be larger than one), so callers must test each form in order.
  */
+function* collectionReductions(packet: EvidencePacket): Generator<ModelEvidencePacket> {
+  for (let shown = packet.excerpts.length; shown >= 0; shown -= 1) {
+    for (const textLimit of COLLECTION_TEXT_LIMITS) {
+      yield collectionPacketForModel(packet, { shown, textLimit, continuation: false });
+      // Text length is irrelevant once no entries are shown.
+      if (shown === 0) return;
+    }
+  }
+}
+
+/** The first, most complete, reduced form that fits. Undefined means not even the counts fit. */
 function fitCollectionPacket(
   packet: EvidencePacket,
   fits: (candidate: ModelEvidencePacket) => boolean,
 ): ModelEvidencePacket | undefined {
-  const retained = packet.excerpts.length;
-  let best: { packet: ModelEvidencePacket; shown: number } | undefined;
-  for (const textLimit of COLLECTION_TEXT_LIMITS) {
-    let low = 0;
-    let high = retained;
-    while (low <= high) {
-      const shown = Math.floor((low + high) / 2);
-      const candidate = collectionPacketForModel(packet, { shown, textLimit, continuation: false });
-      if (fits(candidate)) {
-        if (!best || shown > best.shown) best = { packet: candidate, shown };
-        low = shown + 1;
-      } else high = shown - 1;
-    }
-    if (best?.shown === retained) break;
-  }
-  return best?.packet;
+  for (const candidate of collectionReductions(packet)) if (fits(candidate)) return candidate;
+  return undefined;
 }
 
 export function evidencePacketsForModel(
@@ -246,33 +256,37 @@ export function evidencePacketsForModel(
   return projectEvidencePacketsForModel(packets, options).evidence;
 }
 
-/** Like evidencePacketsForModel, and also names entry-list packets that could not fit at all. */
-export function projectEvidencePacketsForModel(
-  packets: readonly EvidencePacket[],
-  options: { maxCharacters: number },
+/** Serialized length of `[...selected, candidate]`, from the length of `selected`. */
+function appendedLength(selectedLength: number, selectedCount: number, candidate: unknown): number {
+  return selectedLength + serializedLength(candidate) + (selectedCount ? 1 : 0);
+}
+
+function packEvidence(
+  prioritized: ReadonlyArray<{ source: EvidencePacket; packet: ModelEvidencePacket }>,
+  maxCharacters: number,
 ): { evidence: ModelEvidencePacket[]; omitted: OmittedModelEvidence[] } {
-  const projected = packets.map(packet => ({ source: packet, packet: evidencePacketForModel(packet) }));
-  const prioritized = [
-    ...projected.filter(({ packet }) => packet.transcriptAnalysis),
-    ...projected.filter(({ packet }) => !packet.transcriptAnalysis),
-  ];
   const selected: ModelEvidencePacket[] = [];
   const omitted: OmittedModelEvidence[] = [];
+  let selectedLength = serializedLength(selected);
+  const fits = (candidate: ModelEvidencePacket) => appendedLength(selectedLength, selected.length, candidate) <= maxCharacters;
+  const add = (candidate: ModelEvidencePacket) => {
+    selectedLength = appendedLength(selectedLength, selected.length, candidate);
+    selected.push(candidate);
+  };
 
   for (const { source, packet } of prioritized) {
-    if (serializedLength([...selected, packet]) <= options.maxCharacters) {
-      selected.push(packet);
+    if (fits(packet)) {
+      add(packet);
       continue;
     }
     if (packet.collection) {
-      const fitted = fitCollectionPacket(source, candidate => serializedLength([...selected, candidate]) <= options.maxCharacters);
-      if (fitted) selected.push(fitted);
+      const fitted = fitCollectionPacket(source, fits);
+      if (fitted) add(fitted);
       else omitted.push({
         packetId: source.packetId,
         kind: source.kind,
-        ...(source.artifacts[0]?.title ? { title: source.artifacts[0].title.slice(0, 200) } : {}),
+        ...(source.artifacts[0]?.title ? { title: source.artifacts[0].title.slice(0, OMITTED_TITLE_CHARACTERS) } : {}),
         entriesRetained: source.excerpts.length,
-        reason: 'context_budget',
       });
       continue;
     }
@@ -291,16 +305,63 @@ export function projectEvidencePacketsForModel(
       while (low <= high) {
         const count = Math.floor((low + high) / 2);
         const sample = candidate(count);
-        if (serializedLength([...selected, sample]) <= options.maxCharacters) { fitted = sample; low = count + 1; }
+        if (fits(sample)) { fitted = sample; low = count + 1; }
         else high = count - 1;
       }
-      if (fitted) { selected.push(fitted); continue; }
+      if (fitted) { add(fitted); continue; }
     }
     const reduced = reduceModelEvidencePacket(packet);
-    if (serializedLength([...selected, reduced]) <= options.maxCharacters) selected.push(reduced);
+    if (fits(reduced)) add(reduced);
   }
 
   return { evidence: selected, omitted };
+}
+
+/**
+ * Projects packets so that the evidence and the omission notice together fit
+ * `maxCharacters` (measured as their two JSON serializations). List packets
+ * that cannot fit even as counts are disclosed in `omitted` rather than dropped
+ * silently. The only exception is a budget below the minimal notice itself:
+ * evidence is then empty and the minimal count-only notice is still returned.
+ */
+export function projectEvidencePacketsForModel(
+  packets: readonly EvidencePacket[],
+  options: { maxCharacters: number },
+): { evidence: ModelEvidencePacket[]; omitted?: OmittedEvidenceNotice; omittedPackets: OmittedModelEvidence[] } {
+  const projected = packets.map(packet => ({ source: packet, packet: evidencePacketForModel(packet) }));
+  const prioritized = [
+    ...projected.filter(({ packet }) => packet.transcriptAnalysis),
+    ...projected.filter(({ packet }) => !packet.transcriptAnalysis),
+  ];
+  const unreserved = packEvidence(prioritized, options.maxCharacters);
+  if (!unreserved.omitted.length) return { evidence: unreserved.evidence, omittedPackets: [] };
+  // Reserve the largest minimal notice any omitted subset could need, then repack.
+  const collections = projected.filter(({ packet }) => packet.collection);
+  const reserve = serializedLength(omittedNotice(
+    collections.map(({ source }) => ({ packetId: source.packetId, kind: source.kind, entriesRetained: source.excerpts.length })), 0));
+  const packed = packEvidence(prioritized, Math.max(0, options.maxCharacters - reserve));
+  return {
+    evidence: packed.evidence,
+    omitted: packed.omitted.length ? omittedNotice(packed.omitted, options.maxCharacters - serializedLength(packed.evidence)) : undefined,
+    omittedPackets: packed.omitted,
+  };
+}
+
+/**
+ * Counts every omitted packet, and lists as many as fit `available`. The
+ * count of packets not listed is always stated.
+ */
+export function omittedNotice(packets: readonly OmittedModelEvidence[], available: number): OmittedEvidenceNotice {
+  const notice = (listed: number): OmittedEvidenceNotice => ({
+    reason: 'context_budget',
+    packets: packets.length,
+    entriesRetained: packets.reduce((total, packet) => total + packet.entriesRetained, 0),
+    listed: packets.slice(0, listed).map(({ kind, title, entriesRetained }) => ({ kind, ...(title ? { title } : {}), entriesRetained })),
+    notListed: packets.length - listed,
+  });
+  let listed = 0;
+  while (listed < packets.length && serializedLength(notice(listed + 1)) <= available) listed += 1;
+  return notice(listed);
 }
 
 function readTranscriptAnalysis(packet: EvidencePacket) {
@@ -382,9 +443,11 @@ export function finalizationEvidenceForModel(
   const evidence = projections.flatMap(projection => projection.evidence);
   // A packet shown for one comparison subject is not omitted overall.
   const shownPackets = new Set(evidence.map(packet => packet.packetId));
-  const omitted = [...new Map(projections.flatMap(projection => projection.omitted)
+  const omittedPackets = [...new Map(projections.flatMap(projection => projection.omittedPackets)
     .filter(packet => !shownPackets.has(packet.packetId))
     .map(packet => [packet.packetId, packet] as const)).values()];
+  // One notice for all subjects, sized to what the combined evidence leaves.
+  const omitted = omittedPackets.length ? omittedNotice(omittedPackets, maxCharacters - serializedLength(evidence)) : undefined;
   const included = new Set(evidence.flatMap(packet => [
     ...(packet.excerpts?.map(excerpt => excerpt.id) ?? []),
     ...(packet.transcriptAnalysis?.findings.flatMap(finding => finding.excerptIds) ?? []),
