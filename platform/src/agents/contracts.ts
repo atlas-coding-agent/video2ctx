@@ -209,6 +209,20 @@ export const finalizeAnswerInputSchema = z.object({
   warnings: z.array(agentWarningSchema).max(50).default([]),
 });
 
+/** The run's ledger settlement. creditsRemaining is the balance read when the run settled, never a later balance. */
+export const agentRunBillingSchema = z.object({
+  creditsCharged: z.number().int().nonnegative(),
+  creditsRemaining: z.number().int().nonnegative(),
+  /** Settled operations behind creditsCharged. Absent for runs settled before receipts existed. */
+  charges: z.array(z.object({
+    source: z.string().min(1).max(100),
+    operation: evidenceOperationSchema,
+    price: z.enum(['cached', 'fresh']),
+    credits: z.number().int().positive(),
+    videoId: z.string().max(100).optional(),
+  })).max(64).optional(),
+});
+
 export const agentTurnResultSchema = z.object({
   runId: z.string().uuid(),
   conversationId: z.string().uuid(),
@@ -220,18 +234,7 @@ export const agentTurnResultSchema = z.object({
   citations: z.array(agentCitationSchema),
   artifacts: z.array(agentArtifactSchema),
   warnings: z.array(agentWarningSchema),
-  billing: z.object({
-    creditsCharged: z.number().int().nonnegative(),
-    creditsRemaining: z.number().int().nonnegative(),
-    /** Settled operations behind creditsCharged. Absent for runs settled before receipts existed. */
-    charges: z.array(z.object({
-      source: z.string().min(1).max(100),
-      operation: evidenceOperationSchema,
-      price: z.enum(['cached', 'fresh']),
-      credits: z.number().int().positive(),
-      videoId: z.string().max(100).optional(),
-    })).max(64).optional(),
-  }),
+  billing: agentRunBillingSchema,
 });
 
 export const agentRequestSchema = z.object({
@@ -277,6 +280,7 @@ export type CitationReference = z.infer<typeof citationReferenceSchema>;
 export type AgentCitation = z.infer<typeof agentCitationSchema>;
 export type FinalizeAnswerInput = z.infer<typeof finalizeAnswerInputSchema>;
 export type AgentTurnResult = z.infer<typeof agentTurnResultSchema>;
+export type AgentRunBilling = z.infer<typeof agentRunBillingSchema>;
 export type AgentRequest = z.infer<typeof agentRequestSchema>;
 export type AgentAdmission = z.infer<typeof agentAdmissionSchema>;
 export type AgentRunReceipt = z.infer<typeof agentRunReceiptSchema>;

@@ -16,6 +16,8 @@ import { env, runInDurableObject } from 'cloudflare:test';
 import { expect, test, vi } from 'vitest';
 import { reserveAgentCredits, settleAgentCredits } from '../src/agents/runtime/billing';
 import { creditBalance } from '../src/lib/entitlements';
+import { compactAgentRun } from '../src/agents/response';
+import type { AgentRunView } from '../src/agents/agent-runtime-do';
 import { conversationModelMessages, type ConversationTurn } from '../src/agents/runtime/conversation-memory';
 import type { AgentTurnResult, FinalizeAnswerInput } from '../src/agents/contracts';
 
@@ -387,9 +389,13 @@ test('completed responses use the settled ledger balance, not their admission sn
   });
   // Another account operation consumes credits between admission and settlement.
   await reserveAgentCredits(env, userId, 'another-run');
-  expect(await runtime.getRun(runId)).toMatchObject({ result: { billing: {
+  const completed = await runtime.getRun(runId) as AgentRunView | null;
+  expect(completed).toMatchObject({ billingStatus: 'settled', result: { billing: {
     creditsCharged: 1, creditsRemaining: 977,
   } } });
+  // The run-level receipt is the same settlement, so existing result.billing readers are unaffected.
+  expect(completed?.billing).toEqual(completed?.result?.billing);
+  expect(compactAgentRun(completed!)).toMatchObject({ billingStatus: 'settled', billing: { creditsCharged: 1, creditsRemaining: 977 } });
 });
 
 test('deadline watchdog settles abandoned runs without restarting inference', async () => {

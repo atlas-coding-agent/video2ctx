@@ -4,7 +4,7 @@ import { researchVideoTarget } from './research/research-plan';
 import { z } from 'zod';
 import { ApiError } from '../lib/http';
 import {
-  agentArtifactSchema, agentCitationSchema, agentRunReceiptSchema, agentTurnResultSchema,
+  agentArtifactSchema, agentCitationSchema, agentRunBillingSchema, agentRunReceiptSchema, agentTurnResultSchema,
   agentWarningSchema, capabilityRouteDecisionSchema, researchCoverageSchema, type CapabilityRouteDecision, type AgentTurnResult,
 } from './contracts';
 import type { AgentRunView } from './agent-runtime-do';
@@ -43,7 +43,8 @@ export const compactAgentRunSchema = agentRunReceiptSchema.pick({
 }).extend({
   sessionId: z.string().uuid(),
   result: compactAgentResultSchema.optional(),
-  billing: agentTurnResultSchema.shape.billing.optional(),
+  billing: agentRunBillingSchema.optional().describe('Settled ledger receipt. Present for completed, failed and cancelled runs once billingStatus is settled, whether or not an answer was saved. creditsRemaining is the balance when the run settled, not the current balance.'),
+  billingStatus: z.enum(['pending', 'settled']).optional().describe('Terminal runs only. pending means the credit settlement is not recorded yet, so no final receipt is reported. A settled run from before receipts were stored for failed or cancelled runs may have no billing.'),
   error: z.string().optional(),
   diagnostics: agentRunReceiptSchema.pick({
     userMessageId: true, conversationTurn: true, modelStepCount: true, toolCallCount: true,
@@ -59,7 +60,8 @@ export function compactAgentRun(run: AgentRunView, include: AgentResponseOptions
     sessionId: run.conversationId,
     agentMessageId: run.agentMessageId,
     status: run.status,
-    ...(run.result ? { result: compactAgentResult(run.result, include, run.route), billing: run.result.billing } : {}),
+    ...(run.result ? { result: compactAgentResult(run.result, include, run.route) } : {}),
+    ...agentRunBilling(run),
     ...(run.error !== undefined ? { error: run.error } : {}),
     ...(include.includes('diagnostics') ? { diagnostics: {
       userMessageId: run.userMessageId, conversationTurn: run.conversationTurn,
@@ -67,6 +69,16 @@ export function compactAgentRun(run: AgentRunView, include: AgentResponseOptions
       extractions: run.extractionDiagnostics, extractionDiagnosticsTruncated: run.extractionDiagnosticsTruncated,
     } } : {}),
   });
+}
+
+/**
+ * Settled billing is independent of the answer. A pending settlement reports no receipt,
+ * because a stored answer's provisional billing is not final until the ledger settles.
+ */
+function agentRunBilling(run: AgentRunView) {
+  if (run.billingStatus === 'pending') return { billingStatus: 'pending' as const };
+  const billing = run.billing ?? run.result?.billing;
+  return { ...(billing ? { billing } : {}), ...(run.billingStatus ? { billingStatus: run.billingStatus } : {}) };
 }
 
 export function compactAgentResult(result: AgentTurnResult, include: AgentResponseOptions['include'] = [], route?: CapabilityRouteDecision) {
@@ -148,8 +160,9 @@ export function withSessionId<T extends { conversationId: string }>(value: T) {
 }
 
 export function legacyAgentRun(run: AgentRunView) {
-  const { result, ...receipt } = run;
-  return { ...withSessionId(receipt), ...(result ? { result: withSessionId(result) } : {}) };
+  const { result, billing: _billing, billingStatus: _billingStatus, ...receipt } = run;
+  // result.billing keeps its existing place; top-level billing also covers runs without a result.
+  return { ...withSessionId(receipt), ...(result ? { result: withSessionId(result) } : {}), ...agentRunBilling(run) };
 }
 
 export const publicAgentRunReceiptSchema = agentRunReceiptSchema.omit({ conversationId: true }).extend({ sessionId: z.string().uuid() });
