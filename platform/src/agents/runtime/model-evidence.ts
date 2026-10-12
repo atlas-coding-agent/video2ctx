@@ -8,9 +8,13 @@ import {
   evidenceSourceSchema,
   type EvidencePacket,
 } from '../contracts';
+import { isCollectionKind, modelCollection, modelCollectionSchema, readCollectionRetrieval } from './collection-coverage';
 
 const MODEL_EXCERPTS_PER_PACKET = 8;
 const MODEL_EXCERPT_CHARACTERS = 800;
+/** Entry text lengths tried before showing fewer list entries under a budget. */
+const COLLECTION_TEXT_LIMITS = [MODEL_EXCERPT_CHARACTERS, 300, 120] as const;
+const MODEL_WARNINGS = 50;
 const MODEL_ANALYSIS_SUMMARY_CHARACTERS = 2_000;
 const MODEL_ANALYSIS_FINDINGS = 20;
 const MODEL_ANALYSIS_FINDING_CHARACTERS = 600;
@@ -71,10 +75,21 @@ export const modelEvidencePacketSchema = z.object({
     title: z.string().min(1).max(500).optional(),
   })).max(10).optional(),
   continuation: z.string().max(4_000).optional(),
-  warnings: z.array(agentWarningSchema).max(50),
+  /** Entry-list coverage. Counts describe this projection, not the saved packet alone. */
+  collection: modelCollectionSchema.optional(),
+  warnings: z.array(agentWarningSchema).max(MODEL_WARNINGS),
 });
 
 export type ModelEvidencePacket = z.infer<typeof modelEvidencePacketSchema>;
+
+/** A packet that could not fit the model budget even with no entries shown. */
+export interface OmittedModelEvidence {
+  packetId: string;
+  kind: string;
+  title?: string;
+  entriesRetained: number;
+  reason: 'context_budget';
+}
 
 /**
  * Produces the evidence representation that a model may read. The full packet
@@ -112,6 +127,7 @@ export function evidencePacketForModel(packet: EvidencePacket): ModelEvidencePac
       warnings: packet.warnings,
     });
   }
+  if (isCollectionKind(packet.kind)) return collectionPacketForModel(packet);
 
   // One visual finding can have three frame citations. Keep each distinct
   // finding before adding duplicate observations at other timestamps.
@@ -158,20 +174,106 @@ function distinctVisualFindingsFirst(excerpts: EvidencePacket['excerpts']) {
   return [...values.flatMap(group => group.slice(0, 1)), ...values.flatMap(group => group.slice(1))];
 }
 
+/**
+ * Projects one entry-list packet. Every retained entry is shown unless `shown`
+ * lowers the count; counts and the coverage statement are recomputed for the
+ * exact entries emitted. Sources are kept only for shown entries.
+ */
+function collectionPacketForModel(
+  packet: EvidencePacket,
+  options: { shown?: number; textLimit?: number; continuation?: boolean } = {},
+): ModelEvidencePacket {
+  const retrieval = readCollectionRetrieval(packet);
+  const retained = packet.excerpts.length;
+  const shown = Math.max(0, Math.min(retained, options.shown ?? retained));
+  const textLimit = options.textLimit ?? MODEL_EXCERPT_CHARACTERS;
+  // get_playlist never accepted a continuation, including for packets saved before retrieval counts existed.
+  const accepted = retrieval?.continuationAccepted ?? packet.kind !== 'youtube_playlist';
+  const continuationShown = (options.continuation ?? true) && accepted && !!packet.continuation;
+  const excerpts = packet.excerpts.slice(0, shown).map(excerpt => ({
+    ...excerpt,
+    text: boundedText(excerpt.text, textLimit),
+  }));
+  const sourceIds = new Set(excerpts.map(excerpt => excerpt.sourceId));
+  const truncated = shown < retained ? [{
+    code: 'COLLECTION_CONTEXT_TRUNCATED',
+    message: `Only ${shown} of ${retained} retained list entries fit this context. The rest are saved but not shown.`,
+  }] : [];
+  return modelEvidencePacketSchema.parse({
+    packetId: packet.packetId,
+    kind: packet.kind,
+    assetVersions: packet.assetVersions,
+    sources: packet.sources.filter(source => sourceIds.has(source.id)),
+    excerpts,
+    artifacts: packet.artifacts.map(({ type, title }) => ({ type, title })),
+    continuation: continuationShown ? packet.continuation : undefined,
+    collection: modelCollection({ shown, retained, retrieval, continuationShown }),
+    warnings: [...truncated, ...packet.warnings].slice(0, MODEL_WARNINGS),
+  });
+}
+
+/**
+ * Shows as many retained entries as fit with the packets already selected,
+ * shortening entry text before dropping entries. Undefined means not even the
+ * counts fit.
+ */
+function fitCollectionPacket(
+  packet: EvidencePacket,
+  fits: (candidate: ModelEvidencePacket) => boolean,
+): ModelEvidencePacket | undefined {
+  const retained = packet.excerpts.length;
+  let best: { packet: ModelEvidencePacket; shown: number } | undefined;
+  for (const textLimit of COLLECTION_TEXT_LIMITS) {
+    let low = 0;
+    let high = retained;
+    while (low <= high) {
+      const shown = Math.floor((low + high) / 2);
+      const candidate = collectionPacketForModel(packet, { shown, textLimit, continuation: false });
+      if (fits(candidate)) {
+        if (!best || shown > best.shown) best = { packet: candidate, shown };
+        low = shown + 1;
+      } else high = shown - 1;
+    }
+    if (best?.shown === retained) break;
+  }
+  return best?.packet;
+}
+
 export function evidencePacketsForModel(
   packets: readonly EvidencePacket[],
   options: { maxCharacters: number },
 ): ModelEvidencePacket[] {
-  const projected = packets.map(evidencePacketForModel);
+  return projectEvidencePacketsForModel(packets, options).evidence;
+}
+
+/** Like evidencePacketsForModel, and also names entry-list packets that could not fit at all. */
+export function projectEvidencePacketsForModel(
+  packets: readonly EvidencePacket[],
+  options: { maxCharacters: number },
+): { evidence: ModelEvidencePacket[]; omitted: OmittedModelEvidence[] } {
+  const projected = packets.map(packet => ({ source: packet, packet: evidencePacketForModel(packet) }));
   const prioritized = [
-    ...projected.filter((packet) => packet.transcriptAnalysis),
-    ...projected.filter((packet) => !packet.transcriptAnalysis),
+    ...projected.filter(({ packet }) => packet.transcriptAnalysis),
+    ...projected.filter(({ packet }) => !packet.transcriptAnalysis),
   ];
   const selected: ModelEvidencePacket[] = [];
+  const omitted: OmittedModelEvidence[] = [];
 
-  for (const packet of prioritized) {
+  for (const { source, packet } of prioritized) {
     if (serializedLength([...selected, packet]) <= options.maxCharacters) {
       selected.push(packet);
+      continue;
+    }
+    if (packet.collection) {
+      const fitted = fitCollectionPacket(source, candidate => serializedLength([...selected, candidate]) <= options.maxCharacters);
+      if (fitted) selected.push(fitted);
+      else omitted.push({
+        packetId: source.packetId,
+        kind: source.kind,
+        ...(source.artifacts[0]?.title ? { title: source.artifacts[0].title.slice(0, 200) } : {}),
+        entriesRetained: source.excerpts.length,
+        reason: 'context_budget',
+      });
       continue;
     }
     if (packet.artifacts?.some(artifact => artifact.type === 'youtube_complete_transcript') && packet.excerpts?.length) {
@@ -198,7 +300,7 @@ export function evidencePacketsForModel(
     if (serializedLength([...selected, reduced]) <= options.maxCharacters) selected.push(reduced);
   }
 
-  return selected;
+  return { evidence: selected, omitted };
 }
 
 function readTranscriptAnalysis(packet: EvidencePacket) {
@@ -271,16 +373,22 @@ export function finalizationEvidenceForModel(
         })) } } : artifact),
     };
   });
-  const evidence = comparisonVideoIds.length
-    ? comparisonVideoIds.flatMap(videoId => evidencePacketsForModel(
+  const projections = comparisonVideoIds.length
+    ? comparisonVideoIds.map(videoId => projectEvidencePacketsForModel(
       compact.filter(packet => packet.sources.some(source => source.videoId === videoId)),
       { maxCharacters: Math.floor(maxCharacters / comparisonVideoIds.length) },
     ))
-    : evidencePacketsForModel(compact, { maxCharacters });
+    : [projectEvidencePacketsForModel(compact, { maxCharacters })];
+  const evidence = projections.flatMap(projection => projection.evidence);
+  // A packet shown for one comparison subject is not omitted overall.
+  const shownPackets = new Set(evidence.map(packet => packet.packetId));
+  const omitted = [...new Map(projections.flatMap(projection => projection.omitted)
+    .filter(packet => !shownPackets.has(packet.packetId))
+    .map(packet => [packet.packetId, packet] as const)).values()];
   const included = new Set(evidence.flatMap(packet => [
     ...(packet.excerpts?.map(excerpt => excerpt.id) ?? []),
     ...(packet.transcriptAnalysis?.findings.flatMap(finding => finding.excerptIds) ?? []),
   ]));
   for (const [full, short] of aliases) if (included.has(short)) fullIds.set(short, full);
-  return { evidence, fullIds };
+  return { evidence, fullIds, omitted };
 }

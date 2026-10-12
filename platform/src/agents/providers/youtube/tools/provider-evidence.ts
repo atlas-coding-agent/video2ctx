@@ -1,4 +1,5 @@
 import { isDataOperation, retrievalUsage } from '../../../runtime/evidence-billing';
+import { collectionRetrieval } from '../../../runtime/collection-coverage';
 import type { SearchResult, SourceMetadata } from 'all-things-youtube';
 import { z } from 'zod';
 import type { DataOperation, MeteredCacheStatus } from '../../../../lib/metering';
@@ -128,6 +129,8 @@ export function entityListPacket(options: {
   warnings: EvidencePacket['warnings'];
   artifactType: string;
   artifactData: Record<string, unknown>;
+  /** Every current entity-list tool accepts the continuation it returns. */
+  continuationAccepted?: boolean;
 }): Omit<EvidencePacket, 'packetId' | 'usage'> {
   const results = options.results.slice(0, MAX_PROVIDER_ITEMS);
   const sources = results.map((result, index) => ({
@@ -155,6 +158,12 @@ export function entityListPacket(options: {
         ...options.artifactData,
         resultCount: results.length,
         candidates: results.map(entityArtifact),
+        collection: collectionRetrieval({
+          fetchedCount: options.results.length,
+          retainedCount: results.length,
+          continuation: options.continuation,
+          continuationAccepted: options.continuationAccepted ?? true,
+        }),
       },
     }],
     continuation: options.continuation,

@@ -4,6 +4,7 @@ import { tool } from 'ai';
 import { z } from 'zod';
 import { dataOperationCost } from '../../../../lib/metering';
 import { evidencePacketSchema, type EvidencePacket } from '../../../contracts';
+import { collectionRetrieval } from '../../../runtime/collection-coverage';
 import type { AgentToolContext } from '../tool-context';
 
 const MAX_RESULTS = 12;
@@ -103,6 +104,13 @@ export function executeSearchYouTube(
             query: parsed.query,
             resultCount: results.length,
             candidates: results.map((result) => candidateArtifact(result)),
+            collection: collectionRetrieval({
+              fetchedCount: response.value.results.length,
+              excludedCount: omitted,
+              retainedCount: results.length,
+              continuation: response.value.continuation,
+              continuationAccepted: true,
+            }),
           },
         }],
         continuation: response.value.continuation,
