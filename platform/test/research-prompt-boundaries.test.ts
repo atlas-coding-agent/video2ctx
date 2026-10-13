@@ -22,9 +22,12 @@ describe('research and answer responsibilities', () => {
     expect(finalizationAnswerGuidance(route)).toContain('For a detailed report, use compact sections');
   });
   it('gives every answer builder the same list-order rule, and keeps it out of evidence collection', () => {
-    expect(LIST_ORDER_GUIDANCE).toContain('State a playlist position, adjacency or order as fact only when cited evidence states it');
-    expect(LIST_ORDER_GUIDANCE).toContain('Supported chapter labels and chronology stated in cited evidence may be reported as order.');
+    expect(LIST_ORDER_GUIDANCE).toContain('only when cited evidence about that playlist states it');
+    expect(LIST_ORDER_GUIDANCE).toContain('establishes order only within that series, course or event');
+    expect(LIST_ORDER_GUIDANCE).toContain('because a playlist can be reordered or shuffled');
+    expect(LIST_ORDER_GUIDANCE).toContain('unless other cited evidence about that playlist states it');
     expect(LIST_ORDER_GUIDANCE).toContain('Never present a suggestion as the playlist\'s order.');
+    expect(LIST_ORDER_GUIDANCE).not.toContain('chronology stated in cited evidence may be reported as order');
     const answerPrompts = {
       inspectNatural: inspectVideoInstructions('finalize_answer'),
       topicNatural: researchTopicInstructions('finalize_answer'),

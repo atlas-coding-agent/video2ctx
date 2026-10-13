@@ -1485,20 +1485,51 @@ it('QA 027: the finalizer receives every retained playlist entry with its counts
   expect(result.answer).not.toMatch(/\b30 videos in total|\b8 (?:videos|entries) (?:are )?available/);
 });
 
-it('BCON: the finalizer gets the list-order rule and an accurate note promise, but an unsupported order claim is not rejected', async () => {
-  const { options, finalizer, identity } = setup('context_answer', true);
-  const talks = ['SciExplorer', 'Geometry Nodes Workshop', 'Grease Pencil Update', 'Studio Pipeline', 'Cycles Roadmap', 'EEVEE Next',
-    'Animation 2025', 'Sculpting Session', 'Python API Tips', 'Asset Browser', 'Open Movie Q&A', 'Fall of Reach'];
-  const playlist: EvidencePacket = {
-    packetId: 'packet:bcon', kind: 'youtube_playlist',
-    sources: talks.map((title, index) => ({ id: `youtube:playlist:PLbcon:b${String(index).padStart(10, '0')}:${index}`,
-      provider: 'youtube' as const, kind: 'playlist' as const, playlistId: 'PLbcon', videoId: `b${String(index).padStart(10, '0')}`, title })),
-    excerpts: talks.map((title, index) => ({ id: `playlist:bcon:${index}`,
-      sourceId: `youtube:playlist:PLbcon:b${String(index).padStart(10, '0')}:${index}`, text: `${title}\nChannel: Blender\nDuration: 30:00` })),
-    artifacts: [{ type: 'youtube_playlist', title: 'Blender Conference', data: { videoCount: 94,
-      collection: { version: 1, fetchedCount: 94, retainedCount: 12, reportedTotal: 94, reportedTotalText: '94 videos', morePages: false, continuationAccepted: false } } }],
+function listPacket(packetId: string, playlistId: string, title: string, entries: string[], reportedTotal: number): EvidencePacket {
+  const id = (index: number) => `${playlistId.toLowerCase().slice(2, 6)}${String(index).padStart(7, '0')}`;
+  return {
+    packetId, kind: 'youtube_playlist',
+    sources: entries.map((entry, index) => ({ id: `youtube:playlist:${playlistId}:${id(index)}:${index}`,
+      provider: 'youtube' as const, kind: 'playlist' as const, playlistId, videoId: id(index), title: entry })),
+    excerpts: entries.map((entry, index) => ({ id: `playlist:${packetId}:${index}`,
+      sourceId: `youtube:playlist:${playlistId}:${id(index)}:${index}`, text: `${entry}\nDuration: 30:00` })),
+    artifacts: [{ type: 'youtube_playlist', title, data: { videoCount: reportedTotal, collection: { version: 1, fetchedCount: reportedTotal,
+      retainedCount: entries.length, reportedTotal, reportedTotalText: `${reportedTotal} videos`, morePages: false, continuationAccepted: false } } }],
     warnings: [], usage: [],
   };
+}
+
+/** Runs one direct finalization with fixed list evidence and a mocked answer. Mocks prove wiring, not model behavior. */
+async function finalizeListQuestion(message: string, packets: EvidencePacket[], block: { text: string; evidenceIds: string[] }) {
+  const { options, finalizer, identity } = setup('context_answer', true);
+  options.message = message;
+  options.conversationHistory = [{ ...options.conversationHistory![0]!, evidence: packets }];
+  vi.mocked(options.finalize).mockImplementation(async (_id, input) =>
+    buildAgentTurnResult(identity, { userId: 'user', creditsRemaining: 100 }, input, packets, 0));
+  const calls: typeof finalizer.doGenerateCalls = [];
+  finalizer.doGenerate = async call => {
+    calls.push(call);
+    return { content: [{ type: 'text', text: JSON.stringify({ confidence: 'medium', warnings: [], blocks: [block] }) }],
+      finishReason: { unified: 'stop', raw: 'stop' }, usage, warnings: [] };
+  };
+  await executeResearchRun(options);
+  expect(calls).toHaveLength(1);
+  const prompt = JSON.stringify(calls[0]!.prompt);
+  expect(prompt).toContain('only when cited evidence about that playlist states it');
+  expect(prompt).toContain('establishes order only within that series, course or event');
+  expect(prompt).toContain('unless other cited evidence about that playlist states it');
+  expect(prompt).toContain('A viewing recommendation is allowed when it is labeled as a suggestion and gives its reason');
+  expect(prompt).toContain('When the answer cites a playlist entry, or reviewed transcript or visual content for a listed video, the application appends a playlist coverage note');
+  expect(prompt).toContain('Otherwise no note is appended, so state any material playlist coverage limit yourself.');
+  expect(prompt).not.toContain('The application appends a playlist coverage note stating');
+  const result: AgentTurnResult = await vi.mocked(options.finalize).mock.results[0]!.value;
+  return { prompt, result };
+}
+
+it('BCON: the finalizer gets the list-order rule and an accurate note promise, but an unsupported order claim is not rejected', async () => {
+  const playlist = listPacket('bcon', 'PLbcon', 'Blender Conference', ['SciExplorer', 'Geometry Nodes Workshop', 'Grease Pencil Update',
+    'Studio Pipeline', 'Cycles Roadmap', 'EEVEE Next', 'Animation 2025', 'Sculpting Session', 'Python API Tips', 'Asset Browser',
+    'Open Movie Q&A', 'Fall of Reach'], 94);
   // Search titles identify the two talks but say nothing about their playlist position.
   const search: EvidencePacket = {
     packetId: 'packet:search', kind: 'youtube_search',
@@ -1508,30 +1539,27 @@ it('BCON: the finalizer gets the list-order rule and an accurate note promise, b
       sourceId: `youtube:search:${['suzanneaw01', 'closingev01'][index]}:${index}`, text: `${title}\nChannel: Blender\nPublished: 1 year ago` })),
     artifacts: [], warnings: [], usage: [],
   };
-  options.message = 'In the conference playlist, does the Suzanne Awards come right before the Closing Event?';
-  options.conversationHistory = [{ ...options.conversationHistory![0]!, evidence: [playlist, search] }];
-  vi.mocked(options.finalize).mockImplementation(async (_id, input) =>
-    buildAgentTurnResult(identity, { userId: 'user', creditsRemaining: 100 }, input, [playlist, search], 0));
   const claim = 'The Suzanne Awards come directly before the Closing Event in the playlist.';
-  const calls: typeof finalizer.doGenerateCalls = [];
-  finalizer.doGenerate = async call => {
-    calls.push(call);
-    return { content: [{ type: 'text', text: JSON.stringify({ confidence: 'medium', warnings: [], blocks: [{
-      text: claim, evidenceIds: ['ref_13', 'ref_14'] }] }) }],
-    finishReason: { unified: 'stop', raw: 'stop' }, usage, warnings: [] };
-  };
-  await executeResearchRun(options);
-  expect(calls).toHaveLength(1);
-  const prompt = JSON.stringify(calls[0]!.prompt);
-  expect(prompt).toContain('State a playlist position, adjacency or order as fact only when cited evidence states it');
-  expect(prompt).toContain('A viewing recommendation is allowed when it is labeled as a suggestion and gives its reason');
-  expect(prompt).toContain('When the answer cites a playlist entry, or reviewed transcript or visual content for a listed video, the application appends a playlist coverage note');
-  expect(prompt).toContain('Otherwise no note is appended, so state any material playlist coverage limit yourself.');
-  expect(prompt).not.toContain('The application appends a playlist coverage note stating');
-  const result: AgentTurnResult = await vi.mocked(options.finalize).mock.results[0]!.value;
+  const { result } = await finalizeListQuestion('In the conference playlist, does the Suzanne Awards come right before the Closing Event?',
+    [playlist, search], { text: claim, evidenceIds: ['ref_13', 'ref_14'] });
   expect(result.citations.map(citation => citation.id)).toEqual(['search:call:0', 'search:call:1']);
   // Guidance only: the application still accepts the claim unchanged, and metadata citations add no playlist note.
   expect(result.answer).toContain(claim);
   expect(result.answer).not.toContain('**Playlist coverage');
   expect(result.artifacts.some(artifact => artifact.type === 'playlist_coverage')).toBe(false);
+});
+
+it('shuffled playlist control: part labels reach the model in parser order and a series-scoped answer keeps its note', async () => {
+  // A complete playlist whose parser order differs from the series order its titles state.
+  const playlist = listPacket('shuffled', 'PLmix1', 'Rigging series (shuffled)',
+    ['Rigging Basics Part 3: Constraints', 'Rigging Basics Part 1: Bones', 'Rigging Basics Part 2: Weights'], 3);
+  const answer = 'The titles number "Rigging Basics Part 2: Weights" as part 2 of the series. The evidence does not establish its position in this playlist.';
+  const { prompt, result } = await finalizeListQuestion('Is Part 2 the second video in this playlist?', [playlist],
+    { text: answer, evidenceIds: ['ref_3'] });
+  for (const title of ['Part 3: Constraints', 'Part 1: Bones', 'Part 2: Weights']) expect(prompt).toContain(title);
+  expect(prompt.indexOf('Part 3: Constraints')).toBeLessThan(prompt.indexOf('Part 1: Bones'));
+  expect(prompt.indexOf('Part 1: Bones')).toBeLessThan(prompt.indexOf('Part 2: Weights'));
+  expect(result.citations.map(citation => citation.id)).toEqual(['playlist:shuffled:2']);
+  for (const sentence of answer.split(/(?<=\.) /)) expect(result.answer).toContain(sentence);
+  expect(result.answer).toContain('**Playlist coverage (Rigging series (shuffled)):** This playlist has 3 videos in total, and listing details were available for all 3.');
 });
