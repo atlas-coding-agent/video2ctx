@@ -492,6 +492,61 @@ html:has(.developer-page) body {
   color-scheme: dark;
 }
 
+/* Keep the native page scroller and paint the same backdrop on its canvas. */
+html:has(.workspace-shell) {
+  --dashboard-backdrop:
+    radial-gradient(circle at 72% -8%, var(--color-dashboard-accent-wash), transparent 25rem),
+    var(--color-dashboard-paper);
+  background: var(--dashboard-backdrop);
+  background-attachment: fixed;
+  background-size: 100vw 100dvh;
+  background-repeat: no-repeat;
+  overscroll-behavior-y: auto;
+  scrollbar-width: thin;
+  scrollbar-color: var(--color-dashboard-muted) transparent;
+}
+
+html:has(.workspace-shell) body {
+  background: transparent;
+}
+
+/* Older WebKit browsers use the same slim, rounded native scrollbar. */
+@supports not (scrollbar-width: thin) {
+  html:has(.workspace-shell)::-webkit-scrollbar {
+    width: .625rem;
+  }
+
+  html:has(.workspace-shell)::-webkit-scrollbar-track {
+    background: transparent;
+  }
+
+  html:has(.workspace-shell)::-webkit-scrollbar-thumb {
+    min-height: 3rem;
+    border: .125rem solid transparent;
+    border-radius: 999px;
+    background: var(--color-dashboard-muted);
+    background-clip: padding-box;
+  }
+
+  html:has(.workspace-shell)::-webkit-scrollbar-thumb:hover {
+    background-color: var(--color-dashboard-ink-soft);
+  }
+}
+
+@media (forced-colors: active) {
+  html:has(.workspace-shell) {
+    scrollbar-width: auto;
+    scrollbar-color: auto;
+  }
+}
+
+/* Modal navigation and evidence viewers lock the page without changing its scroll owner. */
+html:has(.workspace-shell dialog[open]),
+html:has(.workspace-shell dialog[open]) body {
+  overflow-y: hidden;
+  overscroll-behavior-y: none;
+}
+
 .workspace-shell::selection,
 .workspace-shell ::selection,
 .auth-gate::selection,
@@ -507,16 +562,40 @@ html:has(.developer-page) body {
   --press: 140ms;
   --control: 200ms;
   min-height: 100dvh;
+  isolation: isolate;
   grid-template-columns: 16rem minmax(0, 1fr);
-  background: var(--color-dashboard-paper);
+  background: transparent;
   color: var(--color-dashboard-ink);
 }
 
+/* This viewport layer remains stationary during native page overscroll. */
+.workspace-shell::before {
+  content: "";
+  position: fixed;
+  inset: 0;
+  z-index: -1;
+  pointer-events: none;
+  background: var(--dashboard-backdrop);
+}
+
 .workspace-main {
+  position: relative;
+  grid-area: 1 / 2;
   min-height: 100dvh;
-  background:
-    radial-gradient(circle at 72% -8%, var(--color-dashboard-accent-wash), transparent 25rem),
-    var(--color-dashboard-paper);
+  overflow: visible;
+  background: transparent;
+}
+
+@media (max-width: 700px) {
+  /* Keep scroll targets below the fixed mobile navigation. */
+  html:has(.workspace-shell) {
+    scroll-padding-top: 3.5rem;
+  }
+
+  .workspace-main {
+    grid-area: auto;
+    min-height: calc(100dvh - 3.5rem);
+  }
 }
 
 .workspace-brand {
