@@ -7,8 +7,10 @@ import { authClient } from '../../lib/auth-client';
 const LINKS = [
   { label: 'Docs', href: 'https://docs.video2ctx.dev' },
   { label: 'Pricing', href: '#pricing' },
-  { label: 'FAQ', href: 'https://api.video2ctx.dev/docs#tag/FAQ' },
-  { label: 'CLI + Skill', href: '#agent-setup' },
+  { label: 'FAQs', href: '#faq' },
+  { label: 'Installation', href: '#agent-setup' },
+  /* Phones drop the GitHub icon from the bar, so it lives in the menu there. */
+  { label: 'GitHub', href: 'https://github.com/devhims/video2ctx', phonesOnly: true },
 ];
 
 export function CraftNav() {
@@ -50,6 +52,7 @@ export function CraftNav() {
                 target={external ? '_blank' : undefined}
                 rel={external ? 'noreferrer' : undefined}
                 onClick={() => setOpen(false)}
+                data-phones-only={link.phonesOnly ? 'true' : undefined}
               >
                 {link.label}
               </a>
@@ -58,8 +61,10 @@ export function CraftNav() {
         </nav>
 
         <div className='craft-nav-actions'>
+          {/* "Get Started" rather than "Sign in": most visitors here are new,
+              and returning users reach the same login page through it. */}
           <a className='craft-nav-account' href={session?.user ? '/dashboard' : '/login'}>
-            {session?.user ? 'Dashboard' : 'Sign in'}
+            {session?.user ? 'Dashboard' : 'Get Started'}
           </a>
           <a
             className='craft-nav-github'

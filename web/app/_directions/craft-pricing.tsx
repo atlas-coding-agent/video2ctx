@@ -34,7 +34,7 @@ const PLANS: PricingPlan[] = [
     name: 'Builder',
     price: '$20',
     cadence: 'per month',
-    credits: '20,000 credits monthly',
+    credits: '10,000 credits monthly',
     description: 'Build production applications, agents, and internal tools with recurring usage.',
     features: [
       'Everything in Starter',
@@ -104,7 +104,7 @@ export function CraftPricing() {
   return (
     <section className='craft-band craft-pricing' id='pricing' aria-labelledby='craft-pricing-title'>
       <div className='craft-band-head'>
-        <h2 id='craft-pricing-title'>Start small. Pay when you build.</h2>
+        <h2 id='craft-pricing-title'>Start free. Pay when you build.</h2>
         <p>
           Every plan includes the dashboard and API. Credits are charged according to the data you request.
         </p>

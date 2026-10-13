@@ -15,6 +15,43 @@ html:has(.craft) body {
   color-scheme: dark;
 }
 
+/* The same slim, rounded page scrollbar as the dashboard, in this page's muted
+ * ink. The tokens live on .craft, which the root cannot see, so the two inks
+ * are repeated here as literals. */
+html:has(.craft) {
+  scrollbar-width: thin;
+  scrollbar-color: oklch(56% 0.008 80) transparent;
+}
+
+@supports not (scrollbar-width: thin) {
+  html:has(.craft)::-webkit-scrollbar {
+    width: 0.625rem;
+  }
+
+  html:has(.craft)::-webkit-scrollbar-track {
+    background: transparent;
+  }
+
+  html:has(.craft)::-webkit-scrollbar-thumb {
+    min-height: 3rem;
+    border: 0.125rem solid transparent;
+    border-radius: 999px;
+    background: oklch(56% 0.008 80);
+    background-clip: padding-box;
+  }
+
+  html:has(.craft)::-webkit-scrollbar-thumb:hover {
+    background-color: oklch(72% 0.008 82);
+  }
+}
+
+@media (forced-colors: active) {
+  html:has(.craft) {
+    scrollbar-width: auto;
+    scrollbar-color: auto;
+  }
+}
+
 .craft {
   --radius-home-control: .375rem;
   --paper: oklch(15.5% 0.006 75);
@@ -503,7 +540,10 @@ html:has(.craft) body {
 .craft-build-cta {
   min-height: 2.25rem;
   margin-bottom: var(--space-xl);
-  padding: var(--space-2xs) var(--space-2xs) var(--space-2xs) var(--space-md);
+  /* Both ends hold a filled shape, so each is inset as far from the side as
+   * from the top and bottom: the arrow box by the small padding, and the
+   * shorter NEW badge by 0.625rem, which matches its vertical gap. */
+  padding: var(--space-2xs) var(--space-2xs) var(--space-2xs) 0.625rem;
   border: 1px solid var(--rule-strong);
   border-radius: var(--radius-home-control);
   position: relative;
@@ -637,22 +677,46 @@ html:has(.craft) body {
 .craft-sub {
   max-width: 38ch;
   margin: var(--space-lg) 0 0;
-  color: var(--ink-soft);
+  /* Brighter than the soft ink so the offer line under it, which shares the
+   * paragraph, reads as the quieter of the two. */
+  color: color-mix(in oklch, var(--ink) 50%, var(--ink-soft));
   font-size: clamp(0.95rem, 1.6vw, 1.0625rem);
+  font-weight: 550;
   line-height: 1.55;
   text-wrap: balance;
 }
 
-.craft-open-source {
-  margin-top: var(--space-xs);
+/* The free offer, set as quietly as the open-source note it replaced so it
+ * reads as a footnote to the claim. It is a link because "Get started" reads
+ * as an action, and a phrase that looks clickable should go somewhere. */
+.craft-offer {
+  width: fit-content;
+  margin: var(--space-xs) auto 0;
   color: var(--ink-muted);
-  display: block;
-  font-family: var(--font-home-mono);
-  font-size: 0.72rem;
-  font-weight: 540;
-  font-variant-numeric: tabular-nums;
-  letter-spacing: 0.01em;
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  justify-content: center;
+  text-decoration: none;
+  transition: color var(--control) var(--out);
+  font-family: var(--font-home-body);
+  font-size: 0.8125rem;
+  font-weight: 450;
   line-height: 1.35;
+  white-space: nowrap;
+}
+
+/* Two phrases that only ever break between each other, so a narrow screen
+ * gets two clean lines instead of "1,000" stranded from "credits". */
+.craft-offer-terms {
+  display: inline-flex;
+  align-items: center;
+  gap: 0.35em;
+}
+
+.craft-offer-terms::before {
+  content: '·';
+  margin-inline: 0.35em 0;
 }
 
 /* ------------------------------------------------------------------ form */
@@ -767,8 +831,9 @@ html:has(.craft) body {
 .craft-examples-label {
   margin-right: var(--space-2xs);
   color: var(--ink-muted);
-  font-family: var(--font-home-mono);
-  font-size: 0.68rem;
+  font-family: var(--font-home-body);
+  font-size: 0.8125rem;
+  font-weight: 450;
 }
 
 .craft-examples button {
@@ -819,6 +884,35 @@ html:has(.craft) body {
 .craft-examples button:disabled:not([data-active='true']) {
   opacity: 0.45;
   cursor: progress;
+}
+
+.craft-works-with {
+  margin-top: var(--space-sm);
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  gap: var(--space-sm);
+}
+
+.craft-works-with-label {
+  color: var(--ink-muted);
+  font-family: var(--font-home-body);
+  font-size: 0.8125rem;
+  font-weight: 450;
+}
+
+.craft-works-with ul {
+  margin: 0;
+  padding: 0;
+  display: flex;
+  align-items: center;
+  gap: var(--space-md);
+  list-style: none;
+}
+
+.craft-works-with li {
+  color: var(--ink);
+  display: flex;
 }
 
 .craft-form-note {
@@ -1467,6 +1561,17 @@ html:has(.craft) body {
   text-align: right;
 }
 
+.craft-more-count a {
+  color: var(--ink-soft);
+  display: inline-flex;
+  align-items: center;
+  gap: 0.35em;
+  text-decoration: underline;
+  text-decoration-color: var(--rule-strong);
+  text-underline-offset: 0.25em;
+  transition: color var(--control) var(--out);
+}
+
 .craft-comments-footer .craft-more-count {
   margin: 0;
 }
@@ -1580,21 +1685,6 @@ html:has(.craft) body {
   text-wrap: pretty;
 }
 
-.craft-parts-integrations {
-  max-width: 62ch;
-  margin: var(--space-md) 0 0;
-  color: var(--ink-muted);
-  font-size: 0.85rem;
-  line-height: 1.6;
-}
-
-.craft-parts-integrations b {
-  color: var(--ink-soft);
-  font-family: var(--font-home-mono);
-  font-size: 0.78rem;
-  font-weight: 560;
-}
-
 .craft-parts h3 {
   margin: var(--space-2xl) 0 0;
   font-size: 1rem;
@@ -1610,22 +1700,20 @@ html:has(.craft) body {
 }
 
 .craft-parts li,
-.craft-ways li,
-.craft-trust > div {
+.craft-ways li {
   transition-delay: calc(var(--i) * 45ms);
 }
 
 .craft-parts li {
   padding: var(--space-md) 0;
   border-top: 1px solid var(--rule);
-  display: flex;
+  display: grid;
+  grid-template-columns: 10rem minmax(0, 1fr);
   align-items: baseline;
-  flex-wrap: wrap;
   gap: var(--space-xs) var(--space-lg);
 }
 
 .craft-parts b {
-  min-width: 7rem;
   font-size: 0.95rem;
   font-weight: 620;
   letter-spacing: -0.02em;
@@ -1634,6 +1722,59 @@ html:has(.craft) body {
 .craft-parts span {
   color: var(--ink-muted);
   font-size: 0.85rem;
+}
+
+/* Where video comes from: the supported source lit, the next ones hollow. */
+.craft-parts .craft-roadmap ol {
+  margin: var(--space-lg) 0 0;
+  padding: 0;
+  list-style: none;
+  display: grid;
+  grid-template-columns: repeat(3, minmax(0, 1fr));
+  gap: var(--space-md);
+}
+
+.craft-parts .craft-roadmap li {
+  padding: var(--space-md) 0 0;
+  border-top: 1px solid var(--rule);
+  display: grid;
+  grid-template-columns: auto minmax(0, 1fr);
+  align-items: center;
+  gap: 0.2rem var(--space-xs);
+}
+
+.craft-parts .craft-roadmap li[data-live='true'] {
+  border-color: var(--accent);
+}
+
+.craft-roadmap i {
+  width: 0.5rem;
+  height: 0.5rem;
+  border: 1px solid var(--ink-muted);
+  border-radius: 50%;
+}
+
+.craft-roadmap li[data-live='true'] i {
+  border-color: var(--accent);
+  background: var(--accent);
+}
+
+.craft-roadmap strong {
+  font-size: 0.95rem;
+  font-weight: 620;
+  letter-spacing: -0.02em;
+}
+
+.craft-roadmap em {
+  grid-column: 2;
+  color: var(--ink-muted);
+  font-family: var(--font-home-mono);
+  font-size: 0.68rem;
+  font-style: normal;
+}
+
+.craft-roadmap li[data-live='true'] em {
+  color: var(--accent);
 }
 
 /* ----------------------------------------------------------------- agent */
@@ -1931,6 +2072,347 @@ html:has(.craft) body {
   cursor: default;
 }
 
+/* ------------------------------------------------------------- monitor run */
+
+/* Two columns on wide screens: the monitor on the left raises the alert, and
+ * the agent on the right answers it. Phones stack them in reading order. */
+@media (min-width: 761px) {
+  .craft-monitor-panel {
+    grid-template-columns: minmax(0, 0.9fr) minmax(0, 1.1fr);
+    align-items: start;
+  }
+}
+
+.craft-monitor-watch {
+  display: grid;
+  gap: var(--space-md);
+}
+
+/* Two rows, padded like the question card beside it: the live dot and title,
+ * then the channel and cadence aligned under the title. */
+.craft-monitor-head {
+  padding: var(--space-sm) var(--space-md);
+  border: 1px solid var(--rule);
+  border-radius: 0.5rem;
+  background: var(--paper);
+  display: grid;
+  grid-template-columns: auto minmax(0, 1fr);
+  align-items: center;
+  gap: 0.3rem var(--space-sm);
+  font-size: 0.85rem;
+}
+
+.craft-monitor-head b {
+  font-weight: 650;
+}
+
+.craft-monitor-head span:last-child {
+  grid-column: 2;
+  color: var(--ink-muted);
+  font-family: var(--font-home-mono);
+  font-size: 0.66rem;
+}
+
+.craft-monitor-live {
+  width: 0.5rem;
+  height: 0.5rem;
+  border-radius: 50%;
+  background: var(--accent);
+}
+
+.craft-monitor[data-running='true'] .craft-monitor-live {
+  animation: craft-run-pulse 900ms var(--in-out) infinite alternate;
+}
+
+.craft-monitor-checks {
+  margin: 0;
+  padding: 0;
+  list-style: none;
+  display: grid;
+  grid-template-columns: repeat(4, minmax(0, 1fr));
+  gap: var(--space-xs);
+}
+
+.craft-monitor-checks li {
+  min-width: 0;
+  padding-top: var(--space-xs);
+  border-top: 1px solid var(--rule);
+  display: grid;
+  gap: 0.15rem;
+  opacity: 0.35;
+  transition:
+    opacity var(--control) var(--out),
+    border-color var(--control) var(--out);
+}
+
+.craft-monitor-checks li:not([data-state='pending']) {
+  border-color: var(--rule-strong);
+  opacity: 1;
+}
+
+.craft-monitor-checks li[data-state='alert'] {
+  border-color: var(--accent);
+}
+
+.craft-monitor-checks i {
+  width: 0.4rem;
+  height: 0.4rem;
+  border-radius: 50%;
+  background: var(--rule-strong);
+}
+
+.craft-monitor-checks li[data-state='alert'] i {
+  background: var(--accent);
+}
+
+.craft-monitor-checks span {
+  color: var(--ink-muted);
+  font-family: var(--font-home-mono);
+  font-size: 0.62rem;
+}
+
+.craft-monitor-checks b {
+  overflow: hidden;
+  font-size: 0.74rem;
+  font-weight: 600;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.craft-monitor-checks li[data-state='alert'] b {
+  color: var(--accent);
+}
+
+/* The new alert always holds its slot, so it lands without pushing the
+ * earlier alerts down; it drops in from just above. */
+.craft-monitor-inbox {
+  margin: 0;
+  padding: 0;
+  list-style: none;
+  display: grid;
+  gap: var(--space-xs);
+}
+
+.craft-monitor-inbox li {
+  padding: var(--space-sm) var(--space-md);
+  border: 1px solid var(--rule);
+  border-radius: 0.5rem;
+  display: grid;
+  grid-template-columns: minmax(0, 1fr) auto;
+  column-gap: var(--space-sm);
+  row-gap: 0.15rem;
+  opacity: 0.5;
+}
+
+.craft-monitor-inbox span {
+  grid-column: 1 / -1;
+  color: var(--ink-muted);
+  font-family: var(--font-home-mono);
+  font-size: 0.62rem;
+}
+
+.craft-monitor-inbox b {
+  min-width: 0;
+  font-size: 0.8rem;
+  font-weight: 600;
+  line-height: 1.35;
+  text-wrap: pretty;
+}
+
+.craft-monitor-inbox time {
+  color: var(--ink-muted);
+  font-family: var(--font-home-mono);
+  font-size: 0.66rem;
+}
+
+.craft-monitor-inbox li[data-new='true'] {
+  border-color: color-mix(in oklch, var(--accent) 55%, var(--rule-strong));
+  background: color-mix(in oklch, var(--accent) 7%, transparent);
+  opacity: 0;
+  transform: translateY(-6px);
+  transition:
+    opacity var(--enter) var(--out),
+    transform var(--enter) var(--out);
+}
+
+.craft-monitor-inbox li[data-new='true'][data-on='true'] {
+  opacity: 1;
+  transform: none;
+}
+
+.craft-monitor-inbox li[data-new='true'] span {
+  color: var(--accent);
+}
+
+/* The agent side waits, dimmed, until the alert is handed to it. */
+.craft-monitor-handoff {
+  display: grid;
+  gap: var(--space-md);
+  opacity: 0.35;
+  transition: opacity var(--enter) var(--out);
+}
+
+.craft-monitor-handoff[data-on='true'] {
+  opacity: 1;
+}
+
+/* ---------------------------------------------------------------- use cases */
+
+.craft-cases {
+  margin-top: clamp(var(--space-xl), 4vh, var(--space-2xl));
+}
+
+.craft-cases .craft-run {
+  margin-top: var(--space-md);
+}
+
+.craft-case .craft-run-sources {
+  grid-template-columns: repeat(var(--count), minmax(0, 1fr));
+}
+
+.craft-case .craft-run-sources li {
+  min-width: 0;
+}
+
+/* The storyboard as a contact sheet, one tile per second. Tiles scan in while
+ * it is read; the seconds pulled as full frames light up once that step ends. */
+.craft-case-sheet {
+  max-width: 9rem;
+  margin-top: 0.35rem;
+  display: grid;
+  grid-template-columns: repeat(18, minmax(0, 1fr));
+  gap: 1px;
+}
+
+.craft-case-sheet i {
+  aspect-ratio: 16 / 9;
+  border-radius: 1px;
+  background: var(--rule-strong);
+  opacity: 0;
+  transition:
+    opacity var(--control) var(--out),
+    background-color var(--control) var(--out);
+  transition-delay: calc(var(--i) * 7ms);
+}
+
+.craft-run-sources li:not([data-state='pending']) .craft-case-sheet i {
+  opacity: 0.7;
+}
+
+.craft-run-sources li[data-state='done'] .craft-case-sheet i[data-picked='true'] {
+  background: var(--accent);
+  opacity: 1;
+  transition-delay: 0ms;
+}
+
+/* Stand-ins for interface frames: a viewport with a properties strip, not a
+ * picture of the video. */
+.craft-case-frames i {
+  width: 1.5rem;
+  aspect-ratio: 16 / 9;
+  border: 1px solid var(--rule-strong);
+  background: linear-gradient(90deg, var(--paper) 0 68%, var(--rule-strong) 68%);
+}
+
+/* ---------------------------------------------------------------------- faq */
+
+.craft-faq {
+  scroll-margin-top: 5.5rem;
+}
+
+.craft-faq-list {
+  margin-top: clamp(var(--space-xl), 4vh, var(--space-2xl));
+  border-top: 1px solid var(--rule);
+}
+
+.craft-faq details {
+  border-bottom: 1px solid var(--rule);
+}
+
+.craft-faq summary {
+  min-height: 3.5rem;
+  padding: var(--space-md) 0;
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: var(--space-md);
+  cursor: pointer;
+  font-size: 0.95rem;
+  font-weight: 600;
+  letter-spacing: -0.01em;
+  list-style: none;
+}
+
+.craft-faq summary::-webkit-details-marker {
+  display: none;
+}
+
+/* A plus that turns into a minus: the vertical bar folds flat on open. */
+.craft-faq summary i {
+  width: 0.75rem;
+  height: 0.75rem;
+  position: relative;
+  flex: none;
+  color: var(--ink-muted);
+}
+
+.craft-faq summary i::before,
+.craft-faq summary i::after {
+  content: '';
+  position: absolute;
+  inset: 50% 0 auto;
+  height: 1.5px;
+  border-radius: 1px;
+  background: currentColor;
+  transform: translateY(-50%);
+  transition: transform var(--control) var(--out);
+}
+
+.craft-faq summary i::after {
+  transform: translateY(-50%) rotate(90deg);
+}
+
+.craft-faq details[open] summary i::after {
+  transform: translateY(-50%) rotate(0deg);
+}
+
+.craft-faq details p {
+  max-width: 62ch;
+  margin: 0;
+  padding: 0 0 var(--space-lg);
+  color: var(--ink-soft);
+  font-size: 0.9rem;
+  line-height: 1.65;
+  text-wrap: pretty;
+}
+
+.craft-faq details a {
+  color: var(--ink);
+  text-decoration: underline;
+  text-decoration-color: var(--rule-strong);
+  text-underline-offset: 0.2em;
+  transition: text-decoration-color var(--control) var(--out);
+}
+
+@media (hover: hover) and (pointer: fine) {
+  .craft-faq details a:hover {
+    text-decoration-color: var(--ink);
+  }
+}
+
+@media (prefers-reduced-motion: no-preference) {
+  .craft-faq details[open] p {
+    animation: craft-faq-open var(--enter) var(--out);
+  }
+}
+
+@keyframes craft-faq-open {
+  from {
+    opacity: 0;
+    transform: translateY(-4px);
+  }
+}
+
 /* ----------------------------------------------------------------- close */
 
 /* Same width as the bands above, so the hairlines line up down the page. */
@@ -1939,6 +2421,40 @@ html:has(.craft) body {
   margin-inline: auto;
   padding-bottom: clamp(var(--space-2xl), 8vh, 5rem);
   text-align: center;
+}
+
+/* The page closes on the landscape it opened with: the hero's voxel scene,
+ * full bleed behind the last call to action. It fades in from the top so the
+ * section edge never shows, and fades out before the footer. A static image,
+ * so it costs no motion and no main-thread time. */
+.craft-close-scene {
+  position: relative;
+  isolation: isolate;
+  overflow: hidden;
+}
+
+.craft-close-scene::before {
+  content: '';
+  position: absolute;
+  z-index: -1;
+  inset: 0;
+  background: url('/scene/voxel-horizon-symbols-900.webp') 50% 100% / cover no-repeat;
+  opacity: 0.28;
+  mask-image: linear-gradient(
+    to bottom,
+    transparent 0%,
+    oklch(0% 0 0 / 0.35) 30%,
+    oklch(0% 0 0) 70%,
+    oklch(0% 0 0 / 0.6) 92%,
+    transparent 100%
+  );
+  pointer-events: none;
+}
+
+@media (min-width: 1101px) {
+  .craft-close-scene::before {
+    background-image: url('/scene/voxel-horizon-symbols.webp');
+  }
 }
 
 .craft-close h2 {
@@ -2147,8 +2663,31 @@ html:has(.craft) body {
 
 .craft-code-note {
   margin: var(--space-md) 0 0;
+  display: grid;
+  justify-items: start;
+  gap: var(--space-xs);
+}
+
+.craft-code-note p {
+  max-width: 68ch;
+  margin: 0;
   color: var(--ink-muted);
   font-size: 0.8rem;
+  line-height: 1.6;
+}
+
+.craft-code-note a {
+  color: var(--ink);
+  display: inline-flex;
+  align-items: center;
+  gap: var(--space-xs);
+  font-size: 0.82rem;
+  font-weight: 620;
+  text-decoration: none;
+}
+
+.craft-code-note a span {
+  transition: transform var(--control) var(--out);
 }
 
 /* The copy control belongs to the code surface it acts on. Both icons occupy
@@ -2627,35 +3166,6 @@ html:has(.craft) body {
   margin-top: var(--space-xl);
 }
 
-/* ---------------------------------------------------------------- trust */
-
-.craft-trust {
-  margin: clamp(var(--space-xl), 4vh, var(--space-2xl)) 0 0;
-  display: grid;
-  grid-template-columns: repeat(2, minmax(0, 1fr));
-  gap: var(--space-xl) clamp(var(--space-xl), 5vw, 3.5rem);
-}
-
-.craft-trust > div {
-  min-width: 0;
-  padding-top: var(--space-lg);
-  border-top: 1px solid var(--rule);
-}
-
-.craft-trust dt {
-  font-size: 0.95rem;
-  font-weight: 620;
-  letter-spacing: -0.02em;
-}
-
-.craft-trust dd {
-  max-width: 40ch;
-  margin: var(--space-sm) 0 0;
-  color: var(--ink-muted);
-  font-size: 0.85rem;
-  line-height: 1.65;
-}
-
 .craft-agent-setup {
   scroll-margin-top: 6rem;
 }
@@ -2679,6 +3189,11 @@ html:has(.craft) body {
   .craft-copy-action:hover,
   .craft-load-comments:hover {
     transform: translateY(-1px);
+  }
+
+  .craft-offer:hover,
+  .craft-more-count a:hover {
+    color: var(--ink);
   }
 
   .craft-examples button:enabled:hover {
@@ -2737,7 +3252,8 @@ html:has(.craft) body {
     color: var(--ink);
   }
 
-  .craft-ways a:hover span {
+  .craft-ways a:hover span,
+  .craft-code-note a:hover span {
     transform: translateX(3px);
   }
 }
@@ -2803,6 +3319,16 @@ html:has(.craft) body {
   .craft-nav-menu {
     display: grid;
   }
+
+  .craft-nav-github {
+    display: none;
+  }
+}
+
+@media (min-width: 721px) {
+  .craft-nav-links [data-phones-only='true'] {
+    display: none;
+  }
 }
 
 @media (max-width: 900px) {
@@ -2811,8 +3337,7 @@ html:has(.craft) body {
   }
 
   .craft-ways,
-  .craft-pricing-grid,
-  .craft-trust {
+  .craft-pricing-grid {
     grid-template-columns: minmax(0, 1fr);
     gap: var(--space-lg);
   }
@@ -2844,6 +3369,19 @@ html:has(.craft) body {
 }
 
 @media (max-width: 640px) {
+  .craft-parts > ul li {
+    grid-template-columns: minmax(0, 1fr);
+  }
+
+  .craft-parts .craft-roadmap ol {
+    grid-template-columns: minmax(0, 1fr);
+    gap: 0;
+  }
+
+  .craft-parts .craft-roadmap li {
+    padding-bottom: var(--space-md);
+  }
+
   .craft-result-head h2 {
     flex-basis: 100%;
   }
@@ -2861,7 +3399,16 @@ html:has(.craft) body {
     display: none;
   }
 
-  .craft-run-sources {
+  .craft-offer {
+    flex-direction: column;
+  }
+
+  .craft-offer-terms::before {
+    content: none;
+  }
+
+  .craft-run-sources,
+  .craft-case .craft-run-sources {
     grid-template-columns: repeat(2, minmax(0, 1fr));
     row-gap: var(--space-md);
   }
