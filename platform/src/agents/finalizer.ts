@@ -8,7 +8,7 @@ import {
   type EvidencePacket,
   type FinalizeAnswerInput,
 } from './contracts';
-import { playlistCoverageDisclosures } from './playlist-coverage';
+import { appendNotices, playlistCoverageDisclosures } from './playlist-coverage';
 
 const CITATION_MARKER = /\[cite:([A-Za-z0-9:_-]+)\]/g;
 
@@ -65,7 +65,7 @@ export function buildAgentTurnResult(
 
   // The application states playlist totals, the listing limit and reviewed content itself.
   const playlistCoverage = playlistCoverageDisclosures(packets, citations.map(citation => citation.id));
-  const disclosedAnswer = [answer, ...playlistCoverage.notes.filter(note => !answer.includes(note))].join('\n\n');
+  const disclosedAnswer = appendNotices(answer, playlistCoverage.notes);
 
   const warnings = deduplicateWarnings([
     ...packets.flatMap((packet) => packet.warnings),

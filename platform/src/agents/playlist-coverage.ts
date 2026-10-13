@@ -3,14 +3,38 @@ import { COLLECTION_ITEM_LIMIT, readCollectionRetrieval } from './runtime/collec
 
 /** Packets whose excerpts are reviewed video content, as opposed to listing metadata. */
 const REVIEWED_CONTENT_KINDS = new Set<EvidencePacket['kind']>(['youtube_transcript', 'youtube_storyboard', 'youtube_frames']);
-const MAX_DISCLOSED_PLAYLISTS = 3;
+/** Playlists given a full sentence note. The rest get one compact line each. */
+const DETAILED_PLAYLISTS = 3;
+const SUMMARIZED_PLAYLISTS = 10;
+const LIMIT_SENTENCE = `video2ctx lists at most ${COLLECTION_ITEM_LIMIT} videos per playlist.`;
 
 export type PlaylistCoverage = 'complete' | 'incomplete' | 'unknown';
 
+interface PlaylistDisclosure {
+  playlistId: string;
+  title: string;
+  note: string;
+  summary: string;
+  data: {
+    coverage: PlaylistCoverage;
+    listLimit: number;
+    listedVideos: number;
+    reviewedVideos: number;
+    fetchedVideos?: number;
+    reportedTotal?: number;
+    cited: 'entry' | 'video_content';
+  };
+}
+
 /**
  * Application-written coverage notes for the playlists an answer relies on.
- * A playlist counts as relied on when the answer cites one of its entries, or
- * cites any evidence about a video it lists.
+ *
+ * A playlist is relied on when the answer cites one of its entries, or cites
+ * transcript or visual content for a video it lists. Citing an entry of one
+ * playlist does not pull in other playlists that share that video. Directly
+ * cited playlists come first, each group in citation order. The first three
+ * get a full note; up to ten more get a compact line that keeps their exact
+ * total; every relied-on playlist gets a playlist_coverage artifact.
  *
  * The total comes only from a provider-stated count recorded at retrieval.
  * Saved playlists without recorded counts keep an unknown total. Listing
@@ -21,78 +45,100 @@ export function playlistCoverageDisclosures(
   packets: readonly EvidencePacket[],
   citedExcerptIds: readonly string[],
 ): { notes: string[]; artifacts: AgentArtifact[] } {
-  const cited = new Set(citedExcerptIds);
-  const citedVideos = new Set(packets.flatMap(packet => packet.excerpts.filter(excerpt => cited.has(excerpt.id))
-    .flatMap(excerpt => packet.sources.find(source => source.id === excerpt.sourceId)?.videoId ?? [])));
-  const reviewed = new Set(packets.filter(packet => REVIEWED_CONTENT_KINDS.has(packet.kind))
-    .flatMap(packet => packet.excerpts.filter(excerpt => excerpt.text.trim())
-      .flatMap(excerpt => packet.sources.find(source => source.id === excerpt.sourceId)?.videoId ?? [])));
+  const citationOrder = new Map<string, number>();
+  citedExcerptIds.forEach((id, index) => { if (!citationOrder.has(id)) citationOrder.set(id, index); });
+  const sourceVideo = (packet: EvidencePacket, sourceId: string) => packet.sources.find(source => source.id === sourceId)?.videoId;
 
-  // One disclosure per playlist. A packet with recorded counts is preferred over a legacy copy.
-  const playlists = new Map<string, EvidencePacket>();
+  const reviewed = new Set<string>();
+  // Earliest citation of reviewed content per video.
+  const citedContent = new Map<string, number>();
+  for (const packet of packets) {
+    if (!REVIEWED_CONTENT_KINDS.has(packet.kind)) continue;
+    for (const excerpt of packet.excerpts) {
+      const videoId = excerpt.text.trim() ? sourceVideo(packet, excerpt.sourceId) : undefined;
+      if (!videoId) continue;
+      reviewed.add(videoId);
+      const order = citationOrder.get(excerpt.id);
+      if (order !== undefined && order < (citedContent.get(videoId) ?? Infinity)) citedContent.set(videoId, order);
+    }
+  }
+
+  const groups = new Map<string, EvidencePacket[]>();
   for (const packet of packets) {
     if (packet.kind !== 'youtube_playlist') continue;
-    const relied = packet.excerpts.some(excerpt => cited.has(excerpt.id))
-      || packet.sources.some(source => source.videoId && citedVideos.has(source.videoId));
-    if (!relied) continue;
     const id = packet.sources.find(source => source.playlistId)?.playlistId ?? packet.packetId;
-    const existing = playlists.get(id);
-    if (!existing || (!readCollectionRetrieval(existing) && readCollectionRetrieval(packet))) playlists.set(id, packet);
+    groups.set(id, [...groups.get(id) ?? [], packet]);
   }
+  const relied: Array<{ playlistId: string; packet: EvidencePacket; direct: boolean; order: number }> = [];
+  for (const [playlistId, copies] of groups) {
+    const direct = Math.min(...copies.flatMap(packet => packet.excerpts.map(excerpt => citationOrder.get(excerpt.id) ?? Infinity)));
+    const viaContent = Math.min(...copies.flatMap(packet => packet.sources.map(source =>
+      source.videoId ? citedContent.get(source.videoId) ?? Infinity : Infinity)));
+    if (direct === Infinity && viaContent === Infinity) continue;
+    // A copy with recorded counts is preferred over a legacy copy of the same playlist.
+    const packet = copies.find(copy => readCollectionRetrieval(copy)) ?? copies[0]!;
+    relied.push({ playlistId, packet, direct: direct !== Infinity, order: direct !== Infinity ? direct : viaContent });
+  }
+  relied.sort((a, b) => Number(b.direct) - Number(a.direct) || a.order - b.order);
 
-  const disclosed = [...playlists.entries()];
-  const notes: string[] = [];
-  const artifacts: AgentArtifact[] = [];
-  for (const [playlistId, packet] of disclosed.slice(0, MAX_DISCLOSED_PLAYLISTS)) {
-    const disclosure = playlistDisclosure(packet, reviewed);
-    notes.push(disclosure.note);
-    artifacts.push({ type: 'playlist_coverage', title: disclosure.title, data: { playlistId, ...disclosure.data } });
+  const disclosures = relied.map(item => playlistDisclosure(item.playlistId, item.packet, reviewed, item.direct));
+  const notes = disclosures.slice(0, DETAILED_PLAYLISTS).map(disclosure => disclosure.note);
+  const summarized = disclosures.slice(DETAILED_PLAYLISTS, DETAILED_PLAYLISTS + SUMMARIZED_PLAYLISTS);
+  if (summarized.length) {
+    const rest = disclosures.length - DETAILED_PLAYLISTS - summarized.length;
+    notes.push(`**Other playlist coverage:** ${summarized.map(disclosure => disclosure.summary).join('; ')}.${
+      rest ? ` ${rest} more playlist${rest === 1 ? ' is' : 's are'} not listed here; treat ${rest === 1 ? 'its' : 'their'} coverage as possibly incomplete.` : ''} ${LIMIT_SENTENCE}`);
   }
-  if (disclosed.length > MAX_DISCLOSED_PLAYLISTS) {
-    const more = disclosed.length - MAX_DISCLOSED_PLAYLISTS;
-    notes.push(`Coverage notes for ${more} more playlist${more === 1 ? '' : 's'} are not shown. Treat their coverage as possibly incomplete.`);
-  }
-  return { notes, artifacts };
+  return {
+    notes,
+    artifacts: disclosures.map(disclosure => ({ type: 'playlist_coverage', title: disclosure.title,
+      data: { playlistId: disclosure.playlistId, ...disclosure.data } })),
+  };
 }
 
-function playlistDisclosure(packet: EvidencePacket, reviewedVideos: ReadonlySet<string>) {
+function playlistDisclosure(playlistId: string, packet: EvidencePacket, reviewedVideos: ReadonlySet<string>, direct: boolean): PlaylistDisclosure {
   const retrieval = readCollectionRetrieval(packet);
   const recorded = retrieval && retrieval.retainedCount === packet.excerpts.length ? retrieval : undefined;
   const retained = packet.excerpts.length;
   const videoIds = [...new Set(packet.sources.flatMap(source => source.videoId ?? []))];
   const reviewed = videoIds.filter(videoId => reviewedVideos.has(videoId)).length;
-  const title = (packet.artifacts.find(artifact => artifact.type === 'youtube_playlist')?.title ?? 'this playlist')
-    .replace(/\s+/g, ' ').replace(/\*/g, '').trim().slice(0, 120) || 'this playlist';
-  const limit = `video2ctx lists at most ${COLLECTION_ITEM_LIMIT} videos per playlist`;
+  const title = (packet.artifacts.find(artifact => artifact.type === 'youtube_playlist')?.title ?? '')
+    .replace(/\s+/g, ' ').replace(/[*`;]/g, '').trim().slice(0, 120) || playlistId.slice(0, 120);
   const listed = `${retained} video${retained === 1 ? '' : 's'}`;
   const sentences: string[] = [];
   let coverage: PlaylistCoverage;
+  let totalText: string;
 
   if (recorded?.reportedTotal !== undefined) {
     const total = recorded.reportedTotal;
+    totalText = `${total} video${total === 1 ? '' : 's'} in total`;
     if (total > retained) {
       coverage = 'incomplete';
-      const cause = recorded.fetchedCount > retained ? ` because ${limit}` : ` because the playlist listing returned only ${retained}`;
-      sentences.push(`This playlist has ${total} videos in total. Listing details were available for ${retained}${cause}, so coverage of this playlist is incomplete.`);
+      // The limit is the cause only when the page had more entries than were kept.
+      sentences.push(recorded.fetchedCount > retained
+        ? `This playlist has ${total} videos in total. Listing details were available for ${retained} because ${LIMIT_SENTENCE.slice(0, -1)}, so coverage of this playlist is incomplete.`
+        : `This playlist has ${total} videos in total. Listing details were available for ${retained}, so coverage of this playlist is incomplete. The playlist listing returned ${listed}, and ${LIMIT_SENTENCE}`);
     } else {
       coverage = 'complete';
-      sentences.push(`This playlist has ${total} video${total === 1 ? '' : 's'} in total, and listing details were available for ${total === retained ? `all ${retained}` : listed}.`);
+      sentences.push(`This playlist has ${totalText}, and listing details were available for ${total === retained ? `all ${retained}` : listed}.`);
     }
   } else if (recorded) {
+    totalText = 'total not reported';
     if (recorded.fetchedCount > retained) {
       coverage = 'incomplete';
-      sentences.push(`The playlist's total number of videos was not reported. The listing returned ${recorded.fetchedCount} videos, but details were available for only ${retained} because ${limit}, so coverage of this playlist is incomplete.`);
+      sentences.push(`The playlist's total number of videos was not reported. The listing returned ${recorded.fetchedCount} videos, but details were available for only ${retained} because ${LIMIT_SENTENCE.slice(0, -1)}, so coverage of this playlist is incomplete.`);
     } else if (recorded.morePages) {
       coverage = 'incomplete';
-      sentences.push(`The playlist's total number of videos was not reported. Listing details were available for ${listed}, and the playlist has further videos that were not listed (${limit}), so coverage of this playlist is incomplete.`);
+      sentences.push(`The playlist's total number of videos was not reported. Listing details were available for ${listed}, and the playlist has further videos that were not listed, so coverage of this playlist is incomplete. ${LIMIT_SENTENCE}`);
     } else {
       coverage = 'complete';
       sentences.push(`The playlist's total number of videos was not reported. The listing returned ${listed} with no further videos.`);
     }
   } else {
+    totalText = 'total unknown';
     coverage = 'unknown';
     sentences.push(retained >= COLLECTION_ITEM_LIMIT || packet.continuation
-      ? `The playlist's total number of videos is unknown for this saved listing. Listing details are available for ${listed}, and ${limit}, so coverage of this playlist may be incomplete.`
+      ? `The playlist's total number of videos is unknown for this saved listing. Listing details are available for ${listed}, so coverage of this playlist may be incomplete. ${LIMIT_SENTENCE}`
       : `The playlist's total number of videos is unknown for this saved listing. Listing details are available for ${listed}.`);
   }
 
@@ -104,8 +150,10 @@ function playlistDisclosure(packet: EvidencePacket, reviewedVideos: ReadonlySet<
       : `Transcript or visual content was reviewed for ${reviewed} of the ${videoIds.length} listed videos; the other ${videoIds.length - reviewed} are known only from ${known}.`);
 
   return {
+    playlistId,
     title,
     note: `**Playlist coverage (${title}):** ${sentences.join(' ')}`,
+    summary: `${title}: ${totalText}, listing details for ${retained}, content reviewed for ${reviewed}${coverage === 'incomplete' ? ' (incomplete)' : coverage === 'unknown' ? ' (may be incomplete)' : ''}`,
     data: {
       coverage,
       listLimit: COLLECTION_ITEM_LIMIT,
@@ -113,6 +161,38 @@ function playlistDisclosure(packet: EvidencePacket, reviewedVideos: ReadonlySet<
       reviewedVideos: reviewed,
       ...(recorded ? { fetchedVideos: recorded.fetchedCount } : {}),
       ...(recorded?.reportedTotal !== undefined ? { reportedTotal: recorded.reportedTotal } : {}),
+      cited: direct ? 'entry' : 'video_content',
     },
   };
+}
+
+/**
+ * The fence an answer leaves open, if any, so appended text can close it first.
+ * Follows CommonMark fence rules for top-level fences: up to three spaces of
+ * indentation, three or more backticks or tildes, an info string without
+ * backticks for backtick fences, and a closing run of the same character at
+ * least as long with nothing but whitespace after it.
+ */
+export function openCodeFence(markdown: string): string | undefined {
+  let open: { char: string; length: number } | undefined;
+  for (const line of markdown.split(/\r?\n/)) {
+    if (open) {
+      const close = /^ {0,3}(`{3,}|~{3,})[ \t]*$/.exec(line);
+      if (close && close[1]![0] === open.char && close[1]!.length >= open.length) open = undefined;
+      continue;
+    }
+    const start = /^ {0,3}(`{3,}|~{3,})(.*)$/.exec(line);
+    if (!start || (start[1]![0] === '`' && start[2]!.includes('`'))) continue;
+    open = { char: start[1]![0]!, length: start[1]!.length };
+  }
+  return open ? open.char.repeat(open.length) : undefined;
+}
+
+/** Appends application notices after the answer, outside any code block it leaves open. Code is not changed. */
+export function appendNotices(answer: string, notices: readonly string[]): string {
+  const pending = notices.filter(notice => !answer.includes(notice));
+  if (!pending.length) return answer;
+  const fence = openCodeFence(answer);
+  const body = fence ? `${answer}${answer.endsWith('\n') ? '' : '\n'}${fence}` : answer;
+  return [body, ...pending].join('\n\n');
 }
