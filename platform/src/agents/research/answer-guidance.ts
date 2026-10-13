@@ -10,6 +10,14 @@ When including a numerical comparison, preserve both sides when supported. Read 
 Include costs, timings, and benchmark statistics only when they help answer the question and their workload, setup, and comparison are clear. Never present one task's measured cost as a general per-task price. Omit promotional claims and unrelated benchmarks.
 Select only necessary evidenceIds, usually one to three per point. Keep the answer useful on its own, with material limitations in warnings.
 `.trim();
+/**
+ * List entries reach the model in parser order. The parser groups renderer types and drops repeated
+ * videos, so an entry's place among excerpts is not its playlist position.
+ */
+export const LIST_ORDER_GUIDANCE = `
+Entries in playlist and other list evidence appear in parser order, which is not a verified position: the parser can regroup entries and drop repeated videos. State a playlist position, adjacency or order as fact only when cited evidence states it, such as a numbered chapter label, "Part 2", or a description or transcript naming the next or previous video. Do not infer order from event conventions, titles such as Opening or Closing, published dates, upload order or an entry's place among the excerpts. For a video that is not among the shown entries, say the evidence does not establish its position.
+Supported chapter labels and chronology stated in cited evidence may be reported as order. A viewing recommendation is allowed when it is labeled as a suggestion and gives its reason, for example "Suggested viewing order, not the playlist order: start with the overview talk because it defines terms the others use." Never present a suggestion as the playlist's order.
+`.trim();
 
 /** Shared writing guidance for both natural tool answers and reserved synthesis. */
 export const ANSWER_SCOPE_GUIDANCE = `
@@ -20,6 +28,7 @@ For ordinary requests, give a concise answer with the strongest distinct points.
 Use only the references needed to support each point. State each material source limitation once in warnings; preserve attribution and qualifications within claims that need them.
 For a detailed report, use compact sections or a comparison table to cover what each recommendation does, how to use it, an example and its limitations, followed by a short workflow. Avoid repeating the recommendations in a closing comparison. State objective measurements separately from subjective recommendations; do not invent best-for labels or composite metrics that the evidence does not establish.
 ${FINAL_FACT_GUIDANCE}
+${LIST_ORDER_GUIDANCE}
 ${EVIDENCE_LIMITATIONS}
 `.trim();
 export const RESEARCH_ANSWER_GUIDANCE = `${ANSWER_SCOPE_GUIDANCE}

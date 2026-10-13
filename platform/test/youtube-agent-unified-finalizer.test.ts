@@ -1484,3 +1484,54 @@ it('QA 027: the finalizer receives every retained playlist entry with its counts
   expect(result.answer).toContain('No transcript or visual content was reviewed for these videos, so statements about them rely on listing details (title, description, duration) only.');
   expect(result.answer).not.toMatch(/\b30 videos in total|\b8 (?:videos|entries) (?:are )?available/);
 });
+
+it('BCON: the finalizer gets the list-order rule and an accurate note promise, but an unsupported order claim is not rejected', async () => {
+  const { options, finalizer, identity } = setup('context_answer', true);
+  const talks = ['SciExplorer', 'Geometry Nodes Workshop', 'Grease Pencil Update', 'Studio Pipeline', 'Cycles Roadmap', 'EEVEE Next',
+    'Animation 2025', 'Sculpting Session', 'Python API Tips', 'Asset Browser', 'Open Movie Q&A', 'Fall of Reach'];
+  const playlist: EvidencePacket = {
+    packetId: 'packet:bcon', kind: 'youtube_playlist',
+    sources: talks.map((title, index) => ({ id: `youtube:playlist:PLbcon:b${String(index).padStart(10, '0')}:${index}`,
+      provider: 'youtube' as const, kind: 'playlist' as const, playlistId: 'PLbcon', videoId: `b${String(index).padStart(10, '0')}`, title })),
+    excerpts: talks.map((title, index) => ({ id: `playlist:bcon:${index}`,
+      sourceId: `youtube:playlist:PLbcon:b${String(index).padStart(10, '0')}:${index}`, text: `${title}\nChannel: Blender\nDuration: 30:00` })),
+    artifacts: [{ type: 'youtube_playlist', title: 'Blender Conference', data: { videoCount: 94,
+      collection: { version: 1, fetchedCount: 94, retainedCount: 12, reportedTotal: 94, reportedTotalText: '94 videos', morePages: false, continuationAccepted: false } } }],
+    warnings: [], usage: [],
+  };
+  // Search titles identify the two talks but say nothing about their playlist position.
+  const search: EvidencePacket = {
+    packetId: 'packet:search', kind: 'youtube_search',
+    sources: ['suzanneaw01', 'closingev01'].map((videoId, index) => ({ id: `youtube:search:${videoId}:${index}`,
+      provider: 'youtube' as const, kind: 'search' as const, videoId, title: index ? 'Closing Event' : 'Suzanne Awards' })),
+    excerpts: ['Suzanne Awards', 'Closing Event'].map((title, index) => ({ id: `search:call:${index}`,
+      sourceId: `youtube:search:${['suzanneaw01', 'closingev01'][index]}:${index}`, text: `${title}\nChannel: Blender\nPublished: 1 year ago` })),
+    artifacts: [], warnings: [], usage: [],
+  };
+  options.message = 'In the conference playlist, does the Suzanne Awards come right before the Closing Event?';
+  options.conversationHistory = [{ ...options.conversationHistory![0]!, evidence: [playlist, search] }];
+  vi.mocked(options.finalize).mockImplementation(async (_id, input) =>
+    buildAgentTurnResult(identity, { userId: 'user', creditsRemaining: 100 }, input, [playlist, search], 0));
+  const claim = 'The Suzanne Awards come directly before the Closing Event in the playlist.';
+  const calls: typeof finalizer.doGenerateCalls = [];
+  finalizer.doGenerate = async call => {
+    calls.push(call);
+    return { content: [{ type: 'text', text: JSON.stringify({ confidence: 'medium', warnings: [], blocks: [{
+      text: claim, evidenceIds: ['ref_13', 'ref_14'] }] }) }],
+    finishReason: { unified: 'stop', raw: 'stop' }, usage, warnings: [] };
+  };
+  await executeResearchRun(options);
+  expect(calls).toHaveLength(1);
+  const prompt = JSON.stringify(calls[0]!.prompt);
+  expect(prompt).toContain('State a playlist position, adjacency or order as fact only when cited evidence states it');
+  expect(prompt).toContain('A viewing recommendation is allowed when it is labeled as a suggestion and gives its reason');
+  expect(prompt).toContain('When the answer cites a playlist entry, or reviewed transcript or visual content for a listed video, the application appends a playlist coverage note');
+  expect(prompt).toContain('Otherwise no note is appended, so state any material playlist coverage limit yourself.');
+  expect(prompt).not.toContain('The application appends a playlist coverage note stating');
+  const result: AgentTurnResult = await vi.mocked(options.finalize).mock.results[0]!.value;
+  expect(result.citations.map(citation => citation.id)).toEqual(['search:call:0', 'search:call:1']);
+  // Guidance only: the application still accepts the claim unchanged, and metadata citations add no playlist note.
+  expect(result.answer).toContain(claim);
+  expect(result.answer).not.toContain('**Playlist coverage');
+  expect(result.artifacts.some(artifact => artifact.type === 'playlist_coverage')).toBe(false);
+});
