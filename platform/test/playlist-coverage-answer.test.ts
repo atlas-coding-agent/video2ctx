@@ -4,6 +4,7 @@ import { buildAgentTurnResult } from '../src/agents/finalizer';
 import { fromMarkdown } from 'mdast-util-from-markdown';
 import { appendNotices } from '../src/agents/playlist-coverage';
 import { collectionRetrieval } from '../src/agents/runtime/collection-coverage';
+import { evidencePacketForModel, transcriptAwaitsAnalysis } from '../src/agents/runtime/model-evidence';
 
 const identity = { runId: crypto.randomUUID(), conversationId: crypto.randomUUID(), userMessageId: crypto.randomUUID(), agentMessageId: crypto.randomUUID() };
 const admission = { userId: 'user', creditsRemaining: 100 };
@@ -171,6 +172,65 @@ describe('playlist coverage disclosure in final responses', () => {
     const artifacts = response.artifacts.filter(artifact => artifact.type === 'playlist_coverage');
     expect(artifacts.map(artifact => [artifact.data.playlistId, artifact.data.reportedTotal, artifact.data.cited])).toEqual([
       ['PL1', 21, 'entry'], ['PL2', 22, 'entry'], ['PL3', 23, 'entry'], ['PL4', 97, 'entry'], ['PL5', 55, 'video_content']]);
+  });
+
+  describe('review: reviewed content matches what the model saw', () => {
+    const packets = (...content: EvidencePacket[]) => [playlist(collectionRetrieval({ fetchedCount: 30, retainedCount: 12, reportedTotal: 45, continuationAccepted: false })), ...content];
+    const id = videoId(11);
+    const source = { id: `youtube:${id}:transcript`, provider: 'youtube' as const, kind: 'transcript' as const, videoId: id };
+    // get_video_transcript under contextual analysis: the raw text is saved for an analyst and withheld from the model.
+    const awaitingAnalysis: EvidencePacket = { packetId: 'packet:raw', kind: 'youtube_transcript', sources: [source],
+      excerpts: [{ id: `transcript:${id}:0`, sourceId: source.id, text: 'The fundamental theorem links derivatives and integrals.' }],
+      artifacts: [{ type: 'youtube_complete_transcript', data: { requiresAnalysis: true, videoId: id } }], warnings: [], usage: [] };
+    // analyze_video_transcripts success: a separate packet with the analyst's selected excerpts.
+    const analyzed: EvidencePacket = { packetId: 'packet:analysis', kind: 'youtube_transcript', sources: [source],
+      excerpts: [{ id: `analysis:${id}:0`, sourceId: source.id, text: 'The fundamental theorem links derivatives and integrals.' }],
+      artifacts: [{ type: 'youtube_transcript_analysis', data: { summary: 'Chapter 12 covers the fundamental theorem.',
+        findings: [{ claim: 'It links derivatives and integrals.', excerptIds: [`analysis:${id}:0`] }],
+        coverage: { completeTranscriptRead: true, segmentCount: 1, startMs: 0, endMs: 1_000 }, selectedExcerptCount: 1 } }], warnings: [], usage: [] };
+    // read_session_evidence: a paged read (limit up to 30) has no artifact; a full read sets requiresAnalysis to false.
+    const pagedRead: EvidencePacket = { ...awaitingAnalysis, packetId: 'session:7:0:30:x', assetVersions: ['7'],
+      excerpts: [{ id: 'evidence:7:0', sourceId: source.id, text: 'The fundamental theorem links derivatives and integrals.' }], artifacts: [] };
+    const fullRead: EvidencePacket = { ...pagedRead, packetId: 'session:7:0:5000:x',
+      artifacts: [{ type: 'youtube_complete_transcript', data: { requiresAnalysis: false, allReturnedSegmentsIncluded: true } }] };
+    const reviewed = (response: ReturnType<typeof result>) =>
+      response.artifacts.find(artifact => artifact.type === 'playlist_coverage')!.data.reviewedVideos;
+
+    it('failed analysis: a raw transcript awaiting analysis is not reviewed content, even when its excerpt is cited', () => {
+      const listed = result(packets(awaitingAnalysis), ['playlist:call:11']);
+      expect(reviewed(listed)).toBe(0);
+      expect(listed.answer).toContain('No transcript or visual content was reviewed for these videos');
+      // Citing only the withheld raw excerpt does not make the playlist relied on through content.
+      const rawOnly = result(packets(awaitingAnalysis), [`transcript:${id}:0`]);
+      expect(rawOnly.artifacts.some(artifact => artifact.type === 'playlist_coverage')).toBe(false);
+      expect(rawOnly.answer).not.toContain('Playlist coverage');
+    });
+
+    it('successful analysis counts the video as reviewed and relies on the playlist through it', () => {
+      expect(reviewed(result(packets(awaitingAnalysis, analyzed), ['playlist:call:0']))).toBe(1);
+      const viaContent = result(packets(awaitingAnalysis, analyzed), [`analysis:${id}:0`]);
+      expect(reviewed(viaContent)).toBe(1);
+      expect(viaContent.artifacts.find(artifact => artifact.type === 'playlist_coverage')!.data.cited).toBe('video_content');
+      expect(viaContent.answer).toContain('Transcript or visual content was reviewed for 1 of the 12 listed videos');
+    });
+
+    it('a paged session read counts as reviewed', () => {
+      expect(reviewed(result(packets(pagedRead), ['playlist:call:0']))).toBe(1);
+      expect(reviewed(result(packets(awaitingAnalysis, pagedRead), ['evidence:7:0']))).toBe(1);
+    });
+
+    it('a full read with requiresAnalysis false counts as reviewed', () => {
+      expect(reviewed(result(packets(fullRead), ['playlist:call:0']))).toBe(1);
+      expect(reviewed(result(packets(fullRead), ['evidence:7:0']))).toBe(1);
+    });
+
+    it('matches the model projection for each packet', () => {
+      for (const [packet, shown] of [[awaitingAnalysis, false], [analyzed, true], [pagedRead, true], [fullRead, true]] as const) {
+        expect(transcriptAwaitsAnalysis(packet)).toBe(!shown);
+        const model = evidencePacketForModel(packet);
+        expect((model.excerpts?.length ?? 0) > 0 || !!model.transcriptAnalysis).toBe(shown);
+      }
+    });
   });
 });
 

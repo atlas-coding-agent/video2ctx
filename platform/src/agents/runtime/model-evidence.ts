@@ -104,6 +104,14 @@ export interface OmittedEvidenceNotice {
 }
 
 /**
+ * A raw transcript saved for analysis. Its text never reaches the model;
+ * only a separate youtube_transcript_analysis packet carries reviewed content.
+ */
+export function transcriptAwaitsAnalysis(packet: Pick<EvidencePacket, 'artifacts'>): boolean {
+  return packet.artifacts.some(artifact => artifact.type === 'youtube_complete_transcript' && !!artifact.data.requiresAnalysis);
+}
+
+/**
  * Produces the evidence representation that a model may read. The full packet
  * remains the source of truth for billing, recovery, and citation validation.
  */
@@ -113,7 +121,7 @@ export function evidencePacketForModel(packet: EvidencePacket): ModelEvidencePac
     return modelEvidencePacketSchema.parse({
       packetId: packet.packetId, kind: packet.kind, sources: packet.sources, assetVersions: packet.assetVersions,
       continuation: packet.continuation,
-      excerpts: packet.artifacts.some(artifact => artifact.type === 'youtube_complete_transcript' && artifact.data.requiresAnalysis) ? [] : packet.excerpts,
+      excerpts: transcriptAwaitsAnalysis(packet) ? [] : packet.excerpts,
       artifacts: packet.artifacts.map(({ type, title }) => ({ type, title })), warnings: packet.warnings,
     });
   }

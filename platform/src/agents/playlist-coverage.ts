@@ -1,6 +1,7 @@
 import { fromMarkdown } from 'mdast-util-from-markdown';
 import type { AgentArtifact, EvidencePacket } from './contracts';
 import { COLLECTION_ITEM_LIMIT, readCollectionRetrieval } from './runtime/collection-coverage';
+import { transcriptAwaitsAnalysis } from './runtime/model-evidence';
 
 /** Packets whose excerpts are reviewed video content, as opposed to listing metadata. */
 const REVIEWED_CONTENT_KINDS = new Set<EvidencePacket['kind']>(['youtube_transcript', 'youtube_storyboard', 'youtube_frames']);
@@ -54,7 +55,9 @@ export function playlistCoverageDisclosures(
   // Earliest citation of reviewed content per video.
   const citedContent = new Map<string, number>();
   for (const packet of packets) {
-    if (!REVIEWED_CONTENT_KINDS.has(packet.kind)) continue;
+    // A raw transcript awaiting analysis was never shown to the model, so it was not reviewed,
+    // whether or not the analysis later failed.
+    if (!REVIEWED_CONTENT_KINDS.has(packet.kind) || transcriptAwaitsAnalysis(packet)) continue;
     for (const excerpt of packet.excerpts) {
       const videoId = excerpt.text.trim() ? sourceVideo(packet, excerpt.sourceId) : undefined;
       if (!videoId) continue;
