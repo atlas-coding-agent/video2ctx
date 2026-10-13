@@ -9,6 +9,7 @@ import {
   type EvidencePacket,
   type FinalizeAnswerInput,
 } from './contracts';
+import { appendNotices, playlistCoverageDisclosures } from './playlist-coverage';
 
 const CITATION_MARKER = /\[cite:([A-Za-z0-9:_-]+)\]/g;
 
@@ -63,6 +64,10 @@ export function buildAgentTurnResult(
     ? mapCitationProse(input.answer, prose => prose.replace(CITATION_MARKER, (marker, id: string) => unresolved.has(id) ? '[source unavailable]' : marker))
     : input.answer;
 
+  // The application states playlist totals, the listing limit and reviewed content itself.
+  const playlistCoverage = playlistCoverageDisclosures(packets, citations.map(citation => citation.id));
+  const disclosedAnswer = appendNotices(answer, playlistCoverage.notes);
+
   const warnings = deduplicateWarnings([
     ...packets.flatMap((packet) => packet.warnings),
     ...input.warnings,
@@ -71,11 +76,11 @@ export function buildAgentTurnResult(
 
   return agentTurnResultSchema.parse({
     ...identity,
-    answer,
+    answer: disclosedAnswer,
     intent: input.intent,
     confidence: input.confidence,
     citations,
-    artifacts: [...packets.flatMap((packet) => packet.artifacts), ...input.artifacts],
+    artifacts: [...packets.flatMap((packet) => packet.artifacts), ...input.artifacts, ...playlistCoverage.artifacts],
     warnings,
     billing: {
       creditsCharged,

@@ -62,7 +62,7 @@ function setup(responseIntent: 'context_answer' | 'clarification' | 'rejected', 
     finalize: vi.fn(async (_id, input) => buildAgentTurnResult(identity, { userId: 'user', creditsRemaining: 100 },
       input, cited ? [evidence] : [], 0)),
   };
-  return { options, decision, classifier, finalizer, output };
+  return { options, decision, classifier, finalizer, output, identity };
 }
 
 it.each(['context_answer', 'clarification', 'rejected'] as const)('routes %s through the finalizer without research', async intent => {
@@ -1439,4 +1439,48 @@ it.each(['supported_inline', 'inline_only_mismatch'] as const)('judges figures b
     expect(result.citations.map(citation => citation.id)).toContain('e1');
     expect(result.answer).toContain('54.2g (unverified)');
   }
+});
+
+it('QA 027: the finalizer receives every retained playlist entry with its counts and may cite the last one', async () => {
+  const { options, finalizer, identity } = setup('context_answer', true);
+  const playlist: EvidencePacket = {
+    packetId: 'packet:playlist', kind: 'youtube_playlist',
+    sources: Array.from({ length: 12 }, (_, index) => ({ id: `youtube:playlist:PLcalc:v${String(index + 1).padStart(10, '0')}:${index}`,
+      provider: 'youtube' as const, kind: 'playlist' as const, playlistId: 'PLcalc', videoId: `v${String(index + 1).padStart(10, '0')}`, title: `Chapter ${index + 1}` })),
+    excerpts: Array.from({ length: 12 }, (_, index) => ({ id: `playlist:call:${index}`,
+      sourceId: `youtube:playlist:PLcalc:v${String(index + 1).padStart(10, '0')}:${index}`,
+      text: `Chapter ${index + 1} topic ${['limits', 'derivatives', 'chain rule', 'implicit', 'related rates', 'extrema', 'mean value', 'curve sketching', 'optimization', 'antiderivatives', 'riemann sums', 'fundamental theorem'][index]}\nDuration: 45:00` })),
+    artifacts: [{ type: 'youtube_playlist', title: 'Calculus course', data: {
+      videoCount: 30, collection: { version: 1, fetchedCount: 30, retainedCount: 12, morePages: true, continuationAccepted: false },
+    } }],
+    continuation: 'page-two', warnings: [], usage: [],
+  };
+  options.conversationHistory = [{ ...options.conversationHistory![0]!, evidence: [playlist] }];
+  vi.mocked(options.finalize).mockImplementation(async (_id, input) =>
+    buildAgentTurnResult(identity, { userId: 'user', creditsRemaining: 100 }, input, [playlist], 0));
+  // Replacing doGenerate bypasses the mock's own call recording, so record calls here.
+  const calls: typeof finalizer.doGenerateCalls = [];
+  finalizer.doGenerate = async call => {
+    calls.push(call);
+    return { content: [{ type: 'text', text: JSON.stringify({ confidence: 'medium', warnings: [], blocks: [{
+      text: 'Chapter 12 covers the fundamental theorem.', evidenceIds: ['ref_12'] }] }) }],
+    finishReason: { unified: 'stop', raw: 'stop' }, usage, warnings: [] };
+  };
+  await executeResearchRun(options);
+  expect(calls).toHaveLength(1);
+  const prompt = JSON.stringify(calls[0]!.prompt);
+  for (const topic of ['optimization', 'antiderivatives', 'riemann sums', 'fundamental theorem']) expect(prompt).toContain(topic);
+  expect(prompt).toContain('All 12 entries retained in this packet are shown.');
+  expect(prompt).toContain('18 more were not retained because of the agent item limit');
+  expect(prompt).toContain('No provider-stated total is available');
+  expect(prompt).not.toContain('page-two');
+  const format = calls[0]!.responseFormat;
+  expect(JSON.stringify(format)).toContain('ref_12');
+  expect(JSON.stringify(format)).not.toContain('ref_13');
+  const result = await vi.mocked(options.finalize).mock.results[0]!.value;
+  expect(result.citations).toMatchObject([{ id: 'playlist:call:11' }]);
+  // The saved response itself discloses coverage: no stated total, the 12-video limit, and listing-only evidence.
+  expect(result.answer).toContain("**Playlist coverage (Calculus course):** The playlist's total number of videos was not reported. The listing returned 30 videos, but details were available for only 12 because video2ctx lists at most 12 videos per playlist, so coverage of this playlist is incomplete.");
+  expect(result.answer).toContain('No transcript or visual content was reviewed for these videos, so statements about them rely on listing details (title, description, duration) only.');
+  expect(result.answer).not.toMatch(/\b30 videos in total|\b8 (?:videos|entries) (?:are )?available/);
 });
