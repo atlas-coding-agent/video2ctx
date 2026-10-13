@@ -1,7 +1,8 @@
 import { describe, expect, it } from 'vitest';
 import type { EvidencePacket, FinalizeAnswerInput } from '../src/agents/contracts';
 import { buildAgentTurnResult } from '../src/agents/finalizer';
-import { openCodeFence } from '../src/agents/playlist-coverage';
+import { fromMarkdown } from 'mdast-util-from-markdown';
+import { appendNotices } from '../src/agents/playlist-coverage';
 import { collectionRetrieval } from '../src/agents/runtime/collection-coverage';
 
 const identity = { runId: crypto.randomUUID(), conversationId: crypto.randomUUID(), userMessageId: crypto.randomUUID(), agentMessageId: crypto.randomUUID() };
@@ -112,27 +113,37 @@ describe('playlist coverage disclosure in final responses', () => {
     expect(response.answer).not.toContain('because video2ctx');
   });
 
-  it('review: places the notice outside an unclosed code fence and leaves the code unchanged', () => {
+  it('review: keeps the notice out of unclosed code at the top level and inside lists or quotes, without changing the answer', () => {
     const packets = [playlist(collectionRetrieval({ fetchedCount: 30, retainedCount: 12, reportedTotal: 45, continuationAccepted: false }))];
-    for (const [code, fence] of [
-      ['```python\nderivative = sympy.diff(f, x)\n```js not a close\n', '```'],
-      ['~~~~\nprint(1)\n~~~\nstill code', '~~~~'],
-      ['  ````md\n```\nnested fence text', '````'],
-    ] as const) {
-      const input = { ...answer(['playlist:call:11']), answer: `Chapter 12 covers the fundamental theorem. [cite:playlist:call:11]\n\n${code}` };
-      expect(openCodeFence(input.answer)).toBe(fence);
-      const response = buildAgentTurnResult(identity, admission, input, packets, 0);
-      expect(response.answer.startsWith(input.answer)).toBe(true);
-      const tail = response.answer.slice(input.answer.length);
-      expect(tail.startsWith(`${input.answer.endsWith('\n') ? '' : '\n'}${fence}\n\n**Playlist coverage (Calculus course):**`)).toBe(true);
-      expect(openCodeFence(response.answer)).toBeUndefined();
+    const prose = 'Chapter 12 covers the fundamental theorem. [cite:playlist:call:11]';
+    const plain = buildAgentTurnResult(identity, admission, { ...answer([]), answer: prose }, packets, 0).answer;
+    const note = plain.slice(prose.length + 2);
+    expect(note.startsWith('**Playlist coverage (Calculus course):**')).toBe(true);
+
+    // A top-level open fence or HTML block runs to the end of the document, so the notice goes before it.
+    for (const code of ['```python\nderivative = sympy.diff(f, x)\n```js not a close\n', '~~~~\nprint(1)\n~~~\nstill code', '<pre>\nunclosed preformatted text']) {
+      const text = `${prose}\n\n${code}`;
+      const response = buildAgentTurnResult(identity, admission, { ...answer([]), answer: text }, packets, 0).answer;
+      expect(response).toBe(`${prose}\n\n${note}\n\n${code}`);
+      expectNoticeOutsideCode(text, response, note);
     }
-    // Closed, indented and inline fences are not open.
-    expect(openCodeFence('```\ncode\n```\n')).toBeUndefined();
-    expect(openCodeFence('    ```\nindented code block')).toBeUndefined();
-    expect(openCodeFence('```js `x` ```')).toBeUndefined();
-    const closed = buildAgentTurnResult(identity, admission, { ...answer(['playlist:call:0']), answer: 'Text [cite:playlist:call:0]\n\n```\ncode\n```' }, packets, 0);
-    expect(closed.answer).toMatch(/^Text \[cite:playlist:call:0\]\n\n```\ncode\n```\n\n\*\*Playlist coverage/);
+    // Open fences nested in bullet, numbered and nested lists or quotes: wherever the notice goes, it is prose
+    // and removing it restores the answer exactly.
+    for (const code of [
+      '- Differentiate first:\n  ```python\n  sympy.diff(f, x)\n',
+      '1. Integrate next:\n   ~~~\n   sympy.integrate(f, x)',
+      '- Outer step\n  - Inner step\n    ```js\n    run()\n',
+      '1. Outer step\n   - Inner step\n     ~~~~\n     integrate()\n     ~~~\n',
+      '> Quoted example:\n> ```\n> code in a quote',
+    ]) {
+      const text = `${prose}\n\n${code}`;
+      expectNoticeOutsideCode(text, buildAgentTurnResult(identity, admission, { ...answer([]), answer: text }, packets, 0).answer, note);
+    }
+    expect(appendNotices('```\nonly code', ['Notice.'])).toBe('Notice.\n\n```\nonly code');
+
+    // Closed fences, and answers with no code, keep the notice at the end.
+    const closed = `${prose}\n\n- Step:\n  \`\`\`\n  code\n  \`\`\`\n\n\`\`\`\nmore\n\`\`\``;
+    expect(buildAgentTurnResult(identity, admission, { ...answer([]), answer: closed }, packets, 0).answer).toBe(`${closed}\n\n${note}`);
   });
 
   it('review: citing one playlist entry does not pull in other playlists that share the video', () => {
@@ -162,3 +173,32 @@ describe('playlist coverage disclosure in final responses', () => {
       ['PL1', 21, 'entry'], ['PL2', 22, 'entry'], ['PL3', 23, 'entry'], ['PL4', 97, 'entry'], ['PL5', 55, 'video_content']]);
   });
 });
+
+type MarkdownNode = ReturnType<typeof fromMarkdown> | ReturnType<typeof fromMarkdown>['children'][number];
+
+function codeValues(markdown: string): string[] {
+  const values: string[] = [];
+  const visit = (node: MarkdownNode) => {
+    if (node.type === 'code' || node.type === 'html') values.push(node.value);
+    if ('children' in node) for (const child of node.children) visit(child);
+  };
+  visit(fromMarkdown(markdown));
+  return values;
+}
+
+/** The notice is one root paragraph outside code, and removing it with its blank-line separator restores the answer. */
+function expectNoticeOutsideCode(text: string, response: string, note: string) {
+  const index = response.indexOf(note);
+  expect(index).toBeGreaterThan(0);
+  const atEnd = index + note.length === response.length;
+  expect(atEnd ? response.slice(index - 2, index) : response.slice(index + note.length, index + note.length + 2)).toBe('\n\n');
+  expect(atEnd ? response.slice(0, index - 2) : response.slice(0, index) + response.slice(index + note.length + 2)).toBe(text);
+  expect(codeValues(response)).toEqual(codeValues(text));
+  expect(codeValues(response).some(value => value.includes('Playlist coverage'))).toBe(false);
+  expect(rootParagraphs(response)).toContain(note);
+}
+
+function rootParagraphs(markdown: string): string[] {
+  return fromMarkdown(markdown).children.filter(child => child.type === 'paragraph')
+    .map(child => markdown.slice(child.position!.start.offset, child.position!.end.offset));
+}

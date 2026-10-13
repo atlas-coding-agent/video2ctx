@@ -1,3 +1,4 @@
+import { fromMarkdown } from 'mdast-util-from-markdown';
 import type { AgentArtifact, EvidencePacket } from './contracts';
 import { COLLECTION_ITEM_LIMIT, readCollectionRetrieval } from './runtime/collection-coverage';
 
@@ -166,33 +167,57 @@ function playlistDisclosure(playlistId: string, packet: EvidencePacket, reviewed
   };
 }
 
-/**
- * The fence an answer leaves open, if any, so appended text can close it first.
- * Follows CommonMark fence rules for top-level fences: up to three spaces of
- * indentation, three or more backticks or tildes, an info string without
- * backticks for backtick fences, and a closing run of the same character at
- * least as long with nothing but whitespace after it.
- */
-export function openCodeFence(markdown: string): string | undefined {
-  let open: { char: string; length: number } | undefined;
-  for (const line of markdown.split(/\r?\n/)) {
-    if (open) {
-      const close = /^ {0,3}(`{3,}|~{3,})[ \t]*$/.exec(line);
-      if (close && close[1]![0] === open.char && close[1]!.length >= open.length) open = undefined;
-      continue;
-    }
-    const start = /^ {0,3}(`{3,}|~{3,})(.*)$/.exec(line);
-    if (!start || (start[1]![0] === '`' && start[2]!.includes('`'))) continue;
-    open = { char: start[1]![0]!, length: start[1]!.length };
+type MarkdownNode = ReturnType<typeof fromMarkdown> | ReturnType<typeof fromMarkdown>['children'][number];
+
+/** Blocks that run to the end of their container when left open, absorbing any text appended after them. */
+const ABSORBING_BLOCKS = new Set(['code', 'html']);
+
+/** Character range of the first code or HTML block that overlaps [start, end), at any nesting depth. */
+function absorbingBlock(root: MarkdownNode, start: number, end: number): { start: number } | undefined {
+  const pending: MarkdownNode[] = [root];
+  while (pending.length) {
+    const node = pending.shift()!;
+    const from = node.position?.start.offset;
+    const to = node.position?.end.offset;
+    if (from === undefined || to === undefined || to <= start || from >= end) continue;
+    if (ABSORBING_BLOCKS.has(node.type)) return { start: from };
+    if ('children' in node) pending.push(...node.children);
   }
-  return open ? open.char.repeat(open.length) : undefined;
+  return undefined;
 }
 
-/** Appends application notices after the answer, outside any code block it leaves open. Code is not changed. */
+/** True when every notice in [start, end) parses as prose, outside code and HTML blocks. */
+function noticesAreProse(markdown: string, start: number, end: number): boolean {
+  return !absorbingBlock(fromMarkdown(markdown), start, end);
+}
+
+/**
+ * Adds application notices to an answer without changing the answer's text.
+ *
+ * Notices go at the end unless an unclosed code fence (or HTML block) would
+ * absorb them, at the top level or nested in lists or quotes. Then they go
+ * just before the top-level block that contains the open code, so the code
+ * and its list or quote keep their exact Markdown. If parsing still finds a
+ * notice inside code, the notices go first.
+ */
 export function appendNotices(answer: string, notices: readonly string[]): string {
   const pending = notices.filter(notice => !answer.includes(notice));
   if (!pending.length) return answer;
-  const fence = openCodeFence(answer);
-  const body = fence ? `${answer}${answer.endsWith('\n') ? '' : '\n'}${fence}` : answer;
-  return [body, ...pending].join('\n\n');
+  const block = pending.join('\n\n');
+  const appended = `${answer}\n\n${block}`;
+  const root = fromMarkdown(appended);
+  const absorbing = absorbingBlock(root, answer.length, appended.length);
+  if (!absorbing) return appended;
+
+  // The top-level block that holds the absorbing code, from the start of its first line.
+  const topLevel = root.children.find(child => (child.position?.start.offset ?? Infinity) <= absorbing.start
+    && (child.position?.end.offset ?? -1) > absorbing.start);
+  const blockStart = topLevel?.position?.start.offset ?? absorbing.start;
+  const lineStart = answer.lastIndexOf('\n', blockStart - 1) + 1;
+  // The prefix is kept byte for byte: trailing spaces can be indented-code data.
+  const before = answer.slice(0, lineStart);
+  const leading = before ? `${before}${before.endsWith('\n\n') ? '' : '\n'}` : '';
+  const placed = `${leading}${block}\n\n${answer.slice(lineStart)}`;
+  if (noticesAreProse(placed, leading.length, leading.length + block.length)) return placed;
+  return `${block}\n\n${answer}`;
 }
