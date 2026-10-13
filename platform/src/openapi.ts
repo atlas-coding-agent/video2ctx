@@ -2510,7 +2510,7 @@ export const openApiDocument = {
         allOf: [schemaRef('AgentRunReceipt'), {
           type: 'object', properties: {
             route: schemaRef('AgentRouteDecision'), result: schemaRef('AgentTurnResult'), error: { type: 'string' },
-            billing: { ...z.toJSONSchema(agentRunBillingSchema, { target: 'openapi-3.0' }), description: 'Settled ledger receipt for completed, failed and cancelled runs, with or without a result. creditsRemaining is the balance when the run settled. For a completed run it matches result.billing.' },
+            billing: { ...z.toJSONSchema(agentRunBillingSchema, { target: 'openapi-3.0' }), description: 'Settled ledger receipt for completed, failed and cancelled runs, with or without a result. creditsRemaining is the account balance observed when this receipt was recorded; a receipt recorded by a settlement retry reflects the balance at that retry. For a completed run it matches result.billing.' },
             billingStatus: { type: 'string', enum: ['pending', 'settled'], description: 'Terminal runs only. While pending, billing is omitted and result.billing is provisional.' },
             extractionDiagnostics: { type: 'array', maxItems: 64, items: z.toJSONSchema(storedExtractionDiagnosticSchema, { target: 'openapi-3.0' }) },
             extractionDiagnosticsTruncated: { type: 'boolean' },

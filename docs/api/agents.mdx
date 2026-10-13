@@ -138,7 +138,10 @@ Completed, failed, and cancelled runs report `billingStatus`. Once it is
 `creditsCharged`, `creditsRemaining`, and itemized `charges` when credits were
 charged. This also applies to failed and cancelled runs with no `result`. A failed
 run can still charge for evidence retrieved before it stopped. `creditsRemaining`
-is the account balance when the run settled, not your current balance.
+is the account balance observed when the receipt was recorded, not your current
+balance. Settlement charges a run once, even when it is retried. If a retry has to
+record the receipt again, for example after an interrupted save, `creditsRemaining`
+reflects the balance at that retry.
 
 While `billingStatus` is `pending`, the run has ended but its settlement is not
 recorded yet. Responses omit `billing`, and the event stream keeps sending

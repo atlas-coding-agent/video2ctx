@@ -789,7 +789,7 @@ test('failed and cancelled runs show their settled credit receipt, and a pending
   release(); settlement = undefined;
   await expect(receiptView).toBeVisible();
   await expect(receiptView).toContainText('4 credits charged');
-  await expect(receiptView).toContainText('Balance at settlement: 671 credits');
+  await expect(receiptView).toContainText('Balance when recorded: 671 credits');
   await expect(receiptView.getByRole('listitem')).toHaveText([
     'get_video_transcript · transcript (fresh) · K48wIslK7zg: 3 credits', 'get_video · video (cached) · K48wIslK7zg: 1 credit',
   ]);
@@ -805,13 +805,13 @@ test('failed and cancelled runs show their settled credit receipt, and a pending
   connections = 0; states = [{ billingStatus: 'settled', billing: receipt }];
   await page.reload();
   await expect(receiptView).toContainText('4 credits charged');
-  await expect(receiptView).toContainText('Balance at settlement: 671 credits');
+  await expect(receiptView).toContainText('Balance when recorded: 671 credits');
 
   status = 'cancelled'; connections = 0; states = [{ billingStatus: 'settled', billing: { creditsCharged: 0, creditsRemaining: 675 } }];
   await page.reload();
   await expect(message.getByText('This run was cancelled before an answer was saved.')).toBeVisible();
   await expect(receiptView).toContainText('0 credits charged');
-  await expect(receiptView).toContainText('Balance at settlement: 675 credits');
+  await expect(receiptView).toContainText('Balance when recorded: 675 credits');
   await expect(receiptView.getByRole('listitem')).toHaveCount(0);
 
   // Runs settled before receipts were stored say so instead of reconstructing a balance.

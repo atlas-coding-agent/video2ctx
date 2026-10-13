@@ -209,7 +209,10 @@ export const finalizeAnswerInputSchema = z.object({
   warnings: z.array(agentWarningSchema).max(50).default([]),
 });
 
-/** The run's ledger settlement. creditsRemaining is the balance read when the run settled, never a later balance. */
+/**
+ * The run's ledger settlement. creditsRemaining is the account balance observed when this receipt was
+ * recorded. The charge is idempotent, but a retry after a lost checkpoint records the balance at that retry.
+ */
 export const agentRunBillingSchema = z.object({
   creditsCharged: z.number().int().nonnegative(),
   creditsRemaining: z.number().int().nonnegative(),

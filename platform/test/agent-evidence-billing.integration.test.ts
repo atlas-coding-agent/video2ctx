@@ -290,7 +290,7 @@ test('admits saved analysis inputs before inference without counting a hold, and
 import { vi } from 'vitest';
 import { AGENT_CREDIT_RESERVE, reserveAgentCredits } from '../src/agents/runtime/billing';
 import { compactAgentRun } from '../src/agents/response';
-import type { AgentRunView } from '../src/agents/agent-runtime-do';
+import type { AgentRunView, AgentRuntimeDO } from '../src/agents/agent-runtime-do';
 import { creditBalance } from '../src/lib/entitlements';
 import type { EvidenceToolExecution } from '../src/agents/providers/youtube/tool-context';
 import type { AgentTurnResult, FinalizeAnswerInput } from '../src/agents/contracts';
@@ -451,6 +451,9 @@ test('a finalize-only answer from saved evidence pays for that evidence and repo
 
 type RuntimeStub = ReturnType<typeof env.AGENT_RUNTIME.getByName>;
 const readView = async (runtime: RuntimeStub, runId: string) => await runtime.getRun(runId) as AgentRunView | null;
+// The stub's RPC typing collapses the progress snapshot to never; read it as the method's declared result.
+const readProgress = async (runtime: RuntimeStub, runId: string) =>
+  await runtime.getRunProgress(runId) as Awaited<ReturnType<AgentRuntimeDO['getRunProgress']>>;
 const paidReadThenFail = (runtime: RuntimeStub, runId: string, error: string) => runInDurableObject(runtime, async instance => {
   (instance as unknown as RuntimeInternals).deliverEvidence(runId, 'read_session_evidence', [packet('read', [v(1)])]);
   instance.sql`UPDATE agent_runs SET status = 'failed', phase = 'failed', error = ${error} WHERE id = ${runId}`;
@@ -471,7 +474,7 @@ test('a failed run without an answer reports its settled receipt once, across re
   await reserveAgentCredits(env, userId, crypto.randomUUID());
   for (let read = 0; read < 3; read++) {
     expect((await readView(runtime, runId!))?.billing).toEqual(receipt);
-    const progress = await runtime.getRunProgress(runId!);
+    const progress = await readProgress(runtime, runId!);
     expect(progress?.run).toMatchObject({ status: 'failed', billingStatus: 'settled', billing: receipt });
     expect(progress?.run).not.toHaveProperty('result');
   }
@@ -496,7 +499,7 @@ test('zero-credit failures and cancellations report a settled zero receipt witho
       expect(run).toMatchObject({ billingStatus: 'settled' });
       expect(run?.billing).toEqual({ creditsCharged: 0, creditsRemaining });
       expect(run).not.toHaveProperty('result');
-      expect((await runtime.getRunProgress(runId))?.run.billing).toEqual({ creditsCharged: 0, creditsRemaining });
+      expect((await readProgress(runtime, runId))?.run.billing).toEqual({ creditsCharged: 0, creditsRemaining });
     }
     expect(await settled(userId, runId)).toEqual([{ credits: AGENT_CREDIT_RESERVE }]);
   }
@@ -513,7 +516,7 @@ test('a finished run whose settlement is not recorded reports pending billing, t
     const pending = await readView(runtime, runId!);
     expect(pending).toMatchObject({ status: 'failed', error: 'Research timed out.', billingStatus: 'pending' });
     expect(pending).not.toHaveProperty('billing');
-    const progress = await runtime.getRunProgress(runId!);
+    const progress = await readProgress(runtime, runId!);
     expect(progress?.run).toMatchObject({ status: 'failed', billingStatus: 'pending' });
     expect(progress?.run).not.toHaveProperty('billing');
   }
@@ -523,7 +526,7 @@ test('a finished run whose settlement is not recorded reports pending billing, t
   expect(await reserveAgentCredits(env, userId, runId!)).toBe(true);
   const receipt = { creditsCharged: 1, creditsRemaining: beforeRestore - 1, charges: [transcriptCharge] };
   expect(await readView(runtime, runId!)).toMatchObject({ billingStatus: 'settled', billing: receipt });
-  expect((await runtime.getRunProgress(runId!))?.run).toMatchObject({ billingStatus: 'settled', billing: receipt });
+  expect((await readProgress(runtime, runId!))?.run).toMatchObject({ billingStatus: 'settled', billing: receipt });
   expect(await settled(userId, runId!)).toEqual([{ credits: AGENT_CREDIT_RESERVE - 1 }]);
 });
 

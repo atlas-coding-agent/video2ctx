@@ -43,7 +43,7 @@ export const compactAgentRunSchema = agentRunReceiptSchema.pick({
 }).extend({
   sessionId: z.string().uuid(),
   result: compactAgentResultSchema.optional(),
-  billing: agentRunBillingSchema.optional().describe('Settled ledger receipt. Present for completed, failed and cancelled runs once billingStatus is settled, whether or not an answer was saved. creditsRemaining is the balance when the run settled, not the current balance.'),
+  billing: agentRunBillingSchema.optional().describe('Settled ledger receipt. Present for completed, failed and cancelled runs once billingStatus is settled, whether or not an answer was saved. creditsRemaining is the account balance observed when this receipt was recorded, not the current balance. A receipt recorded by a settlement retry reflects the balance at that retry.'),
   billingStatus: z.enum(['pending', 'settled']).optional().describe('Terminal runs only. pending means the credit settlement is not recorded yet, so no final receipt is reported. A settled run from before receipts were stored for failed or cancelled runs may have no billing.'),
   error: z.string().optional(),
   diagnostics: agentRunReceiptSchema.pick({

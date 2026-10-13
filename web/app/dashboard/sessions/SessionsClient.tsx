@@ -265,7 +265,7 @@ function RunReceipt({ run }: { run: AgentRun }) {
   if (!run.billing) return run.billingStatus === 'settled' ? <p className='agent-run-receipt'>No credit receipt was saved for this earlier run.</p> : null;
   const { creditsCharged, creditsRemaining, charges = [] } = run.billing;
   return <section className='agent-run-receipt' aria-label='Credit receipt'>
-    <p><strong>{creditCount(creditsCharged)} charged</strong> · Balance at settlement: {creditCount(creditsRemaining)}</p>
+    <p><strong>{creditCount(creditsCharged)} charged</strong> · Balance when recorded: {creditCount(creditsRemaining)}</p>
     {!!charges.length && <ul>{charges.map((charge, index) => <li key={index}>
       {charge.source} · {charge.operation} ({charge.price}){charge.videoId ? ` · ${charge.videoId}` : ''}: {creditCount(charge.credits)}
     </li>)}</ul>}

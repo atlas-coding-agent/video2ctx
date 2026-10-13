@@ -1021,8 +1021,8 @@ export class AgentRuntimeDO extends Agent<Env, AgentRuntimeState> {
     // Failed and cancelled runs keep the same receipt as answered ones; the answer is never required.
     const billing: AgentRunBilling = { creditsCharged: actual, creditsRemaining: remaining, ...(charges.length ? { charges } : {}) };
     if (result) result.billing = billing;
-    // A concurrent read may have settled first. Keep the first recorded receipt rather than
-    // replacing its balance with one read later.
+    // The ledger charge is idempotent. This guard only keeps a receipt already recorded here, e.g. by a
+    // concurrent read. If D1 settled but this checkpoint was lost, the retry records the balance it observes now.
     this.sql`UPDATE agent_runs SET billing_settled = 1, billing_json = ${JSON.stringify(billing)},
       result_json = ${result ? JSON.stringify(result) : null} WHERE id = ${runId} AND billing_settled = 0`;
   }
@@ -1816,7 +1816,7 @@ export class AgentRuntimeDO extends Agent<Env, AgentRuntimeState> {
     }
     if (!columns.some(column => column.name === 'billing_json')) {
       // Earlier settlements stored a receipt only inside a completed result. Their failed and
-      // cancelled runs have no recorded balance, so leave them without one rather than read a later balance.
+      // cancelled runs have no recorded receipt, so leave them without one rather than report today's balance.
       this.sql`ALTER TABLE agent_runs ADD COLUMN billing_json TEXT`;
     }
     if (!columns.some(column => column.name === 'classification_deadline_at')) {

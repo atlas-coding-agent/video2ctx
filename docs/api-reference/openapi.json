@@ -8058,7 +8058,7 @@
                 "additionalProperties": false
               },
               "billing": {
-                "description": "Settled ledger receipt. Present for completed, failed and cancelled runs once billingStatus is settled, whether or not an answer was saved. creditsRemaining is the balance when the run settled, not the current balance.",
+                "description": "Settled ledger receipt. Present for completed, failed and cancelled runs once billingStatus is settled, whether or not an answer was saved. creditsRemaining is the account balance observed when this receipt was recorded, not the current balance. A receipt recorded by a settlement retry reflects the balance at that retry.",
                 "type": "object",
                 "properties": {
                   "creditsCharged": {
@@ -9639,7 +9639,7 @@
             "additionalProperties": false
           },
           "billing": {
-            "description": "Settled ledger receipt. Present for completed, failed and cancelled runs once billingStatus is settled, whether or not an answer was saved. creditsRemaining is the balance when the run settled, not the current balance.",
+            "description": "Settled ledger receipt. Present for completed, failed and cancelled runs once billingStatus is settled, whether or not an answer was saved. creditsRemaining is the account balance observed when this receipt was recorded, not the current balance. A receipt recorded by a settlement retry reflects the balance at that retry.",
             "type": "object",
             "properties": {
               "creditsCharged": {
@@ -11285,7 +11285,7 @@
                   "creditsRemaining"
                 ],
                 "additionalProperties": false,
-                "description": "Settled ledger receipt for completed, failed and cancelled runs, with or without a result. creditsRemaining is the balance when the run settled. For a completed run it matches result.billing."
+                "description": "Settled ledger receipt for completed, failed and cancelled runs, with or without a result. creditsRemaining is the account balance observed when this receipt was recorded; a receipt recorded by a settlement retry reflects the balance at that retry. For a completed run it matches result.billing."
               },
               "billingStatus": {
                 "type": "string",

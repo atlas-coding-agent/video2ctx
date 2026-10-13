@@ -378,6 +378,31 @@ test('recovers a D1 settlement committed before the SQLite checkpoint', async ()
   });
 });
 
+test('a settlement replayed after a lost checkpoint charges once and records the balance observed at replay', async () => {
+  const { runtime, userId, runId } = await seed('agent-checkpoint-loss-replay');
+  const settleRows = async () => (await env.DB.prepare(
+    "SELECT credits FROM credit_ledger WHERE user_id = ? AND operation_id = ? AND entry_type = 'settle'")
+    .bind(userId, `agent:${runId}`).all<{ credits: number }>()).results;
+  expect(await runtime.getRun(runId) as AgentRunView | null)
+    .toMatchObject({ status: 'failed', billingStatus: 'settled', billing: { creditsCharged: 1, creditsRemaining: 999 } });
+  // D1 committed the settlement, but the Durable Object's SQLite checkpoint for it was lost.
+  await runInDurableObject(runtime, async instance => {
+    instance.sql`UPDATE agent_runs SET billing_settled = 0, billing_json = NULL WHERE id = ${runId}`;
+  });
+  // Another account operation changes the balance before the retry.
+  await reserveAgentCredits(env, userId, 'after-checkpoint-loss');
+  const replayed = await runtime.getRun(runId) as AgentRunView | null;
+  // The charge is not repeated, but the rewritten receipt records the balance observed at the retry.
+  expect(replayed).toMatchObject({ billingStatus: 'settled', billing: { creditsCharged: 1, creditsRemaining: 977 } });
+  expect(await settleRows()).toHaveLength(1);
+  expect(await creditBalance(env, userId)).toBe(977);
+  // Once recorded, the receipt is kept: later reads and reconciliation do not rewrite it.
+  await reserveAgentCredits(env, userId, 'after-replay');
+  await runtime.reconcileRun(runId);
+  expect((await runtime.getRun(runId) as AgentRunView | null)?.billing).toEqual(replayed?.billing);
+  expect(await settleRows()).toHaveLength(1);
+});
+
 test('completed responses use the settled ledger balance, not their admission snapshot', async () => {
   const { runtime, userId, runId, conversationId } = await seed('agent-completed-runtime', 'completed');
   await runInDurableObject(runtime, async instance => {
