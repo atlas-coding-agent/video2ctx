@@ -1,6 +1,9 @@
 import { z } from 'zod';
 import type { EvidencePacket } from '../contracts';
 
+/** Entries one provider list tool keeps per page. Shared by every list tool and by user-facing disclosures. */
+export const COLLECTION_ITEM_LIMIT = 12;
+
 /**
  * Entry-list packets: one excerpt and one source per listed entry. Comments,
  * transcripts and visual packets have their own projections and are excluded.

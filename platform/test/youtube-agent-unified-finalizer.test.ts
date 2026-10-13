@@ -1479,4 +1479,8 @@ it('QA 027: the finalizer receives every retained playlist entry with its counts
   expect(JSON.stringify(format)).not.toContain('ref_13');
   const result = await vi.mocked(options.finalize).mock.results[0]!.value;
   expect(result.citations).toMatchObject([{ id: 'playlist:call:11' }]);
+  // The saved response itself discloses coverage: no stated total, the 12-video limit, and listing-only evidence.
+  expect(result.answer).toContain("**Playlist coverage (Calculus course):** The playlist's total number of videos was not reported. The listing returned 30 videos, but details were available for only 12 because video2ctx lists at most 12 videos per playlist, so coverage of this playlist is incomplete.");
+  expect(result.answer).toContain('No transcript or visual content was reviewed for these videos, so statements about them rely on listing details (title, description, duration) only.');
+  expect(result.answer).not.toMatch(/\b30 videos in total|\b8 (?:videos|entries) (?:are )?available/);
 });

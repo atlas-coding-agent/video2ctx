@@ -1,5 +1,5 @@
 import { isDataOperation, retrievalUsage } from '../../../runtime/evidence-billing';
-import { collectionRetrieval } from '../../../runtime/collection-coverage';
+import { COLLECTION_ITEM_LIMIT, collectionRetrieval } from '../../../runtime/collection-coverage';
 import type { SearchResult, SourceMetadata } from 'all-things-youtube';
 import { z } from 'zod';
 import type { DataOperation, MeteredCacheStatus } from '../../../../lib/metering';
@@ -13,7 +13,7 @@ import type { CachedResult } from '../../../../lib/youtube';
 import type { AgentToolContext } from '../tool-context';
 import type { YouTubeProviderToolName } from '../tool-names';
 
-export const MAX_PROVIDER_ITEMS = 12;
+export const MAX_PROVIDER_ITEMS = COLLECTION_ITEM_LIMIT;
 export const videoIdSchema = z.string().regex(/^[A-Za-z0-9_-]{11}$/);
 export const channelIdSchema = z.string().trim().min(1).max(200).regex(/^[A-Za-z0-9_@.\-]+$/);
 export const playlistIdSchema = z.string().trim().min(2).max(200).regex(/^[A-Za-z0-9_-]+$/);
