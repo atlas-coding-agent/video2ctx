@@ -120,7 +120,7 @@ export function evidencePacketForModel(packet: EvidencePacket): ModelEvidencePac
   if (packet.artifacts.some(artifact => artifact.type === 'youtube_complete_transcript')) {
     return modelEvidencePacketSchema.parse({
       packetId: packet.packetId, kind: packet.kind, sources: packet.sources, assetVersions: packet.assetVersions,
-      continuation: packet.continuation,
+      continuation: packet.kind === 'youtube_search' ? undefined : packet.continuation,
       excerpts: transcriptAwaitsAnalysis(packet) ? [] : packet.excerpts,
       artifacts: packet.artifacts.map(({ type, title }) => ({ type, title })), warnings: packet.warnings,
     });
@@ -209,7 +209,7 @@ function collectionPacketForModel(
   const textLimit = options.textLimit ?? MODEL_EXCERPT_CHARACTERS;
   // get_playlist never accepted a continuation, including for packets saved before retrieval counts existed.
   const accepted = retrieval?.continuationAccepted ?? packet.kind !== 'youtube_playlist';
-  const continuationShown = (options.continuation ?? true) && accepted && !!packet.continuation;
+  const continuationShown = packet.kind !== 'youtube_search' && (options.continuation ?? true) && accepted && !!packet.continuation;
   const excerpts = packet.excerpts.slice(0, shown).map(excerpt => ({
     ...excerpt,
     text: boundedText(excerpt.text, textLimit),
@@ -424,6 +424,22 @@ function serializedLength(value: unknown): number {
 export function finalizationEvidenceForModel(
   packets: readonly EvidencePacket[], maxCharacters: number, comparisonVideoIds: readonly string[] = [],
 ) {
+  // Raw retrieval is not the answer input once a complete analyst result covers
+  // that exact saved version. Never substitute an analysis of another version.
+  const analyzedVersions = new Set(packets.flatMap(packet =>
+    readTranscriptAnalysis(packet)?.coverage.completeTranscriptRead ? packet.assetVersions ?? [] : []));
+  const handoff = packets.filter(packet => !(transcriptAwaitsAnalysis(packet)
+    && packet.assetVersions?.length && packet.assetVersions.every(version => analyzedVersions.has(version))));
+  const missingInputs: Array<{ reason: string; packetId?: string; assetVersions?: string[]; videoId?: string }> = [];
+  for (const packet of handoff) {
+    const raw = packet.artifacts.find(artifact => artifact.type === 'youtube_complete_transcript');
+    const analysis = readTranscriptAnalysis(packet);
+    const reason = transcriptAwaitsAnalysis(packet) ? 'transcript_analysis_missing'
+      : analysis && !analysis.coverage.completeTranscriptRead ? 'transcript_analysis_incomplete'
+      : (packet.kind !== 'youtube_search' && packet.continuation) || raw?.data.allReturnedSegmentsIncluded === false
+        ? 'source_page_missing' : undefined;
+    if (reason) missingInputs.push({ reason, packetId: packet.packetId, assetVersions: packet.assetVersions });
+  }
   const aliases = new Map<string, string>();
   const fullIds = new Map<string, string>();
   const alias = (id: string) => {
@@ -432,7 +448,7 @@ export function finalizationEvidenceForModel(
     return value;
   };
   // Shorten IDs before measuring the input budget, not only after truncation.
-  const compact = packets.map(packet => {
+  const compact = handoff.map(packet => {
     const analysis = readTranscriptAnalysis(packet);
     return { ...packet,
       excerpts: packet.excerpts.map(excerpt => ({ ...excerpt, id: alias(excerpt.id) })),
@@ -461,5 +477,22 @@ export function finalizationEvidenceForModel(
     ...(packet.transcriptAnalysis?.findings.flatMap(finding => finding.excerptIds) ?? []),
   ]));
   for (const [full, short] of aliases) if (included.has(short)) fullIds.set(short, full);
-  return { evidence, fullIds, omitted };
+  // Identify actual handoff inputs lost to the prompt budget or subject filter.
+  // Normal model projection is intentional; additional reduction is a gap.
+  for (const packet of compact) {
+    const expected = evidencePacketForModel(packet);
+    const actual = evidence.find(item => item.packetId === packet.packetId);
+    if (JSON.stringify(expected) !== JSON.stringify(actual)) {
+      missingInputs.push({ reason: 'prompt_evidence_cut', packetId: packet.packetId, assetVersions: packet.assetVersions });
+    }
+  }
+  for (const videoId of comparisonVideoIds) {
+    if (!evidence.some(packet => packet.kind === 'youtube_transcript'
+      && packet.sources.some(source => source.videoId === videoId)
+      && (packet.transcriptAnalysis || packet.excerpts?.length))) {
+      missingInputs.push({ reason: 'comparison_transcript_missing', videoId });
+    }
+  }
+  const complete = missingInputs.length === 0;
+  return { evidence, fullIds, complete, missingInputs, omitted };
 }

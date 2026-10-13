@@ -141,3 +141,50 @@ it('keeps both comparison subjects and budgets short references before truncatin
   expect(prepared.fullIds.size).toBe(200);
   expect(prepared.evidence.every(packet=>packet.excerpts?.every(excerpt=>excerpt.id.startsWith('ref_')))).toBe(true);
 });
+
+it('reports whether the finalization budget cut anything', () => {
+  const small = transcriptPacket();
+  expect(finalizationEvidenceForModel([small], 40_000).complete).toBe(true);
+  const long = { ...transcriptPacket(), packetId: 'long',
+    artifacts: [{ type: 'youtube_complete_transcript', data: { allReturnedSegmentsIncluded: true } }],
+    excerpts: Array.from({ length: 400 }, (_, index) => ({ ...small.excerpts[0]!, id: `long:${index}`, text: `Passage ${index}. ${'detail '.repeat(30)}` })) };
+  const cut = finalizationEvidenceForModel([small, long], 40_000);
+  expect(cut.complete).toBe(false);
+  expect(cut.evidence.some(packet => packet.warnings.some(warning => warning.code === 'TRANSCRIPT_CONTEXT_TRUNCATED'))).toBe(true);
+});
+
+it('treats comparison evidence outside every subject as cut', () => {
+  const subject = transcriptPacket();
+  const other = { ...transcriptPacket(), packetId: 'other', sources: [{ ...subject.sources[0]!, id: 'other', videoId: 'zzzzzzzzzzz' }],
+    excerpts: [{ ...subject.excerpts[0]!, id: 'other:0', sourceId: 'other' }] };
+  expect(finalizationEvidenceForModel([subject], 40_000, ['abcdefghijk']).complete).toBe(true);
+  expect(finalizationEvidenceForModel([subject, other], 40_000, ['abcdefghijk']).complete).toBe(false);
+});
+
+it('treats a transcript returned in pages as incomplete even when it fits', () => {
+  const paged = { ...transcriptPacket(), artifacts: [{ type: 'youtube_complete_transcript', data: { allReturnedSegmentsIncluded: false, nextOffset: 1 } }] };
+  expect(finalizationEvidenceForModel([paged], 40_000).complete).toBe(false);
+  expect(finalizationEvidenceForModel([{ ...transcriptPacket(), continuation: 'next-page' }], 40_000).complete).toBe(false);
+});
+
+
+it('does not treat more discovery results as missing source evidence', () => {
+  const search: EvidencePacket = { packetId: 'search', kind: 'youtube_search', sources: [], excerpts: [],
+    artifacts: [], continuation: 'more-discovery-results', warnings: [], usage: [] };
+  expect(evidencePacketForModel(search).continuation).toBeUndefined();
+  expect(finalizationEvidenceForModel([search, transcriptPacket()], 40_000).complete).toBe(true);
+  expect(finalizationEvidenceForModel([search, { ...transcriptPacket(), continuation: 'missing-source-page' }], 40_000).complete).toBe(false);
+});
+
+it('only lets complete analysis of the same saved version replace raw transcript paging', () => {
+  const analysis = { ...transcriptPacket(), assetVersions: ['a'.repeat(64)] };
+  const raw = { ...transcriptPacket(), packetId: 'raw', assetVersions: ['a'.repeat(64)],
+    artifacts: [{ type:'youtube_complete_transcript', data:{ requiresAnalysis:true, allReturnedSegmentsIncluded:false } }] };
+  expect(finalizationEvidenceForModel([raw, analysis], 40_000).complete).toBe(true);
+  expect(finalizationEvidenceForModel([raw, { ...analysis, assetVersions:['b'.repeat(64)] }], 40_000).complete).toBe(false);
+  expect(finalizationEvidenceForModel([raw], 40_000).missingInputs).toContainEqual({
+    reason:'transcript_analysis_missing', packetId:'raw', assetVersions:raw.assetVersions,
+  });
+  const incomplete = { ...analysis, artifacts: analysis.artifacts.map(a => ({...a,data:{...a.data,coverage:{completeTranscriptRead:false,segmentCount:10,startMs:0,endMs:100}}})) };
+  expect(finalizationEvidenceForModel([raw, incomplete], 40_000).complete).toBe(false);
+});

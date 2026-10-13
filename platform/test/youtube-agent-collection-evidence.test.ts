@@ -121,6 +121,7 @@ describe('collection evidence projection (QA 027)', () => {
 
     const search = evidencePacketForModel(await executeSearchYouTube({ query: 'calculus' }, context, 'search'));
     expect(search.excerpts).toHaveLength(12);
+    expect(search.continuation).toBeUndefined();
     expect(search.collection).toMatchObject({ entriesFetched: 30, entriesExcluded: 5, entriesRetained: 12, entriesNotRetained: 13, morePages: true });
     expect(search.collection!.coverage).toContain('5 were excluded by agent policy.');
 
@@ -207,10 +208,10 @@ describe('collection evidence projection (QA 027)', () => {
   it('regression: keeps the complete entry list without its continuation when only that fits exactly', () => {
     const continuation = 'c'.repeat(4_000);
     const packet: EvidencePacket = {
-      packetId: 'p', kind: 'youtube_search',
-      sources: [{ id: 's', provider: 'youtube', kind: 'search', videoId: 'v0000000001' }],
+      packetId: 'p', kind: 'youtube_channel_videos',
+      sources: [{ id: 's', provider: 'youtube', kind: 'channel_videos', videoId: 'v0000000001' }],
       excerpts: [{ id: 'e', sourceId: 's', text: 'Limits' }],
-      artifacts: [{ type: 'youtube_search_candidates', data: {
+      artifacts: [{ type: 'youtube_channel_videos', data: {
         collection: collectionRetrieval({ fetchedCount: 1, retainedCount: 1, continuation, continuationAccepted: true }),
       } }],
       continuation, warnings: [], usage: [],

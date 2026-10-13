@@ -666,7 +666,7 @@ test('search indexes remain isolated between session Durable Objects', async () 
 });
 
 test.each([true, false])(
-  'real Session search tools supply grounded evidence to the shared finalizer (resume=%s)',
+  'research or recovery supplies grounded evidence before answer-only finalization (resume=%s)',
   async (resume) =>
     within(`model-search-${resume}`, async (store) => {
       const { MockLanguageModelV4 } = await import('ai/test');
@@ -686,18 +686,9 @@ test.each([true, false])(
             {
               type: 'tool-call',
               toolCallId: `core-${coreCalls}`,
-              toolName: coreCalls++ === 0 ? 'search_context' : 'finalize_answer',
-              input: JSON.stringify(
-                coreCalls === 1
-                  ? { label: 'evidence', query: 'clear opening' }
-                  : {
-                      intent: 'inspect_video',
-                      confidence: 'high',
-                      warnings: [],
-                      artifacts: [],
-                      blocks: [{ text: 'A clear opening sentence.', evidenceIds: [excerptId] }],
-                    },
-              ),
+              // With a finalizer configured, research ends with complete_research.
+              toolName: coreCalls++ === 0 ? 'search_context' : 'complete_research',
+              input: JSON.stringify(coreCalls === 1 ? { label: 'evidence', query: 'clear opening' } : {}),
             },
           ],
           finishReason: { unified: 'tool-calls', raw: 'tool_calls' },
@@ -706,8 +697,9 @@ test.each([true, false])(
         }),
       });
       const finalizer = new MockLanguageModelV4({
-        doGenerate: async () => {
-          const search = finalizerCalls++ === 0;
+        doGenerate: async call => {
+          // Only a context-gathering call may search; the answer call is structured JSON.
+          const search = finalizerCalls++ === 0 && call.responseFormat?.type !== 'json';
           return {
             content: search
               ? [
@@ -736,6 +728,8 @@ test.each([true, false])(
       });
       const ctx = context(store, sessionProvider(p, store));
       ctx.session = store;
+      // A new session: no stored message besides this request.
+      ctx.userMessageId = 'current-request';
       ctx.finalize = vi.fn(async (_tool, input) =>
         buildAgentTurnResult(
           {
@@ -750,8 +744,13 @@ test.each([true, false])(
           0,
         ),
       );
+      // Recovery restores delivered evidence before entering finalization.
+      const recoveredEvidence = resume ? (await store.search.searchEvidence(store, 'clear opening')).packets : [];
+      const reads = vi.spyOn(store, 'readEvidence');
+      const searches = vi.spyOn(store, 'searchTools');
       await runResearchAgentWithModel({
         model: core,
+        recoveredEvidence,
         finalizationModel: finalizer,
         message: 'What is the opening sentence?',
         decision: { route: 'inspect_video', videoId: id, useStoryboard: false, researchVideoCount: 1 },
@@ -760,7 +759,11 @@ test.each([true, false])(
         ...(resume ? { finalizationDeadlineAt: Date.now() + 30000 } : {}),
       });
       expect(coreCalls).toBe(resume ? 0 : 2);
-      expect(finalizerCalls).toBe(3);
+      expect(finalizerCalls).toBe(1);
+      if (resume) {
+        expect(reads).not.toHaveBeenCalled();
+        expect(searches).not.toHaveBeenCalled();
+      }
       expect(ctx.finalize).toHaveBeenCalledTimes(1);
       expect((await vi.mocked(ctx.finalize).mock.results[0]!.value).citations[0]?.id).toBe(excerptId);
       expect(p.transcript).toHaveBeenCalledTimes(1);

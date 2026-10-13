@@ -1858,3 +1858,36 @@ test('retains rejected answers in private agent traces and revokes them on sessi
     expect(objects.objects.filter(object => object.key.includes(runId))).toHaveLength(0);
   });
 });
+
+test('persists attributed research context on the run for answer-phase recovery', async () => {
+  const { runtime, runId } = await seed('research-context-recovery', 'running');
+  const context = { reads: [{ tool: 'read_session_history', input: { offset: 20 }, result: {
+    messages: [{ id: 'older-budget', role: 'user', text: 'My exact budget is $837.' }],
+  } }], truncated: false };
+  await runInDurableObject(runtime, async instance => {
+    const writer = instance as unknown as { persistResearchContext(id: string, context: import('../src/agents/runtime/context-handoff').ResearchContext): void };
+    writer.persistResearchContext(runId, context);
+  });
+  await runInDurableObject(runtime, async instance => {
+    const rows = instance.sql<{ research_context_json: string }>`SELECT research_context_json FROM agent_runs WHERE id=${runId}`;
+    expect(JSON.parse(rows[0]!.research_context_json)).toEqual(context);
+  });
+});
+
+test('deleting memory removes its persisted research handoff copy before recovery', async () => {
+  const { runtime, runId, conversationId, userId } = await seed('research-context-memory-deletion', 'running');
+  const memory = { id: 'context:budget', kind: 'context', topic: 'budget', text: 'Private remembered budget $837.', evidenceIds: [], runId, updatedAt: 1 };
+  await runInDurableObject(runtime, async instance => {
+    await instance.getSessionAssets(conversationId, userId);
+    instance.sql`INSERT INTO session_memories VALUES (${memory.id}, ${runId}, ${JSON.stringify(memory)}, 1)`;
+    const writer = instance as unknown as { persistResearchContext(id: string, context: import('../src/agents/runtime/context-handoff').ResearchContext): void };
+    writer.persistResearchContext(runId, { reads: [{ tool: 'search_context', input: { label: 'memory', query: 'budget' }, result: JSON.stringify([memory]) }], truncated: false });
+    await instance.deleteSessionMemory(conversationId, userId, memory.id);
+    // A suspended research read must not restore the deleted copy afterward.
+    writer.persistResearchContext(runId, { reads: [{ tool: 'search_context', input: { label: 'memory', query: 'budget' }, result: JSON.stringify([memory]) }], truncated: false });
+  });
+  await runInDurableObject(runtime, async instance => {
+    const rows = instance.sql<{ research_context_json: string }>`SELECT research_context_json FROM agent_runs WHERE id=${runId}`;
+    expect(rows[0]!.research_context_json).not.toContain('Private remembered budget');
+  });
+});
