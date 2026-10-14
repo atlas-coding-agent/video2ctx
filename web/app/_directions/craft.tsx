@@ -32,11 +32,40 @@ const PILLARS = [
   },
   {
     name: 'Ask across videos',
-    detail: 'Video Agent finds the relevant videos and answers with sources, usually in under 30 seconds.',
+    detail: 'Video Agent finds the relevant videos and answers your question across them.',
   },
   {
     name: 'Catch what’s new',
-    detail: 'Monitors tell you when a channel or topic posts.',
+    detail:
+      'Monitors watch a channel, topic, or search and tell you when something new appears.',
+  },
+];
+
+/* Why it is worth using over raw transcripts and frames. The token saving is
+ * measured, not estimated: across three real Video Agent runs, the cited answer
+ * was 96.0%, 97.4%, and 96.4% smaller than the transcripts it read (a 38-minute
+ * video, a 1:15 lecture, and three tutorials compared), 96.6% on average. The
+ * copy rounds down to 95%. Re-measure before changing it. */
+const BENEFITS = [
+  {
+    name: 'Token-efficient',
+    detail:
+      'Agents get the answer and the moments behind it, not the whole video. On average, that means about 95% fewer tokens than reading the full transcripts.',
+  },
+  {
+    name: 'Easier on limits and costs',
+    detail:
+      'Fewer tokens per question means weekly limits and API budgets go further.',
+  },
+  {
+    name: 'Accurate by design',
+    detail:
+      'Answers come from what the video actually says and shows, so claims hold up when you check them.',
+  },
+  {
+    name: 'Fast and multimodal',
+    detail:
+      'Speech, visuals, and comments are processed together, and most answers land in under 30 seconds.',
   },
 ];
 
@@ -210,10 +239,10 @@ export function CraftDirection() {
         <section className='craft-parts' aria-labelledby='craft-parts-title'>
           <h2 id='craft-parts-title'>What is video2ctx?</h2>
           <p className='craft-parts-intro'>
-            video2ctx gives AI agents the context they need to understand
-            videos. From spoken words and on-screen visuals to viewer reactions,
-            it brings everything together with timestamped citations you can
-            trace back to the source.
+            video2ctx makes videos queryable for AI agents and the applications
+            you build. Ask about anything, from spoken words and on-screen
+            visuals to viewer reactions, and every answer comes with timestamped
+            citations you can trace to the original video.
           </p>
           <ul>
             {PILLARS.map((pillar, index) => (
@@ -226,6 +255,20 @@ export function CraftDirection() {
               </li>
             ))}
           </ul>
+          <div className='craft-why'>
+            <h3>Why it matters</h3>
+            <dl>
+              {BENEFITS.map((benefit, index) => (
+                <div
+                  key={benefit.name}
+                  style={{ '--i': index } as React.CSSProperties}
+                >
+                  <dt>{benefit.name}</dt>
+                  <dd>{benefit.detail}</dd>
+                </div>
+              ))}
+            </dl>
+          </div>
           <div className='craft-roadmap'>
             <h3>Where video comes from</h3>
             <ol>
@@ -385,7 +428,7 @@ export function CraftDirection() {
         <div className='craft-colophon-inner'>
           <p className='craft-colophon-lede'>
             <b>video2ctx</b>
-            Turn video into context for agents and apps. YouTube first, not
+            Make videos queryable for agents and apps. YouTube first, not
             YouTube only.
           </p>
           <nav aria-label='Footer'>
@@ -414,6 +457,16 @@ export function CraftDirection() {
         </div>
         <div className='craft-colophon-base'>
           <p>© 2026 video2ctx</p>
+          <p>
+            Built with{' '}
+            <span className='craft-heart' aria-hidden='true'>
+              ♥
+            </span>
+            <span className='craft-sr'>love</span> by{' '}
+            <a href='https://x.com/devhims' target='_blank' rel='noreferrer'>
+              Himanshu
+            </a>
+          </p>
           <p>
             Open source under{' '}
             <a href={LICENSE_HREF} target='_blank' rel='noreferrer'>
