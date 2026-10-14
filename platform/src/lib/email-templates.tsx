@@ -7,13 +7,17 @@ import {
   Heading,
   Hr,
   Html,
+  Img,
   Link,
   Preview,
+  Row,
+  Column,
   Section,
   Text,
   render,
   toPlainText,
 } from 'react-email';
+import { EMAIL_LOGO } from './email-logo';
 import { WelcomeEmail, type WelcomeEmailData } from './welcome-email';
 
 export type { WelcomeEmailData };
@@ -40,6 +44,10 @@ export interface DigestEmailData {
   unsubscribeUrl: string;
 }
 
+export interface MagicLinkEmailData {
+  url: string;
+}
+
 export interface ScaleInquiryEmailData {
   fullName: string;
   role: string;
@@ -64,6 +72,10 @@ export async function renderDigestEmail(data: DigestEmailData): Promise<{ html: 
 
 export async function renderWelcomeEmail(data: WelcomeEmailData): Promise<{ html: string; text: string }> {
   return renderEmail(<WelcomeEmail {...data} />);
+}
+
+export async function renderMagicLinkEmail(data: MagicLinkEmailData): Promise<{ html: string; text: string }> {
+  return renderEmail(<MagicLinkEmail {...data} />);
 }
 
 export async function renderScaleInquiryEmail(data: ScaleInquiryEmailData): Promise<{ html: string; text: string }> {
@@ -113,6 +125,16 @@ export function DigestEmail({ recipientName, cadence, notifications, dashboardUr
   </EmailShell>;
 }
 
+export function MagicLinkEmail({ url }: MagicLinkEmailData) {
+  return <EmailShell preview='Your secure sign-in link for video2ctx'>
+    <Text style={eyebrow}>SIGN IN</Text>
+    <Heading style={heading}>Sign in to video2ctx</Heading>
+    <Text style={bodyText}>Use this secure link to sign in.</Text>
+    <Button href={url} style={primaryButton}>Sign in</Button>
+    <Text style={supportingText}>This link expires in 15 minutes and can be used once. If you did not request it, you can ignore this message.</Text>
+  </EmailShell>;
+}
+
 export function ScaleInquiryEmail({
   fullName,
   role,
@@ -144,7 +166,16 @@ function EmailShell({ preview, children }: { preview: string; children: ReactNod
     <Preview>{preview}</Preview>
     <Body style={page}>
       <Container style={container}>
-        <Text style={brand}>video2<span style={brandAccent}>ctx</span></Text>
+        {/* The logo is an inline attachment the email queue adds for this cid. Its alt
+            text is empty because the wordmark beside it already names the product. */}
+        <Row style={{ marginBottom: '36px' }}>
+          <Column style={{ width: '44px', verticalAlign: 'middle' }}>
+            <Img src={`cid:${EMAIL_LOGO.contentId}`} width='32' height='32' alt='' style={{ display: 'block' }} />
+          </Column>
+          <Column style={{ verticalAlign: 'middle' }}>
+            <Text style={brand}>video2<span style={brandAccent}>ctx</span></Text>
+          </Column>
+        </Row>
         {children}
       </Container>
     </Body>
@@ -158,7 +189,7 @@ async function renderEmail(component: ReactElement): Promise<{ html: string; tex
 
 const page: CSSProperties = { margin: 0, padding: '36px 12px', backgroundColor: '#f1efe9', color: '#171714', fontFamily: 'Arial, Helvetica, sans-serif' };
 const container: CSSProperties = { maxWidth: '560px', margin: '0 auto', padding: '34px', border: '1px solid #dedbd2', borderRadius: '12px', backgroundColor: '#fffefb' };
-const brand: CSSProperties = { margin: '0 0 36px', color: '#171714', fontSize: '18px', fontWeight: 700, letterSpacing: '-0.6px' };
+const brand: CSSProperties = { margin: 0, color: '#171714', fontSize: '18px', fontWeight: 700, letterSpacing: '-0.6px' };
 const brandAccent: CSSProperties = { color: '#d84c3f' };
 const eyebrow: CSSProperties = { margin: '0 0 10px', color: '#a53d33', fontSize: '11px', fontWeight: 700, letterSpacing: '1.2px' };
 const heading: CSSProperties = { margin: '0 0 22px', color: '#171714', fontSize: '28px', lineHeight: '34px', letterSpacing: '-1px' };
@@ -166,7 +197,8 @@ const bodyText: CSSProperties = { margin: '0 0 14px', color: '#55554f', fontSize
 const highlight: CSSProperties = { margin: '24px 0', padding: '20px', borderLeft: '3px solid #d84c3f', backgroundColor: '#f7f4ee' };
 const highlightLabel: CSSProperties = { margin: '0 0 8px', color: '#77766f', fontSize: '11px', fontWeight: 700, letterSpacing: '0.5px', textTransform: 'uppercase' };
 const videoTitleStyle: CSSProperties = { margin: 0, color: '#171714', fontSize: '18px', fontWeight: 700, lineHeight: '26px' };
-const primaryButton: CSSProperties = { margin: '4px 0 24px', padding: '13px 18px', borderRadius: '7px', backgroundColor: '#d84c3f', color: '#ffffff', fontSize: '14px', fontWeight: 700, textDecoration: 'none' };
+// #c43d30 keeps white button text at 5.18:1 (WCAG AA needs 4.5:1; the brand #d84c3f gave 4.18:1).
+const primaryButton: CSSProperties = { margin: '4px 0 24px', padding: '13px 18px', borderRadius: '7px', backgroundColor: '#c43d30', color: '#ffffff', fontSize: '14px', fontWeight: 700, textDecoration: 'none' };
 const supportingText: CSSProperties = { margin: '4px 0 22px', color: '#77766f', fontSize: '12px', lineHeight: '19px' };
 const rule: CSSProperties = { margin: '24px 0 16px', borderColor: '#dedbd2' };
 const footerText: CSSProperties = { margin: 0, color: '#77766f', fontSize: '12px', lineHeight: '19px' };
