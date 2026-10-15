@@ -2,7 +2,7 @@
 
 import { useCallback, useEffect, useRef, useState } from 'react';
 import Link from 'next/link';
-import { platformRequest as api } from '../../../lib/platform-request';
+import { PlatformApiError, platformRequest as api } from '../../../lib/platform-request';
 import { authClient } from '../../../lib/auth-client';
 import { canDeleteAccount, confirmDashboardEmailConsent, DEFAULT_NOTIFICATION_PREFERENCES, DELETE_ACCOUNT_CONFIRMATION, emailConsentToConfirm, pathWithoutEmailConsent, type DashboardBilling, type DashboardNotificationPreferences } from '../../../lib/dashboard-data';
 import type { AccountSeeds } from '../../../lib/dashboard-cache';
@@ -10,7 +10,7 @@ import { useDashboardCache, useStreamedAccountResource } from '../DashboardDataP
 import { BuilderConfirmation } from './BuilderConfirmation';
 import { useDashboardSession } from '../DashboardSessionProvider';
 import { BillingSkeleton, PreferencesSkeleton } from './SettingsSkeleton';
-import { useLoadErrorToast } from '../../../lib/use-error-toast';
+import { useErrorToast, useLoadErrorToast } from '../../../lib/use-error-toast';
 
 export function BillingCard({ promise }: { promise: NonNullable<AccountSeeds['billing']> }) {
   const { user } = useDashboardSession();
@@ -226,21 +226,24 @@ export function PreferencesCard({ promise, emailConsent }: { promise: NonNullabl
 }
 
 export function AccountCards() {
-  const { user } = useDashboardSession();
+  const { user, adminAccess } = useDashboardSession();
   const email = user?.email;
   const [confirmation, setConfirmation] = useState('');
   const [deleting, setDeleting] = useState(false);
   const [deleteError, setDeleteError] = useState('');
+  const deletionToast = useErrorToast();
   const confirmed = canDeleteAccount(confirmation);
   const deleteAccount = async () => {
-    if (!email || !confirmed || deleting) return;
+    if (adminAccess || !email || !confirmed || deleting) return;
     setDeleting(true);
     setDeleteError('');
+    deletionToast.clear();
     try {
       await api<void>('/v1/account', { method: 'DELETE' });
       window.location.replace('/');
     } catch (cause) {
-      setDeleteError(cause instanceof Error ? cause.message : 'Could not delete your account.');
+      if (cause instanceof PlatformApiError && cause.code === 'SUBSCRIPTION_ACTIVE') deletionToast.show(cause.message);
+      else setDeleteError(cause instanceof Error ? cause.message : 'Could not delete your account.');
       setDeleting(false);
     }
   };
@@ -256,7 +259,7 @@ export function AccountCards() {
         <h3 className='settings-card-title mt-2 mb-0' id='delete-account-heading'>Delete account permanently</h3>
         <p className='settings-card-copy mt-2 mb-0 max-w-[65ch]'>This removes your projects, saved research, monitors, API keys, credit history, and connected accounts. This action cannot be undone.</p>
       </div>
-      {email ? <div className='grid gap-2'>
+      {adminAccess ? <p className='settings-danger-message mt-2 mb-0 max-w-[65ch]'>Admin accounts cannot be deleted.</p> : email ? <div className='grid gap-2'>
         <label className='settings-confirm-label' htmlFor='delete-account-confirmation'>Type <strong>{DELETE_ACCOUNT_CONFIRMATION}</strong> to confirm</label>
         <input
           className='settings-confirm-input min-h-11 rounded-[var(--radius-dashboard-sm)] border border-[var(--color-dashboard-rule-strong)] bg-[var(--color-dashboard-surface)] px-3 text-[var(--color-dashboard-ink)]'

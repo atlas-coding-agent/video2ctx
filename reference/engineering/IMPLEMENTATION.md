@@ -76,6 +76,54 @@ Polar checkout, customer portal, and the signed `/api/auth/polar/webhooks` callb
 
 Long-running imports return `202` with a stable job ID. Reusing an idempotency key returns the existing job. Jobs expose `queued`, `running`, `partial`, `succeeded`, `failed`, or `cancelled`, plus progress, partial result, retry time, and permanent failure information.
 
+## Account deletion
+
+The application removes private account data. Polar owns subscription renewal and customer anonymization. Deletion first blocks overlapping checkout and checks all Polar subscription pages. Active, trialing and past-due subscriptions must be cancelled before deletion; a cancellation scheduled for period end permits deletion immediately, forfeiting the remaining paid period. Settings shows `SUBSCRIPTION_ACTIVE` as an error toast. The Polar token needs `subscriptions:read` and the existing customer write permissions. Missing credentials or failed Polar calls stop deletion before private cleanup.
+
+For example, a user with two sessions and a renewing Builder plan receives the cancellation toast with both sessions intact. After cancelling in Polar, retrying deletion anonymizes the customer, fences the account against new sessions, and clears both session runtimes. Runtime cleanup initializes the current schema first, including for sessions created before memory tables existed or sessions that never started.
+
+```mermaid
+%%{init: {"themeVariables": {"sequenceNumber": "#ffffff", "signalColor": "#4b5563"}}}%%
+sequenceDiagram
+    autonumber
+    actor User
+    participant App
+    participant Polar
+    participant Private as Private storage
+    participant D1
+    User->>App: Delete account
+    App->>App: Block checkout; reject if one is in flight
+    App->>Polar: Check subscriptions
+    alt Subscription still renews
+        Polar-->>App: Renewal active
+        App-->>User: Cancellation error toast
+    else Cancelled or no subscription
+        App->>Polar: Anonymize customer
+        App->>Private: Fence account and delete sessions, sources, files
+        App->>App: Queue private search deletion
+        App->>D1: Delete email metadata, sign-in tokens and user
+        App-->>User: Clear browser cookies and return success
+    end
+```
+
+Shared transcripts, storyboards and other video catalog assets remain available. Private cleanup failures return `503 ACCOUNT_DELETION_INCOMPLETE` while retaining the D1 user so deletion can be retried. Successful deletion clears the current browser's token and cached-session cookies. D1 foreign-key cascades revoke stored login sessions and remove related account records. Private search deletion remains asynchronous; failures retry through the task queue, while an already absent index counts as success. Emails queued for a deleted user cannot recreate delivery records.
+
+### Admin account deletion
+
+The admin Users panel searches exact user IDs or email fragments, with 25 results per page. Selecting Delete account shows the target identity and requires typing its email. The backend checks a live verified admin browser session and dashboard Origin, and compares the selected email with the current user record. Admin accounts cannot be deleted through either the admin panel or self-service settings. Protection checks current D1 roles, including comma-separated admin roles, and bootstrap operator emails before any billing or private cleanup. Search results mark these accounts as protected and hide their deletion controls. Other account deletions share the self-service cleanup service; the admin stays signed in and the target's stored sessions are revoked.
+
+Checkout and deletion share durable claims in the user's account Durable Object. A checkout already in flight prevents deletion from starting. A deletion claim blocks new checkouts before checking subscriptions or closing Polar. If the cancellation check fails, that claim is released. Once Polar customer deletion may have started, the checkout fence persists through cleanup failures and completed deletion. Claims do not expire automatically, because a provider request may still be running. A Worker termination before releasing a claim fails closed; inspect the account's billing claims and Polar state before operator recovery. No network call runs inside `blockConcurrencyWhile`.
+
+### Uncertain Polar writes
+
+Before sending a customer-create or checkout-create POST, the account Durable Object records its claim, operation and start time in `billing_checkout_writes`. A valid successful response or a definitive HTTP 4xx rejection, excluding 408, clears that marker. A connection error, timeout, HTTP 5xx or invalid success response retains the marker and checkout claim. The SDK does not automatically retry either POST. Both another checkout and account deletion remain blocked, including after a Worker restart. A failed read before any write releases its claim normally.
+
+Recovery requires confirming the outcome of the specific accepted write. The `billing_write_uncertain` log includes the user ID, claim and operation. Customer and checkout creation metadata include `billing_checkout_claim` for correlation with Polar records. Inspect the account's durable claim and the matching Polar operation. Confirm that the original request has completed or definitively failed and that no accepted attempt can still commit. A temporary 404, a customer found without matching correlation, or elapsed time alone is not confirmation. If the outcome cannot be established, keep the fence and investigate with Polar.
+
+Once the outcome is confirmed, an operator with trusted Worker/DO access can call `finishBillingCheckoutWrite(claim)` and then `endBillingCheckout(claim)` for that exact claim. No public HTTP endpoint exposes these recovery methods. A committed customer is then handled by the normal subscription guard and deletion flow. This recovery is deliberately manual; the application never guesses that an ambiguous POST failed.
+
+Queued magic-link emails reference the exact Better Auth verification row. The delivery insert checks that row, its recipient and expiry atomically. Deleting or consuming the token suppresses the queued email without recreating delivery metadata. A fresh signup link works without an existing user row. Old queued messages without a verification reference are suppressed; request a new sign-in link after deployment if necessary.
+
 ## Postman quick start
 
 Run the platform locally:
@@ -162,7 +210,7 @@ Never commit `.dev.vars`. The web Worker does not receive provider secrets; it r
 - Public transcript imports grow the shared hybrid corpus. Channel and playlist workflows eagerly fan out recent videos, with lazy access still supported.
 - Queue tasks and Polar payment events have deterministic replay records. Credit reservation is a single conditional D1 mutation, followed by settlement or release.
 - Prompt evidence is delimited as untrusted content; synthesis without aligned citations returns `INSUFFICIENT_EVIDENCE`.
-- Account deletion cancels and anonymizes the Polar customer, revokes YouTube OAuth, removes private R2 objects and D1 rows, and queues private AI Search instance removal.
+- Account deletion requires cancellation of renewing subscriptions before anonymizing the Polar customer, revoking YouTube OAuth, removing private data, and queuing private AI Search instance removal.
 
 ## Verification
 

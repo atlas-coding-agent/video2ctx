@@ -1653,6 +1653,36 @@ export const openApiDocument = {
         responses: { '200': jsonResponse('Admin access is enabled.', { type: 'object', properties: { enabled: { const: true } }, required: ['enabled'] }), ...standardErrors },
       },
     },
+    '/v1/admin/users': {
+      get: {
+        tags: ['Administration'], operationId: 'searchAdminUsers', summary: 'Find users by ID or email',
+        description: 'Requires a live verified admin browser session. Matches an exact user ID or a literal case-insensitive email substring. Returns up to 25 users per page. Responses are never cached. Plan labels reflect the local billing projection; deletion checks Polar directly.',
+        security: [{ sessionCookie: [] }],
+        parameters: [
+          { name: 'q', in: 'query', required: true, schema: { type: 'string', minLength: 1, maxLength: 320 } },
+          { name: 'offset', in: 'query', schema: { type: 'integer', minimum: 0, maximum: 1000000, default: 0 } },
+        ],
+        responses: { '200': jsonResponse('Matching users and the next page offset.', { type: 'object', required: ['users','nextOffset'], properties: {
+          users: { type: 'array', maxItems: 25, items: { type: 'object', required: ['id','name','email','plan','isAdmin'], properties: {
+            id: { type: 'string' }, name: { type: 'string' }, email: { type: 'string', format: 'email' }, plan: { type: 'string', enum: ['starter','builder'] }, isAdmin: { type: 'boolean', description: 'Protected admin role or bootstrap operator account.' },
+          } } }, nextOffset: { type: ['integer','null'] },
+        } }), ...standardErrors },
+      },
+    },
+    '/v1/admin/users/{userId}': {
+      delete: {
+        tags: ['Administration'], operationId: 'deleteAdminUser', summary: 'Delete another user account',
+        description: 'Requires a live verified admin browser session and the dashboard Origin. The email must still match the selected user ID. Uses the same cancellation guard, Polar customer anonymization and private cleanup as self-service deletion. Shared video assets remain intact. Admin accounts cannot be deleted through either admin or self-service endpoints. Retrying a completed deletion returns 204. The admin session remains signed in.',
+        security: [{ sessionCookie: [] }],
+        parameters: [{ name: 'userId', in: 'path', required: true, schema: { type: 'string', minLength: 1, maxLength: 128 } }],
+        requestBody: jsonBody({ type: 'object', required: ['email'], properties: { email: { type: 'string', format: 'email', maxLength: 320 } } }),
+        responses: { ...standardErrors,
+          '204': { description: 'Account deleted or already absent. Private search cleanup is queued for deleted accounts.' },
+          '409': jsonResponse('Subscription still renews, another billing operation is in flight or has an unconfirmed outcome, account identity changed, or the target is a protected admin account.', schemaRef('Error')),
+          '503': jsonResponse('Billing or private cleanup is unavailable. Retry deletion.', schemaRef('Error')),
+        },
+      },
+    },
     '/v1/admin/credits': {
       get: {
         tags: ['Administration'], operationId: 'getAdminCreditAccount', summary: 'Look up an account’s credit balance and recent dashboard grants',
@@ -1835,11 +1865,13 @@ export const openApiDocument = {
         tags: ['Account'],
         operationId: 'deleteAccount',
         summary: 'Permanently delete the current account',
-        description: 'Deletes private files and database records and queues private search-index deletion. This operation cannot be undone.',
+        description: 'Admin accounts cannot be deleted. Cancel any renewing Builder subscription before deleting a regular account. Polar is checked before cleanup starts. Removes private sessions, sources, files and database records, clears browser session cookies, and queues private search-index deletion. Shared YouTube assets are retained. This operation cannot be undone; deleting after cancellation forfeits the remaining paid period.',
         security: privateSecurity,
         responses: {
-          '204': { description: 'Account deleted.' },
+          '204': { description: 'Account deleted. Private search-index cleanup is queued.' },
           '401': responseRef('Unauthorized'),
+          '409': jsonResponse('An admin account is protected, a subscription still renews, or another billing operation is in flight or has an unconfirmed outcome.', schemaRef('Error')),
+          '503': jsonResponse('Billing verification is unavailable or private cleanup is incomplete. Retry account deletion.', schemaRef('Error')),
           '500': responseRef('ServerError'),
         },
       },

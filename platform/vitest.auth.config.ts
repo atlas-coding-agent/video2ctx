@@ -17,6 +17,8 @@ export default defineConfig({
   test: {
     include: [
       'test/auth-worker.integration.test.ts',
+      'test/account-record-deletion.integration.test.ts',
+      'test/admin-user-deletion.integration.test.ts',
       'test/admin-access.integration.test.ts',
       'test/billing.integration.test.ts',
       'test/credits.integration.test.ts',
