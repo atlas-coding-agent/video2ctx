@@ -3,7 +3,7 @@ import type { WebhookOrderPaidPayload } from '@polar-sh/sdk/models/components/we
 import type { WebhookOrderRefundedPayload } from '@polar-sh/sdk/models/components/webhookorderrefundedpayload';
 import type { WebhookSubscriptionRevokedPayload } from '@polar-sh/sdk/models/components/webhooksubscriptionrevokedpayload';
 import { creditBalance } from './entitlements';
-import { now, sha256 } from './http';
+import { ApiError, now, sha256 } from './http';
 
 interface BillingAccountRow {
   plan: 'starter' | 'builder';
@@ -75,12 +75,17 @@ export async function getBillingSummary(env: Env, userId: string): Promise<Billi
 export async function applyPaidOrder(env: PaymentWebhookEnv, payload: WebhookOrderPaidPayload): Promise<void> {
   const order = payload.data;
   if (order.productId !== env.POLAR_BUILDER_PRODUCT_ID) return;
-  if (!order.paid) throw new Error(`Polar order ${order.id} was not paid.`);
+  if (!order.paid) throw new ApiError(422, 'POLAR_ORDER_NOT_PAID', `Polar order ${order.id} was not paid.`);
 
-  const userId = order.customer.externalId;
-  if (!userId) throw new Error(`Polar order ${order.id} is missing the Better Auth external ID.`);
   const eventId = `order.paid:${order.id}`;
   if (await processed(env.DB, eventId)) return;
+  const userId = order.customer.externalId;
+  const identity: BillingIdentity = {
+    customerId: order.customerId, subscriptionId: order.subscriptionId, orderId: order.id,
+    customerUserId: userId ?? null, checkoutUserId: checkoutIdentity(userId, order.metadata?.app_user_id, order.subscription?.metadata?.app_user_id),
+  };
+  if (await rejectMismatchedIdentity(env, payload, eventId, identity)) return;
+  if (!userId) throw new ApiError(422, 'POLAR_MISSING_CUSTOMER_EXTERNAL_ID', `Polar order ${order.id} is missing the Better Auth external ID.`);
 
   if (!await userExists(env.DB, userId)) {
     await recordEvent(env.DB, eventId, eventFingerprint(payload));
@@ -140,19 +145,26 @@ export async function syncCustomerState(
 ): Promise<void> {
   const customer = payload.data;
   const userId = customer.externalId;
-  if (!userId) throw new Error(`Polar customer ${customer.id} is missing the Better Auth external ID.`);
-  if (!await userExists(env.DB, userId)) return;
-
-  const current = await env.DB.prepare('SELECT status FROM billing_accounts WHERE user_id=?')
-    .bind(userId).first<{ status: string }>();
-  const matchedSubscription = customer.activeSubscriptions.find(
-    (candidate) => candidate.productId === env.POLAR_BUILDER_PRODUCT_ID,
-  );
-  const refundLocked = current?.status === 'refunded';
-  const subscription = refundLocked ? undefined : matchedSubscription;
   const eventId = `customer.state_changed:${customer.id}:${payload.timestamp.toISOString()}`;
   if (await processed(env.DB, eventId)) return;
-
+  const subscriptions = customer.activeSubscriptions.filter(
+    (candidate) => candidate.productId === env.POLAR_BUILDER_PRODUCT_ID,
+  );
+  const mismatched = subscriptions.find((candidate) => candidate.metadata?.app_user_id !== undefined
+    && candidate.metadata.app_user_id !== userId);
+  const matchedSubscription = mismatched ?? subscriptions[0];
+  const identity: BillingIdentity = {
+    customerId: customer.id, subscriptionId: matchedSubscription?.id ?? null,
+    customerUserId: userId ?? null, checkoutUserId: checkoutIdentity(userId, customer.metadata?.app_user_id,
+      ...subscriptions.map((candidate) => candidate.metadata?.app_user_id)),
+  };
+  if (await rejectMismatchedIdentity(env, payload, eventId, identity)) return;
+  if (!userId) throw new ApiError(422, 'POLAR_MISSING_CUSTOMER_EXTERNAL_ID', `Polar customer ${customer.id} is missing the Better Auth external ID.`);
+  if (!await userExists(env.DB, userId)) return;
+  const current = await env.DB.prepare('SELECT status FROM billing_accounts WHERE user_id=?')
+    .bind(userId).first<{ status: string }>();
+  const refundLocked = current?.status === 'refunded';
+  const subscription = refundLocked ? undefined : matchedSubscription;
   await env.DB.batch([
     billingUpsert(env.DB, {
       userId,
@@ -176,12 +188,17 @@ export async function syncRevokedSubscription(
 ): Promise<void> {
   const subscription = payload.data;
   if (subscription.productId !== env.POLAR_BUILDER_PRODUCT_ID) return;
-  const userId = subscription.customer.externalId;
-  if (!userId) throw new Error(`Polar subscription ${subscription.id} is missing the Better Auth external ID.`);
-  if (!await userExists(env.DB, userId)) return;
-
   const eventId = `subscription.revoked:${subscription.id}:${payload.timestamp.toISOString()}`;
   if (await processed(env.DB, eventId)) return;
+  const userId = subscription.customer.externalId;
+  const identity: BillingIdentity = {
+    customerId: subscription.customerId, subscriptionId: subscription.id,
+    customerUserId: userId ?? null, checkoutUserId: subscription.metadata?.app_user_id,
+  };
+  if (await rejectMismatchedIdentity(env, payload, eventId, identity)) return;
+  if (!userId) throw new ApiError(422, 'POLAR_MISSING_CUSTOMER_EXTERNAL_ID', `Polar subscription ${subscription.id} is missing the Better Auth external ID.`);
+  if (!await userExists(env.DB, userId)) return;
+
   await env.DB.batch([
     billingUpsert(env.DB, {
       userId,
@@ -207,7 +224,12 @@ export async function applyRefundedOrder(env: PaymentWebhookEnv, payload: Webhoo
   if (await processed(env.DB, eventId)) return;
 
   const userId = order.customer.externalId;
-  if (!userId) throw new Error(`Polar refund ${order.id} is missing the Better Auth external ID.`);
+  const identity: BillingIdentity = {
+    customerId: order.customerId, subscriptionId: order.subscriptionId, orderId: order.id,
+    customerUserId: userId ?? null, checkoutUserId: checkoutIdentity(userId, order.metadata?.app_user_id, order.subscription?.metadata?.app_user_id),
+  };
+  if (await rejectMismatchedIdentity(env, payload, eventId, identity)) return;
+  if (!userId) throw new ApiError(422, 'POLAR_MISSING_CUSTOMER_EXTERNAL_ID', `Polar refund ${order.id} is missing the Better Auth external ID.`);
   if (!await userExists(env.DB, userId)) {
     await recordEvent(env.DB, eventId, eventFingerprint(payload));
     console.warn(JSON.stringify({ event: 'polar_refund_without_user', orderId: order.id, userId }));
@@ -260,6 +282,39 @@ export async function closeBillingAccount(env: Env, userId: string): Promise<voi
     if (isHttpStatus(cause, 404)) return;
     throw cause;
   }
+}
+
+function checkoutIdentity(customerUserId: string | null | undefined, ...values: unknown[]): unknown {
+  const supplied = values.filter((value) => value !== undefined);
+  const mismatch = supplied.findIndex((value) => value !== customerUserId);
+  return mismatch === -1 ? supplied[0] : supplied[mismatch];
+}
+
+type BillingEvent = WebhookOrderPaidPayload | WebhookOrderRefundedPayload
+  | WebhookCustomerStateChangedPayload | WebhookSubscriptionRevokedPayload;
+
+interface BillingIdentity {
+  customerId: string;
+  subscriptionId: string | null;
+  customerUserId: string | null;
+  checkoutUserId: unknown;
+  orderId?: string;
+}
+
+/** Invalid ownership is terminal for this event, never a freeze on the customer. */
+async function rejectMismatchedIdentity(
+  env: PaymentWebhookEnv,
+  payload: BillingEvent,
+  eventId: string,
+  identity: BillingIdentity,
+): Promise<boolean> {
+  const expected = identity.checkoutUserId;
+  if (expected === undefined || expected === identity.customerUserId) return false;
+  await recordEvent(env.DB, eventId, eventFingerprint(payload));
+  console.error({ event: 'polar_billing_identity_mismatch', severity: 'error', eventId, eventType: payload.type,
+    orderId: identity.orderId, customerId: identity.customerId, subscriptionId: identity.subscriptionId,
+    checkoutUserId: typeof expected === 'string' ? expected : null, customerUserId: identity.customerUserId });
+  return true;
 }
 
 function billingUpsert(db: D1Database, state: BillingState): D1PreparedStatement {

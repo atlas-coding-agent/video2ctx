@@ -1,12 +1,14 @@
 import { APIError, betterAuth } from 'better-auth';
 import type { BetterAuthOptions } from 'better-auth';
 import { apiKey } from '@better-auth/api-key';
-import { checkout, polar, portal, webhooks } from '@polar-sh/better-auth';
+import { polar, portal } from '@polar-sh/better-auth';
 import { admin, bearer, deviceAuthorization, magicLink, oAuthProxy } from 'better-auth/plugins';
 import type { EmailMessage } from '../types';
 import { safeErrorLog } from './http';
 import { queueWelcomeEmail } from './notification-delivery';
 import { polarClient } from './polar-client';
+import { webhooks } from './polar-webhooks';
+import { checkout } from './polar-checkout';
 import { DEFAULT_API_KEY_PERMISSIONS } from './api-key-permissions';
 import {
   applyPaidOrder,
@@ -133,16 +135,18 @@ export function createAuthOptions(env: Env, executionCtx: { waitUntil(promise: P
           await env.EMAIL_TASKS.send(message, { contentType: 'json' });
         },
       }),
+      {
+        id: 'polar-authenticated-checkout',
+        endpoints: checkout({
+          products: [{ productId: env.POLAR_BUILDER_PRODUCT_ID, slug: 'builder' }],
+          successUrl: `${env.APP_ORIGIN}/dashboard?section=settings&checkout=success`,
+          returnUrl: `${env.APP_ORIGIN}/dashboard?section=settings&checkout=cancelled`,
+        })(polarClient(env)),
+      },
       polar({
         client: polarClient(env),
         createCustomerOnSignUp: false,
         use: [
-          checkout({
-            products: [{ productId: env.POLAR_BUILDER_PRODUCT_ID, slug: 'builder' }],
-            successUrl: `${env.APP_ORIGIN}/dashboard?section=settings&checkout=success`,
-            returnUrl: `${env.APP_ORIGIN}/dashboard?section=settings&checkout=cancelled`,
-            authenticatedUsersOnly: true,
-          }),
           portal({ returnUrl: `${env.APP_ORIGIN}/dashboard?section=settings` }),
           webhooks({
             secret: env.POLAR_WEBHOOK_SECRET,
