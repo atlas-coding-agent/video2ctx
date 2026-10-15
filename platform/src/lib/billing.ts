@@ -2,11 +2,14 @@ import type { WebhookCustomerStateChangedPayload } from '@polar-sh/sdk/models/co
 import type { WebhookOrderPaidPayload } from '@polar-sh/sdk/models/components/webhookorderpaidpayload';
 import type { WebhookOrderRefundedPayload } from '@polar-sh/sdk/models/components/webhookorderrefundedpayload';
 import type { WebhookSubscriptionRevokedPayload } from '@polar-sh/sdk/models/components/webhooksubscriptionrevokedpayload';
-import { creditBalance } from './entitlements';
+import type { WebhookSubscriptionCreatedPayload } from '@polar-sh/sdk/models/components/webhooksubscriptioncreatedpayload';
+import type { WebhookSubscriptionUpdatedPayload } from '@polar-sh/sdk/models/components/webhooksubscriptionupdatedpayload';
+import { creditBalance, type CreditEnv } from './entitlements';
 import { ApiError, now, sha256 } from './http';
 
 interface BillingAccountRow {
   plan: 'starter' | 'builder';
+  has_payment_history: number;
   status: string;
   provider_customer_id: string | null;
   provider_subscription_id: string | null;
@@ -37,6 +40,7 @@ export interface BillingSummary {
   currentPeriodStart: number | null;
   currentPeriodEnd: number | null;
   canManageBilling: boolean;
+  needsBillingAttention: boolean;
 }
 
 export interface PaymentWebhookEnv {
@@ -46,15 +50,22 @@ export interface PaymentWebhookEnv {
   STARTER_ONBOARDING_CREDITS: string;
 }
 
-export async function getBillingSummary(env: Env, userId: string): Promise<BillingSummary> {
-  const [row, balance] = await Promise.all([
+export async function getBillingSummary(env: CreditEnv, userId: string): Promise<BillingSummary> {
+  const [row, balance, navigation] = await Promise.all([
     env.DB.prepare(
-      `SELECT plan,status,provider_customer_id,provider_subscription_id,cancel_at_period_end,
+      `SELECT plan,status,has_payment_history,provider_customer_id,provider_subscription_id,cancel_at_period_end,
         current_period_start,current_period_end FROM billing_accounts WHERE user_id=?`
     ).bind(userId).first<BillingAccountRow>(),
     creditBalance(env, userId),
+    env.DB.prepare(
+      `SELECT EXISTS (
+        SELECT 1 FROM billing_subscription_states WHERE user_id=?
+          AND status IN ('incomplete','past_due','unpaid')
+      ) AS needs_attention`
+    ).bind(userId).first<{ needs_attention: number }>(),
   ]);
   const plan = row?.plan === 'builder' ? 'builder' : 'starter';
+  const needsBillingAttention = navigation?.needs_attention === 1;
   return {
     plan,
     status: row?.status ?? 'inactive',
@@ -63,7 +74,10 @@ export async function getBillingSummary(env: Env, userId: string): Promise<Billi
     cancelAtPeriodEnd: row?.cancel_at_period_end === 1,
     currentPeriodStart: row?.current_period_start ?? null,
     currentPeriodEnd: row?.current_period_end ?? null,
-    canManageBilling: Boolean(row?.provider_customer_id),
+    // Customer creation alone does not imply a subscription or billing history.
+    canManageBilling: needsBillingAttention || Boolean(row?.provider_customer_id
+      && (plan === 'builder' || row.has_payment_history === 1)),
+    needsBillingAttention,
   };
 }
 
@@ -78,12 +92,15 @@ export async function applyPaidOrder(env: PaymentWebhookEnv, payload: WebhookOrd
   if (!order.paid) throw new ApiError(422, 'POLAR_ORDER_NOT_PAID', `Polar order ${order.id} was not paid.`);
 
   const eventId = `order.paid:${order.id}`;
-  if (await processed(env.DB, eventId)) return;
   const userId = order.customer.externalId;
   const identity: BillingIdentity = {
     customerId: order.customerId, subscriptionId: order.subscriptionId, orderId: order.id,
     customerUserId: userId ?? null, checkoutUserId: checkoutIdentity(userId, order.metadata?.app_user_id, order.subscription?.metadata?.app_user_id),
   };
+  if (await processed(env.DB, eventId)) {
+    await repairPaymentHistory(env.DB, identity);
+    return;
+  }
   if (await rejectMismatchedIdentity(env, payload, eventId, identity)) return;
   if (!userId) throw new ApiError(422, 'POLAR_MISSING_CUSTOMER_EXTERNAL_ID', `Polar order ${order.id} is missing the Better Auth external ID.`);
 
@@ -119,6 +136,10 @@ export async function applyPaidOrder(env: PaymentWebhookEnv, payload: WebhookOrd
 
   await env.DB.batch([
     billingUpsert(env.DB, state),
+    paymentHistoryStatement(env.DB, userId, order.customerId),
+    ...(order.subscriptionId ? [subscriptionStateStatement(env.DB, {
+      userId, customerId: order.customerId, subscriptionId: order.subscriptionId, status, eventAt,
+    })] : []),
     env.DB.prepare(
       `INSERT OR IGNORE INTO credit_ledger
        (id,user_id,operation_id,entry_type,credits,metadata_json,created_at)
@@ -166,6 +187,10 @@ export async function syncCustomerState(
   const refundLocked = current?.status === 'refunded';
   const subscription = refundLocked ? undefined : matchedSubscription;
   await env.DB.batch([
+    ...subscriptions.map((candidate) => subscriptionStateStatement(env.DB, {
+      userId, customerId: customer.id, subscriptionId: candidate.id,
+      status: candidate.status, eventAt: payload.timestamp.getTime(),
+    })),
     billingUpsert(env.DB, {
       userId,
       customerId: customer.id,
@@ -200,6 +225,10 @@ export async function syncRevokedSubscription(
   if (!await userExists(env.DB, userId)) return;
 
   await env.DB.batch([
+    subscriptionStateStatement(env.DB, {
+      userId, customerId: subscription.customerId, subscriptionId: subscription.id,
+      status: subscription.status, eventAt: payload.timestamp.getTime(),
+    }),
     billingUpsert(env.DB, {
       userId,
       customerId: subscription.customerId,
@@ -216,18 +245,46 @@ export async function syncRevokedSubscription(
   ]);
 }
 
+/** Subscription events preserve payment problems without changing product access. */
+export async function syncSubscriptionState(
+  env: PaymentWebhookEnv,
+  payload: WebhookSubscriptionCreatedPayload | WebhookSubscriptionUpdatedPayload,
+): Promise<void> {
+  const subscription = payload.data;
+  if (subscription.productId !== env.POLAR_BUILDER_PRODUCT_ID) return;
+  const eventId = `${payload.type}:${subscription.id}:${payload.timestamp.toISOString()}`;
+  if (await processed(env.DB, eventId)) return;
+  const userId = subscription.customer.externalId;
+  if (await rejectMismatchedIdentity(env, payload, eventId, {
+    customerId: subscription.customerId, subscriptionId: subscription.id,
+    customerUserId: userId ?? null, checkoutUserId: subscription.metadata?.app_user_id,
+  })) return;
+  if (!userId) throw new ApiError(422, 'POLAR_MISSING_CUSTOMER_EXTERNAL_ID', `Polar subscription ${subscription.id} is missing the Better Auth external ID.`);
+  if (!await userExists(env.DB, userId)) return;
+  await env.DB.batch([
+    subscriptionStateStatement(env.DB, {
+      userId, customerId: subscription.customerId, subscriptionId: subscription.id,
+      status: subscription.status, eventAt: payload.timestamp.getTime(),
+    }),
+    eventStatement(env.DB, eventId, await eventFingerprint(payload)),
+  ]);
+}
+
 /** A fully refunded Builder order downgrades the user and resets their balance to Starter. */
 export async function applyRefundedOrder(env: PaymentWebhookEnv, payload: WebhookOrderRefundedPayload): Promise<void> {
   const order = payload.data;
   if (order.productId !== env.POLAR_BUILDER_PRODUCT_ID) return;
   const eventId = `order.refunded:${order.id}`;
-  if (await processed(env.DB, eventId)) return;
 
   const userId = order.customer.externalId;
   const identity: BillingIdentity = {
     customerId: order.customerId, subscriptionId: order.subscriptionId, orderId: order.id,
     customerUserId: userId ?? null, checkoutUserId: checkoutIdentity(userId, order.metadata?.app_user_id, order.subscription?.metadata?.app_user_id),
   };
+  if (await processed(env.DB, eventId)) {
+    await repairPaymentHistory(env.DB, identity);
+    return;
+  }
   if (await rejectMismatchedIdentity(env, payload, eventId, identity)) return;
   if (!userId) throw new ApiError(422, 'POLAR_MISSING_CUSTOMER_EXTERNAL_ID', `Polar refund ${order.id} is missing the Better Auth external ID.`);
   if (!await userExists(env.DB, userId)) {
@@ -253,6 +310,7 @@ export async function applyRefundedOrder(env: PaymentWebhookEnv, payload: Webhoo
   };
   await env.DB.batch([
     billingUpsert(env.DB, state),
+    paymentHistoryStatement(env.DB, userId, order.customerId),
     env.DB.prepare(
       `INSERT OR IGNORE INTO credit_ledger
        (id,user_id,operation_id,entry_type,credits,metadata_json,created_at)
@@ -291,7 +349,8 @@ function checkoutIdentity(customerUserId: string | null | undefined, ...values: 
 }
 
 type BillingEvent = WebhookOrderPaidPayload | WebhookOrderRefundedPayload
-  | WebhookCustomerStateChangedPayload | WebhookSubscriptionRevokedPayload;
+  | WebhookCustomerStateChangedPayload | WebhookSubscriptionRevokedPayload
+  | WebhookSubscriptionCreatedPayload | WebhookSubscriptionUpdatedPayload;
 
 interface BillingIdentity {
   customerId: string;
@@ -315,6 +374,36 @@ async function rejectMismatchedIdentity(
     orderId: identity.orderId, customerId: identity.customerId, subscriptionId: identity.subscriptionId,
     checkoutUserId: typeof expected === 'string' ? expected : null, customerUserId: identity.customerUserId });
   return true;
+}
+
+function paymentHistoryStatement(db: D1Database, userId: string, customerId: string): D1PreparedStatement {
+  return db.prepare(
+    `UPDATE billing_accounts SET has_payment_history=1
+     WHERE user_id=? AND provider_customer_id=? AND has_payment_history=0`
+  ).bind(userId, customerId);
+}
+
+/** Older deployments acknowledged some payments without a ledger entry. */
+async function repairPaymentHistory(db: D1Database, identity: BillingIdentity): Promise<void> {
+  if (!identity.customerUserId || (identity.checkoutUserId !== undefined
+    && identity.checkoutUserId !== identity.customerUserId)) return;
+  // Replay repairs only history for the same existing customer. Never reapply
+  // credits, resurrect a deleted account, or accept a rejected ownership claim.
+  await paymentHistoryStatement(db, identity.customerUserId, identity.customerId).run();
+}
+
+function subscriptionStateStatement(db: D1Database, state: {
+  userId: string; customerId: string; subscriptionId: string; status: string; eventAt: number;
+}): D1PreparedStatement {
+  return db.prepare(
+    `INSERT INTO billing_subscription_states
+      (subscription_id,user_id,customer_id,status,provider_updated_at) VALUES (?,?,?,?,?)
+     ON CONFLICT(subscription_id) DO UPDATE SET
+       status=excluded.status,provider_updated_at=excluded.provider_updated_at
+     WHERE excluded.user_id=billing_subscription_states.user_id
+       AND excluded.customer_id=billing_subscription_states.customer_id
+       AND excluded.provider_updated_at >= billing_subscription_states.provider_updated_at`
+  ).bind(state.subscriptionId, state.userId, state.customerId, state.status, state.eventAt);
 }
 
 function billingUpsert(db: D1Database, state: BillingState): D1PreparedStatement {
