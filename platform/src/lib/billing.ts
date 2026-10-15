@@ -6,6 +6,7 @@ import type { WebhookSubscriptionCreatedPayload } from '@polar-sh/sdk/models/com
 import type { WebhookSubscriptionUpdatedPayload } from '@polar-sh/sdk/models/components/webhooksubscriptionupdatedpayload';
 import type { CreditEnv } from './entitlements';
 import { ApiError, now, sha256 } from './http';
+import { paymentReceipt, refundReconciliationStatements } from './credit-continuity';
 
 interface BillingAccountRow {
   plan: 'starter' | 'builder';
@@ -99,19 +100,25 @@ export async function applyPaidOrder(env: PaymentWebhookEnv, payload: WebhookOrd
   if (!order.paid) throw new ApiError(422, 'POLAR_ORDER_NOT_PAID', `Polar order ${order.id} was not paid.`);
 
   const eventId = `order.paid:${order.id}`;
-  const userId = order.customer.externalId;
+  const userId = order.customer.externalId ?? await env.DB.prepare(
+    'SELECT user_id FROM account_credit_payments WHERE order_id=? AND customer_id=?'
+  ).bind(order.id,order.customerId).first<string>('user_id');
   const identity: BillingIdentity = {
     customerId: order.customerId, subscriptionId: order.subscriptionId, orderId: order.id,
     customerUserId: userId ?? null, checkoutUserId: checkoutIdentity(userId, order.metadata?.app_user_id, order.subscription?.metadata?.app_user_id),
   };
   if (await processed(env.DB, eventId)) {
     await repairPaymentHistory(env.DB, identity);
+    if (userId && (identity.checkoutUserId === undefined || identity.checkoutUserId === userId)) {
+      await paymentReceipt(env.DB, order.id, userId, order.customerId, payload.timestamp.getTime()).run();
+    }
     return;
   }
   if (await rejectMismatchedIdentity(env, payload, eventId, identity)) return;
   if (!userId) throw new ApiError(422, 'POLAR_MISSING_CUSTOMER_EXTERNAL_ID', `Polar order ${order.id} is missing the Better Auth external ID.`);
 
   if (!await userExists(env.DB, userId)) {
+    await paymentReceipt(env.DB, order.id, userId, order.customerId, payload.timestamp.getTime()).run();
     await recordEvent(env.DB, eventId, eventFingerprint(payload));
     console.warn(JSON.stringify({ event: 'polar_order_without_user', orderId: order.id, userId }));
     return;
@@ -143,6 +150,7 @@ export async function applyPaidOrder(env: PaymentWebhookEnv, payload: WebhookOrd
     currentPeriodEnd: state.currentPeriodEnd,
     billingReason: order.billingReason,
     allowance,
+    providerEventAt: eventAt,
   });
 
   await env.DB.batch([
@@ -167,6 +175,7 @@ export async function applyPaidOrder(env: PaymentWebhookEnv, payload: WebhookOrd
       crypto.randomUUID(), userId, `polar:order:${order.id}`, allowance, allowance,
       metadata, now(), userId, userId, eventAt, status,
     ),
+    paymentReceipt(env.DB, order.id, userId, order.customerId, eventAt),
     eventStatement(env.DB, eventId, await eventFingerprint(payload)),
   ]);
 }
@@ -193,10 +202,6 @@ export async function syncCustomerState(
   if (await rejectMismatchedIdentity(env, payload, eventId, identity)) return;
   if (!userId) throw new ApiError(422, 'POLAR_MISSING_CUSTOMER_EXTERNAL_ID', `Polar customer ${customer.id} is missing the Better Auth external ID.`);
   if (!await userExists(env.DB, userId)) return;
-  const current = await env.DB.prepare('SELECT status FROM billing_accounts WHERE user_id=?')
-    .bind(userId).first<{ status: string }>();
-  const refundLocked = current?.status === 'refunded';
-  const subscription = refundLocked ? undefined : matchedSubscription;
   await env.DB.batch([
     ...subscriptions.map((candidate) => subscriptionStateStatement(env.DB, {
       userId, customerId: customer.id, subscriptionId: candidate.id,
@@ -207,13 +212,13 @@ export async function syncCustomerState(
       customerId: customer.id,
       subscriptionId: matchedSubscription?.id ?? null,
       productId: matchedSubscription?.productId ?? null,
-      plan: subscription ? 'builder' : 'starter',
-      status: refundLocked ? 'refunded' : subscription?.status ?? 'inactive',
+      plan: matchedSubscription ? 'builder' : 'starter',
+      status: matchedSubscription?.status ?? 'inactive',
       cancelAtPeriodEnd: matchedSubscription?.cancelAtPeriodEnd ?? false,
       currentPeriodStart: dateMillis(matchedSubscription?.currentPeriodStart),
       currentPeriodEnd: dateMillis(matchedSubscription?.currentPeriodEnd),
       eventAt: payload.timestamp.getTime(),
-    }),
+    }, { preserveRefund: true }),
     eventStatement(env.DB, eventId, await eventFingerprint(payload)),
   ]);
 }
@@ -287,20 +292,35 @@ export async function applyRefundedOrder(env: PaymentWebhookEnv, payload: Webhoo
   if (order.productId !== env.POLAR_BUILDER_PRODUCT_ID) return;
   const eventId = `order.refunded:${order.id}`;
 
-  const userId = order.customer.externalId;
+  // Historic orders may omit external_id after Polar anonymizes the customer.
+  const userId = order.customer.externalId ?? await env.DB.prepare(
+    'SELECT user_id FROM deleted_accounts WHERE polar_customer_id=? ORDER BY sequence DESC LIMIT 1'
+  ).bind(order.customerId).first<string>('user_id');
   const identity: BillingIdentity = {
     customerId: order.customerId, subscriptionId: order.subscriptionId, orderId: order.id,
     customerUserId: userId ?? null, checkoutUserId: checkoutIdentity(userId, order.metadata?.app_user_id, order.subscription?.metadata?.app_user_id),
   };
-  if (await processed(env.DB, eventId)) {
+  const acknowledged = await processed(env.DB, eventId);
+  if (acknowledged) {
     await repairPaymentHistory(env.DB, identity);
-    return;
-  }
-  if (await rejectMismatchedIdentity(env, payload, eventId, identity)) return;
+    if (identity.checkoutUserId !== undefined && identity.checkoutUserId !== userId) return;
+  } else if (await rejectMismatchedIdentity(env, payload, eventId, identity)) return;
   if (!userId) throw new ApiError(422, 'POLAR_MISSING_CUSTOMER_EXTERNAL_ID', `Polar refund ${order.id} is missing the Better Auth external ID.`);
   if (!await userExists(env.DB, userId)) {
+    if (await reconcileDeletedRefund(env, payload, userId, eventId)) return;
     await recordEvent(env.DB, eventId, eventFingerprint(payload));
     console.warn(JSON.stringify({ event: 'polar_refund_without_user', orderId: order.id, userId }));
+    return;
+  }
+
+  // A replay for an unrelated customer cannot change the current customer.
+  // A retained grant allows valid historical orders from a previous customer.
+  const unrelated = await env.DB.prepare(`SELECT 1 FROM billing_accounts b
+    WHERE b.user_id=? AND b.provider_customer_id IS NOT NULL AND b.provider_customer_id<>?
+      AND NOT EXISTS (SELECT 1 FROM account_credit_payments p WHERE p.order_id=? AND p.user_id=? AND p.customer_id=?)`)
+    .bind(userId,order.customerId,order.id,userId,order.customerId).first();
+  if (unrelated) {
+    if (!acknowledged) await recordEvent(env.DB,eventId,eventFingerprint(payload));
     return;
   }
 
@@ -320,27 +340,45 @@ export async function applyRefundedOrder(env: PaymentWebhookEnv, payload: Webhoo
     eventAt,
   };
   await env.DB.batch([
-    billingUpsert(env.DB, state),
+    ...refundReconciliationStatements(env.DB, {
+      orderId: order.id, userId, customerId: order.customerId, eventAt, starterCredits,
+    }),
+    billingUpsert(env.DB, state, { refundOrderId: order.id }),
     paymentHistoryStatement(env.DB, userId, order.customerId),
-    env.DB.prepare(
-      `INSERT OR IGNORE INTO credit_ledger
-       (id,user_id,operation_id,entry_type,credits,metadata_json,created_at)
-       SELECT ?,?,?,'adjustment',? - current_balance,?,?
-       FROM (
-         SELECT available_credits AS current_balance
-         FROM credit_accounts WHERE user_id=?
-       )
-       WHERE EXISTS (
-         SELECT 1 FROM billing_accounts
-         WHERE user_id=? AND provider_updated_at=? AND plan='starter' AND status='refunded'
-       )`
-    ).bind(
-      crypto.randomUUID(), userId, `polar:refund:${order.id}`, starterCredits,
-      JSON.stringify({ provider: 'polar', kind: 'refund-reset', orderId: order.id, balance: starterCredits }),
-      now(), userId, userId, eventAt,
-    ),
-    eventStatement(env.DB, eventId, await eventFingerprint(payload)),
+    refundEventStatement(env.DB, eventId, order.id, await eventFingerprint(payload)),
   ]);
+  await assertRefundReconciled(env.DB, order.id);
+}
+
+async function reconcileDeletedRefund(
+  env: PaymentWebhookEnv, payload: WebhookOrderRefundedPayload, userId: string, eventId: string,
+): Promise<boolean> {
+  const customerId = payload.data.customerId;
+  const origin = await env.DB.prepare('SELECT user_id FROM deleted_accounts WHERE user_id=? AND polar_customer_id=?')
+    .bind(userId, customerId).first();
+  if (!origin) return false;
+  await env.DB.batch([
+    ...refundReconciliationStatements(env.DB, {
+      orderId: payload.data.id, userId, customerId,
+      eventAt: payload.timestamp.getTime(), starterCredits: Number(env.STARTER_ONBOARDING_CREDITS),
+    }),
+    refundEventStatement(env.DB, eventId, payload.data.id, await eventFingerprint(payload)),
+  ]);
+  await assertRefundReconciled(env.DB, payload.data.id);
+  return true;
+}
+
+function refundEventStatement(db: D1Database, eventId: string, orderId: string, fingerprint: string): D1PreparedStatement {
+  return db.prepare(`INSERT OR IGNORE INTO processed_events (source,event_id,processed_at,payload_hash)
+    SELECT 'polar',?,?,? WHERE EXISTS (SELECT 1 FROM account_credit_refunds WHERE order_id=?)`)
+    .bind(eventId,now(),fingerprint,orderId);
+}
+
+async function assertRefundReconciled(db: D1Database, orderId: string): Promise<void> {
+  if (!await db.prepare('SELECT 1 FROM account_credit_refunds WHERE order_id=?').bind(orderId).first()) {
+    throw new ApiError(503, 'POLAR_REFUND_ORDERING_UNRESOLVED',
+      `Refund ${orderId} requires reconciliation of a legacy paid order. Replay its signed order.paid event, then retry this refund.`);
+  }
 }
 
 /** Every subscription Polar holds for a user, or null when Polar has never seen them. */
@@ -462,18 +500,27 @@ function subscriptionStateStatement(db: D1Database, state: {
   ).bind(state.subscriptionId, state.userId, state.customerId, state.status, state.eventAt);
 }
 
-function billingUpsert(db: D1Database, state: BillingState): D1PreparedStatement {
+function billingUpsert(db: D1Database, state: BillingState, options: {
+  refundOrderId?: string;
+  preserveRefund?: boolean;
+} = {}): D1PreparedStatement {
+  const { refundOrderId, preserveRefund } = options;
+  // Customer snapshots must inspect the refund lock inside their write. A
+  // preflight read can become stale after either a refund or a paid order.
+  // Fulfilled payments use the normal update and can restore Builder access.
   return db.prepare(
     `INSERT INTO billing_accounts
       (user_id,provider,provider_customer_id,provider_subscription_id,provider_product_id,plan,status,
        cancel_at_period_end,current_period_start,current_period_end,provider_updated_at,updated_at)
-     VALUES (?,'polar',?,?,?,?,?,?,?,?,?,?)
+     SELECT ?,'polar',?,?,?,?,?,?,?,?,?,? WHERE EXISTS (SELECT 1 FROM user WHERE id=?)
+       ${refundOrderId ? `AND EXISTS (SELECT 1 FROM account_credit_refunds WHERE order_id=?
+         AND owner_user_id=? AND outcome IN ('applied','unfunded'))` : ''}
      ON CONFLICT(user_id) DO UPDATE SET
        provider_customer_id=excluded.provider_customer_id,
        provider_subscription_id=excluded.provider_subscription_id,
        provider_product_id=excluded.provider_product_id,
-       plan=excluded.plan,
-       status=excluded.status,
+       plan=${preserveRefund ? "CASE WHEN billing_accounts.status='refunded' THEN 'starter' ELSE excluded.plan END" : 'excluded.plan'},
+       status=${preserveRefund ? "CASE WHEN billing_accounts.status='refunded' THEN 'refunded' ELSE excluded.status END" : 'excluded.status'},
        cancel_at_period_end=excluded.cancel_at_period_end,
        current_period_start=excluded.current_period_start,
        current_period_end=excluded.current_period_end,
@@ -482,7 +529,8 @@ function billingUpsert(db: D1Database, state: BillingState): D1PreparedStatement
      WHERE excluded.provider_updated_at >= billing_accounts.provider_updated_at`
   ).bind(
     state.userId, state.customerId, state.subscriptionId, state.productId, state.plan, state.status,
-    state.cancelAtPeriodEnd ? 1 : 0, state.currentPeriodStart, state.currentPeriodEnd, state.eventAt, now(),
+    state.cancelAtPeriodEnd ? 1 : 0, state.currentPeriodStart, state.currentPeriodEnd, state.eventAt, now(), state.userId,
+    ...(refundOrderId ? [refundOrderId,state.userId] : []),
   );
 }
 
