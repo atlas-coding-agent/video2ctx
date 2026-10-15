@@ -1,3 +1,5 @@
+import { runResearchAgentWithModel } from '../src/agents/research/research-agent';
+import { withModelFailover } from '../src/agents/runtime/model-failover';
 import { attachTestAssetStore } from './fixtures/analysis-session';
 import { executeAnalyzeVideoStoryboard } from '../src/agents/providers/youtube/tools/analyze-video-storyboard';
 import { extractionFixture } from './fixtures/extraction-diagnostic';
@@ -297,13 +299,13 @@ describe('storyboard agent tool', () => {
         ? { uncachedInputUsdPerMillionTokens: .1875, cachedInputUsdPerMillionTokens: .0375, outputUsdPerMillionTokens: .625 }
         : { uncachedInputUsdPerMillionTokens: .15, cachedInputUsdPerMillionTokens: .03, outputUsdPerMillionTokens: .5 }) }));
   });
-  it('bounds a non-cooperative visual model to 20 seconds', async () => {
+  it('bounds a non-cooperative visual model to 60 seconds', async () => {
     vi.useFakeTimers();
     try {
       const analyze = createVisualAnalyst(new MockLanguageModelV4({ doGenerate: () => new Promise(() => {}) }));
       const pending = analyze({ storyboard, focus: 'Diagram', signal: new AbortController().signal, modelCallId: 'timeout' });
-      const check = expect(pending).rejects.toThrow('20-second deadline');
-      await vi.advanceTimersByTimeAsync(20_001);
+      const check = expect(pending).rejects.toThrow('Visual analysis exceeded its deadline');
+      await vi.advanceTimersByTimeAsync(60_001);
       await check;
     } finally { vi.useRealTimers(); }
   });
@@ -357,11 +359,11 @@ it('declines storyboard retrieval when it cannot reserve analysis time', async (
   expect(ctx.provider.storyboard).not.toHaveBeenCalled();
 });
 
-it('bounds a hanging retrieval and preserves 35 seconds for analysis', async () => {
+it('bounds a hanging retrieval and preserves 75 seconds for analysis', async () => {
   vi.useFakeTimers();
   try {
     const ctx = context();
-    ctx.researchDeadlineAt = Date.now() + 60_000;
+    ctx.researchDeadlineAt = Date.now() + 100_000;
     let signal: AbortSignal | undefined;
     ctx.provider.storyboard = vi.fn(async (_id, _times, options) => {
       signal = options?.signal;
@@ -371,7 +373,7 @@ it('bounds a hanging retrieval and preserves 35 seconds for analysis', async () 
     const rejected = expect(request).rejects.toThrow('Storyboard retrieval exceeded its budget');
     await vi.advanceTimersByTimeAsync(25_000);
     await rejected;
-    expect(ctx.researchDeadlineAt - Date.now()).toBe(35_000);
+    expect(ctx.researchDeadlineAt - Date.now()).toBe(75_000);
     expect(ctx.signal.aborted).toBe(false);
     expect(signal?.aborted).toBe(true);
   } finally { vi.useRealTimers(); }
@@ -461,10 +463,10 @@ it('retrieves and analyzes a slow storyboard within the reserved research time',
   vi.useFakeTimers();
   try {
     const ctx = context();
-    ctx.researchDeadlineAt = Date.now() + 60_000;
+    ctx.researchDeadlineAt = Date.now() + 100_000;
     const fetchStoryboard = ctx.provider.storyboard!;
     ctx.provider.storyboard = vi.fn(async (...args: Parameters<typeof fetchStoryboard>) => {
-      expect(args[2]?.deadlineAt).toBe(ctx.researchDeadlineAt! - 35_000);
+      expect(args[2]?.deadlineAt).toBe(ctx.researchDeadlineAt! - 75_000);
       await new Promise(resolve => setTimeout(resolve, 20_000));
       return fetchStoryboard(...args);
     });
@@ -473,6 +475,86 @@ it('retrieves and analyzes a slow storyboard within the reserved research time',
     await vi.advanceTimersByTimeAsync(20_000);
     const packet = await pending;
     expect(packet.excerpts.length).toBeGreaterThan(0);
-    expect(ctx.researchDeadlineAt - Date.now()).toBeGreaterThanOrEqual(35_000);
+    expect(ctx.researchDeadlineAt - Date.now()).toBeGreaterThanOrEqual(75_000);
   } finally { vi.useRealTimers(); }
 });
+
+
+it.each(['deadline', 'ignores abort', 'user cancellation'] as const)(
+  'retains completed storyboard evidence at handoff while respecting %s', async scenario => {
+    vi.useFakeTimers();
+    try {
+      const ctx = context();
+      const parent = new AbortController();
+      ctx.signal = parent.signal;
+      const store = attachTestAssetStore(ctx);
+      const assetVersions = Array.from({ length: 12 }, (_, index) => store.put('storyboard_sheet', storyboard.videoId, {
+        ...storyboard, frameCount: 300, sheets: [{ ...storyboard.sheets[0]!,
+          firstFrameIndex: index * 25, frameCount: 25, columns: 5, rows: 5 }],
+      }, { sheetIndex: index, manifestVersion: 'saved-manifest' }));
+      let retained: Awaited<ReturnType<typeof executeAnalyzeVideoStoryboard>> | undefined;
+      ctx.executeEvidenceTool = async execution => { retained = await execution.execute(); return retained; };
+      const deadlineAt = Date.now() + 45_000;
+      const hanging = () => new MockLanguageModelV4({ doStream: async () => ({ stream: new ReadableStream({
+        start(controller) {
+          controller.enqueue({ type: 'reasoning-start', id: 'r' });
+          controller.enqueue({ type: 'reasoning-delta', id: 'r', delta: 'Inspecting images' });
+        },
+      }) }) });
+      const primary = hanging();
+      const fallback = hanging();
+      const stalled = createVisualAnalyst(withModelFailover({ primary, fallback, role: 'visual_analyst',
+        state: { fallback: false, deadlineAt } }));
+      let stalledSignal: AbortSignal | undefined;
+      ctx.analyzeStoryboard = vi.fn(async input => {
+        if (input.storyboard.sheets[0]!.firstFrameIndex === 0)
+          return { findings: [{ observation: 'The presenter wears a green jacket.', frameIndexes: [0] }], warnings: [] };
+        stalledSignal = input.signal;
+        if (scenario === 'ignores abort') return new Promise<never>(() => {});
+        return stalled(input);
+      });
+      const usage = { inputTokens: { total: 1, noCache: 1, cacheRead: 0, cacheWrite: 0 },
+        outputTokens: { total: 1, text: 1, reasoning: 0 } };
+      let step = 0;
+      const research = new MockLanguageModelV4({ doGenerate: async () => ({
+        content: [{ type: 'tool-call', toolCallId: `research-${step}`, toolName: step++ === 0 ? 'analyze_video_storyboard' : 'complete_research',
+          input: step === 1 ? JSON.stringify({ assetVersions, focus: 'Describe the clothing.' }) : '{}' }],
+        finishReason: { unified: 'tool-calls', raw: 'tool_calls' }, usage, warnings: [],
+      }) });
+      const finalizer = new MockLanguageModelV4({ doGenerate: async call => {
+        expect(Date.now()).toBeLessThan(deadlineAt);
+        expect(JSON.stringify(call.prompt)).toContain('The presenter wears a green jacket.');
+        return { content: [{ type: 'text', text: JSON.stringify({ confidence: 'medium', warnings: [],
+          blocks: [{ text: 'The presenter wears a green jacket.', evidenceIds: ['ref_1'] }] }) }],
+          finishReason: { unified: 'stop', raw: 'stop' }, usage, warnings: [] };
+      } });
+      ctx.finalize = vi.fn(async (_id, input) => ({ ...input, runId: ctx.runId, conversationId: crypto.randomUUID(),
+        userMessageId: crypto.randomUUID(), agentMessageId: crypto.randomUUID(), billing: { creditsCharged: 0, creditsRemaining: 100 } }));
+      const pending = runResearchAgentWithModel({ model: research, finalizationModel: finalizer, context: ctx,
+        message: 'Describe the clothing in these saved storyboard images.', researchDeadlineAt: deadlineAt,
+        decision: { route: 'inspect_video', videoId: storyboard.videoId, useStoryboard: true, visualEvidence: 'required',
+          visualRequirements: ['clothing'] }, toolNames: ['analyze_video_storyboard', 'finalize_answer'],
+      }).catch(error => error);
+      await vi.advanceTimersByTimeAsync(5_000);
+      expect(ctx.analyzeStoryboard).toHaveBeenCalledTimes(2);
+      if (scenario === 'user cancellation') parent.abort(new Error('Cancelled by user'));
+      await vi.advanceTimersByTimeAsync(40_001);
+      const result = await pending;
+      if (scenario === 'user cancellation') {
+        expect(result).toMatchObject({ message: 'Cancelled by user' });
+        expect(finalizer.doGenerateCalls).toHaveLength(0);
+        expect(ctx.finalize).not.toHaveBeenCalled();
+        expect(retained).toBeUndefined();
+        expect(fallback.doStreamCalls).toHaveLength(0);
+      } else {
+        expect(result).not.toBeInstanceOf(Error);
+        expect(finalizer.doGenerateCalls.length).toBeGreaterThan(0);
+        expect(ctx.finalize).toHaveBeenCalledOnce();
+        expect(retained?.artifacts[0]?.data).toMatchObject({ requestedSheetCount: 12, analyzedSheetCount: 6, sampledFrames: 150 });
+        expect(retained?.warnings.some(warning => warning.message.includes('batch 2 failed'))).toBe(true);
+        if (scenario === 'deadline') expect(fallback.doStreamCalls).toHaveLength(1);
+      }
+      expect(stalledSignal?.aborted).toBe(true);
+      expect(vi.getTimerCount()).toBe(0);
+    } finally { vi.useRealTimers(); }
+  });
