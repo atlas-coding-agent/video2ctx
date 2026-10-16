@@ -454,6 +454,45 @@ describe('model-written aliases and passage references', () => {
   ])('leaves code, URLs, identifiers and quotations unchanged: %s', text => {
     expect(publish(text).input.answer).toBe(`${text} [cite:t1]`);
   });
+  it.each([
+    'Call fn(value, ref_1) here.',
+    'Call fn(ref_1, ref_2, value) here.',
+    'Call fn(ref_1, ref_2) here.',
+    'Call outer(inner(ref_1), ref_2) here.',
+    'Call fn(a, b(c), ref_1) here.',
+    'Call obj.method(ref_1) here.',
+    'Call fn(ref_1 here.',
+  ])('leaves aliases in call-like text unchanged in any argument position: %s', text => {
+    const { input, result, compact } = publish(text);
+    expect(input.answer).toBe(`${text} [cite:t1]`);
+    expect(result.citations.map(citation => citation.id)).toEqual(['t1']);
+    expect(compact.answer).toBe(`${text} [1 · 0:10]`);
+  });
+  it.each([
+    ['After fn(value) returns, the wash dries ref_9.', 'After fn(value) returns, the wash dries [1 · 0:40]. [1 · 0:10]'],
+    ['The wash dries (ref_9), as fn(x) shows.', 'The wash dries [1 · 0:40], as fn(x) shows. [1 · 0:10]'],
+    ['Blooms appear (see ref_9) after fn(ref_2).', 'Blooms appear (see [1 · 0:40]) after fn(ref_2). [1 · 0:10]'],
+    ['See [docs](https://example.com/wash) and ref_9.', 'See [docs](https://example.com/wash) and [1 · 0:40]. [1 · 0:10]'],
+  ])('still resolves prose aliases beside call-like text and links: %s', (text, expected) => {
+    expect(publish(text).compact.answer).toBe(expected);
+  });
+  it.each([
+    'See [the wash ref_9](https://example.com/wash) here.',
+    'See [docs](https://example.com/ref_9) here.',
+    'See [docs](ref_9) here.',
+    'See [docs](https://example.com/wash "ref_9") here.',
+    'See ![frame (ref_143, ref_144)](https://example.com/frame.png) here.',
+    'See <https://example.com/ref_9> here.',
+  ])('leaves Markdown link labels and destinations unchanged: %s', text => {
+    const { input, result, compact } = publish(text);
+    expect(input.answer).toBe(`${text} [cite:t1]`);
+    expect(result.citations.map(citation => citation.id)).toEqual(['t1']);
+    expect(compact.answer).toBe(`${text} [1 · 0:10]`);
+  });
+  it('excludes aliases in call-like text and links from block references', () => {
+    expect(blockReferences({ text: 'fn(value, ref_1), [see ref_2](https://example.com) and ref_9.', evidenceIds: [] }, aliases))
+      .toEqual(['t4']);
+  });
   it('leaves aliases inside a fenced code block unchanged', () => {
     const text = 'Example:\n\n```text\n(ref_143, ref_144) ref_9\n```\n\nDone.';
     expect(publish(text).input.answer).toBe(`${text} [cite:t1]`);
