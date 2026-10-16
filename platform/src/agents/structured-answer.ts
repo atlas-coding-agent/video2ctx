@@ -14,8 +14,8 @@ const fields = finalizeAnswerInputSchema.omit({ answer: true, citations: true, i
 const block = z.object({
   // The SDK bounds generation tokens and the rendered contract bounds total
   // characters. A decoding limit on each paragraph can split words at its edge.
-  text: z.string().min(1).regex(/\S/, 'A block must contain non-whitespace text.').describe('One complete paragraph, list item, or Markdown table. Finish the table within this block. End prose at a natural sentence boundary; never continue a sentence in the next block.'),
-  evidenceIds: z.array(z.string().regex(/^[A-Za-z0-9:_-]+$/).max(300)).min(1).max(12),
+  text: z.string().min(1).regex(/\S/, 'A block must contain non-whitespace text.').describe('One complete paragraph, list item, or Markdown table. Finish the table within this block. End prose at a natural sentence boundary; never continue a sentence in the next block. Put prose citations in evidenceIds, not in text: the application appends the links. For Markdown tables only, use [cite:ref_N] in Source cells and include those IDs in evidenceIds. Never write bare aliases or reference ranges as citations.'),
+  evidenceIds: z.array(z.string().regex(/^[A-Za-z0-9:_-]+$/).max(300)).min(1).max(12).describe('Individual supplied evidence IDs supporting this block. List each ID separately, without ranges or duplicates. The application renders these as citations.'),
 });
 // Executable routes require references in the transmitted JSON schema itself.
 // Do not hide model-facing requirements in refinements that JSON Schema omits.
@@ -32,7 +32,7 @@ export const clarificationAnswerSchema = fields.extend({
 export const contextAnswerSchema = fields.extend({
   intent: z.literal('context_answer'),
   blocks: z.array(block.extend({
-    evidenceIds: z.array(block.shape.evidenceIds.element).max(12).describe('Cite persisted evidence for video facts. Use no evidence IDs only when discussing prior conversation statements, without treating them as verified video facts.'),
+    evidenceIds: z.array(block.shape.evidenceIds.element).max(12).describe('List individual supplied evidence IDs for video facts, without ranges or duplicates. The application renders these as citations. Use no evidence IDs only when discussing prior conversation statements, without treating them as verified video facts.'),
   })).min(1).max(20),
 });
 
@@ -114,21 +114,47 @@ function normalizeBareReferences(text: string): string {
 }
 
 const ALIAS = String.raw`ref_\d+`;
-const ALIAS_LIST = String.raw`${ALIAS}(?:\s*,\s*${ALIAS})*`;
+const RANGE_SEPARATOR = String.raw`(?:-|–|—|\bto\b|\bthrough\b|\bthru\b)`;
+const ALIAS_ITEM = String.raw`${ALIAS}(?:\s*${RANGE_SEPARATOR}\s*(?:ref_)?\d+)?`;
+const ALIAS_LIST = String.raw`${ALIAS_ITEM}(?:\s*,\s*${ALIAS_ITEM})*`;
+const ALIAS_RANGE = new RegExp(String.raw`^ref_(\d+)\s*${RANGE_SEPARATOR}\s*(?:ref_)?(\d+)$`);
 // A bare alias must stand alone: not part of an identifier, path, URL or quotation.
 const ALIAS_BEFORE = String.raw`(?<![\w\-./:=#?&%@~+$\\\[【'"‘“\`])`;
 const ALIAS_AFTER = String.raw`(?![\w\-/:(\]】'"’”\`]|\.\w)`;
-// Alternatives are tried left to right at each position. Existing markers and bracketed groups
-// are consumed unchanged here, so their contents are never rescanned, and a range is consumed
-// before its endpoints can match as bare aliases.
+// Consume a range as one item before its endpoints can match separately. Bracketed
+// lists are checked as a whole, including lists mixing ranges and individual aliases.
 const MODEL_REFERENCES = new RegExp([
   String.raw`\[cite:[^\]]*\]|\(source marker:[^\]]*\]`,
-  String.raw`\[\s*${ALIAS_LIST}\s*\]|【\s*${ALIAS_LIST}\s*】`,
-  String.raw`${ALIAS_BEFORE}${ALIAS}\s*(?:-|–|—|\bto\b|\bthrough\b|\bthru\b)\s*(?:ref_)?\d+${ALIAS_AFTER}`,
+  String.raw`\[\s*(?<square>${ALIAS_LIST})\s*\]|【\s*(?<wide>${ALIAS_LIST})\s*】`,
   // A group directly after "]" is a link destination, not a citation.
-  String.raw`(\])?\(\s*(${ALIAS_LIST})\s*\)`,
-  String.raw`${ALIAS_BEFORE}(${ALIAS})${ALIAS_AFTER}`,
+  String.raw`(?<linked>\])?\(\s*(?<group>${ALIAS_LIST})\s*\)`,
+  String.raw`${ALIAS_BEFORE}(?<bare>${ALIAS_ITEM})${ALIAS_AFTER}`,
 ].join('|'), 'g');
+
+/** Expand only complete, ascending ranges of supplied aliases. Bound work by the
+ * actual alias map before iterating, even for enormous model-written endpoints. */
+function expandAliasList(listed: string, aliases: ReadonlyMap<string, string>): string[] | undefined {
+  const resolved = new Set<string>();
+  for (const item of listed.split(',').map(part => part.trim())) {
+    const range = ALIAS_RANGE.exec(item);
+    if (!range) {
+      if (!aliases.has(item)) return undefined;
+      resolved.add(item);
+      continue;
+    }
+    const first = Number(range[1]), last = Number(range[2]);
+    if (!Number.isSafeInteger(first) || !Number.isSafeInteger(last) || first > last
+      || last - first + 1 > aliases.size) return undefined;
+    // Alias numbers are canonical decimal integers, never padded identifiers.
+    if (String(first) !== range[1] || String(last) !== range[2]) return undefined;
+    for (let number = first; number <= last; number += 1) {
+      const alias = `ref_${number}`;
+      if (!aliases.has(alias)) return undefined;
+      resolved.add(alias);
+    }
+  }
+  return [...resolved];
+}
 // Links, images and definitions are copied unchanged, so no citation lands inside a label or URL.
 const LINK_NODES = ['link', 'linkReference', 'image', 'imageReference', 'definition'] as const;
 
@@ -139,6 +165,10 @@ const LINK_NODES = ['link', 'linkReference', 'image', 'imageReference', 'definit
  * or a line break inside a call cannot end it early. */
 function literalSpans(text: string, prose: ReadonlyArray<[number, number]>): Array<[number, number]> {
   const urls = [...text.matchAll(/(?:\b[A-Za-z][A-Za-z\d+.-]*:\/\/|\bwww\.)[^\s<>]+/g)]
+    .map((match): [number, number] => [match.index!, match.index! + match[0].length]);
+  // Quotes describe literal text. Do not turn their contents into evidence links.
+  // Apostrophes within words do not open a quotation.
+  const quotes = [...text.matchAll(/(?<![\p{L}\p{N}_\\])(?:"(?:\\.|[^"\\\n])*"|“[^”\n]*”|'(?:\\.|[^'\\\n])*'|‘[^’\n]*’)/gu)]
     .map((match): [number, number] => [match.index!, match.index! + match[0].length]);
   const calls: Array<[number, number]> = [];
   for (const match of text.matchAll(/[A-Za-z_$][\w$.]*\(/g)) {
@@ -165,24 +195,26 @@ function literalSpans(text: string, prose: ReadonlyArray<[number, number]>): Arr
     }
     calls.push([start, end]);
   }
-  return [...urls, ...calls];
+  return [...urls, ...quotes, ...calls];
 }
 
 /** Resolve parenthesized groups and bare aliases only when every alias names supplied evidence.
- * Ranges, unknown and mixed forms, URLs, call-like text and links stay as written: a range
- * never implies the references between its endpoints. */
+ * Ranges include both endpoints and every supplied alias between them. Incomplete or
+ * reversed ranges, unknown groups, URLs, quoted literals, calls and links stay as written. */
 function resolveAliasForms(text: string, aliases: ReadonlyMap<string, string>): string {
   if (!aliases.size) return text;
   const prose: Array<[number, number]> = [];
   mapCitationProse(text, (chunk, from, to) => { prose.push([from, to]); return chunk; }, false, LINK_NODES);
   const literals = literalSpans(text, prose);
   return mapCitationProse(text, (chunk, proseStart) => {
-    return chunk.replace(MODEL_REFERENCES, (marker: string, linked: string | undefined, group: string | undefined,
-      bare: string | undefined, offset: number) => {
-      const listed = group ?? bare;
+    return chunk.replace(MODEL_REFERENCES, (marker: string, ...args: unknown[]) => {
+      const groups = args.at(-1) as Record<string, string | undefined>;
+      const offset = args.at(-3) as number;
+      const listed = groups.square ?? groups.wide ?? groups.group ?? groups.bare;
       const start = proseStart + offset;
-      if (!listed || linked || literals.some(([from, to]) => start < to && start + marker.length > from)) return marker;
-      return listed.split(',').every(alias => aliases.has(alias.trim())) ? `[cite:${listed}]` : marker;
+      if (!listed || groups.linked || literals.some(([from, to]) => start < to && start + marker.length > from)) return marker;
+      const expanded = expandAliasList(listed, aliases);
+      return expanded ? `[cite:${expanded.join(',')}]` : marker;
     });
   }, false, LINK_NODES);
 }

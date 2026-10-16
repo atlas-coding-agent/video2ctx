@@ -1910,3 +1910,33 @@ it.each([
   expect(compactAgentResult(result).answer).toBe(shown);
   expect(JSON.stringify(finalizer.doGenerateCalls[0]!.prompt[0])).toContain('Never write reference ranges');
 });
+
+it.each(['generate', 'stream'] as const)('%s resolves a range using supplied aliases without another model attempt', async mode => {
+  const { options, classifier, output, identity } = setup('context_answer', true);
+  const second: EvidencePacket = { ...evidence, packetId: 'other-frame',
+    sources: [{ id: 'other-video', provider: 'youtube', kind: 'frames', videoId: 'zzzzzzzzzzz' }],
+    excerpts: [{ id: 'other-observation', sourceId: 'other-video', text: 'A rabbit stands outdoors.', startMs: 60000 }] };
+  options.recoveredEvidence = [second];
+  // Recovered evidence receives ref_1; conversation evidence receives ref_2.
+  const value = { ...output, blocks: [{ text: 'A rabbit and an interview (ref_1 through ref_2).', evidenceIds: ['ref_1'] }] };
+  const finalizer = new MockLanguageModelV4({
+    doGenerate: async () => ({ content: [{ type: 'text', text: JSON.stringify(value) }],
+      finishReason: { unified: 'stop', raw: 'stop' }, usage, warnings: [] }),
+    doStream: async () => ({ stream: simulateReadableStream({ chunks: [
+      { type: 'stream-start', warnings: [] }, { type: 'text-start', id: 'answer' },
+      { type: 'text-delta', id: 'answer', delta: JSON.stringify(value) },
+      { type: 'text-end', id: 'answer' },
+      { type: 'finish', finishReason: { unified: 'stop', raw: 'stop' }, usage },
+    ], initialDelayInMs: null, chunkDelayInMs: null }) }),
+  });
+  models.select.mockImplementation((_env, _session, _effort, metadata) => metadata.model_role === 'classifier' ? classifier : finalizer);
+  if (mode === 'stream') options.onDraft = vi.fn();
+  options.finalize = vi.fn(async (_id, input) => buildAgentTurnResult(identity,
+    { userId: 'user', creditsRemaining: 100 }, input, [second, evidence], 0));
+  await executeResearchRun(options);
+  expect(mode === 'stream' ? finalizer.doStreamCalls : finalizer.doGenerateCalls).toHaveLength(1);
+  expect(options.finalize).toHaveBeenCalledOnce();
+  const result: AgentTurnResult = await vi.mocked(options.finalize).mock.results[0]!.value;
+  expect(result.citations.map(c => c.id)).toEqual(['other-observation', 'frame-observation']);
+  expect(compactAgentResult(result).answer).toBe('A rabbit and an interview [1 · 1:00][2 · 0:30].');
+});
