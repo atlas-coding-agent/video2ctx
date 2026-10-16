@@ -1896,9 +1896,12 @@ it.each([
   ['The woman holds the microphone, ref_1.', 'The woman holds the microphone, [cite:frame-observation].', 'The woman holds the microphone, [1 · 0:30].'],
   ['Unknown (ref_9) and range ref_1 to ref_2 stay.', 'Unknown (ref_9) and range ref_1 to ref_2 stay. [cite:frame-observation]', 'Unknown (ref_9) and range ref_1 to ref_2 stay. [1 · 0:30]'],
 ])('resolves only known model-written aliases in a persisted answer, without a repair: %s', async (text, persisted, shown) => {
-  const { options, finalizer, output } = setup('context_answer', true);
-  finalizer.doGenerate = async () => ({ content: [{ type: 'text', text: JSON.stringify({ ...output, blocks: [{ text, evidenceIds: ['ref_1'] }] }) }],
-    finishReason: { unified: 'stop', raw: 'stop' }, usage, warnings: [] });
+  const { options, classifier, output } = setup('context_answer', true);
+  // Pass doGenerate to the constructor: the mock records calls only through that wrapper.
+  const finalizer = new MockLanguageModelV4({ doGenerate: async () => ({
+    content: [{ type: 'text', text: JSON.stringify({ ...output, blocks: [{ text, evidenceIds: ['ref_1'] }] }) }],
+    finishReason: { unified: 'stop', raw: 'stop' }, usage, warnings: [] }) });
+  models.select.mockImplementation((_env, _session, _effort, metadata) => metadata.model_role === 'classifier' ? classifier : finalizer);
   await executeResearchRun(options);
   expect(finalizer.doGenerateCalls).toHaveLength(1);
   expect(vi.mocked(options.finalize).mock.calls[0]![1].answer).toBe(persisted);

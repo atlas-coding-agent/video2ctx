@@ -399,11 +399,12 @@ describe('model-written aliases and passage references', () => {
   };
   const aliases = new Map([['ref_1', 't1'], ['ref_2', 't2'], ['ref_9', 't4'], ['ref_30', 't1'], ['ref_36', 't4'],
     ['ref_143', 't1'], ['ref_144', 't2']]);
-  function publish(text: string, evidenceIds: string[] = ['t1'], references: ReadonlyMap<string, string> = aliases) {
+  function publish(text: string, evidenceIds: string[] = ['t1'], references: ReadonlyMap<string, string> = aliases,
+    packets: EvidencePacket[] = [evidence]) {
     const input = renderStructuredAnswer({ ...base, blocks: [{ text, evidenceIds }] }, references);
     const result = buildAgentTurnResult({ runId: crypto.randomUUID(), conversationId: crypto.randomUUID(),
       userMessageId: crypto.randomUUID(), agentMessageId: crypto.randomUUID() },
-    { userId: 'test', creditsRemaining: 10 }, input, [evidence], 1);
+    { userId: 'test', creditsRemaining: 10 }, input, packets, 1);
     return { input, result, compact: compactAgentResult(result, ['evidence']) };
   }
 
@@ -473,7 +474,9 @@ describe('model-written aliases and passage references', () => {
     ['The wash dries (ref_9), as fn(x) shows.', 'The wash dries [1 · 0:40], as fn(x) shows. [1 · 0:10]'],
     ['Blooms appear (see ref_9) after fn(ref_2).', 'Blooms appear (see [1 · 0:40]) after fn(ref_2). [1 · 0:10]'],
     ['See [docs](https://example.com/wash) and ref_9.', 'See [docs](https://example.com/wash) and [1 · 0:40]. [1 · 0:10]'],
-  ])('still resolves prose aliases beside call-like text and links: %s', (text, expected) => {
+    ['Visit https://example.com/wash, then ref_9.', 'Visit https://example.com/wash, then [1 · 0:40]. [1 · 0:10]'],
+    ['Visit https://example.com/wash (ref_9).', 'Visit https://example.com/wash [1 · 0:40]. [1 · 0:10]'],
+  ])('still resolves prose aliases beside call-like text, links and URLs: %s', (text, expected) => {
     expect(publish(text).compact.answer).toBe(expected);
   });
   it.each([
@@ -481,9 +484,16 @@ describe('model-written aliases and passage references', () => {
     'See [docs](https://example.com/ref_9) here.',
     'See [docs](ref_9) here.',
     'See [docs](https://example.com/wash "ref_9") here.',
+    'See [docs](https://example.com/wash "Notes (ref_1, ref_2)") here.',
+    '[See (ref_1)](https://example.com/docs) here.',
+    'See [docs](https://example.com/?value=ok,ref_1) here.',
     'See ![frame (ref_143, ref_144)](https://example.com/frame.png) here.',
     'See <https://example.com/ref_9> here.',
-  ])('leaves Markdown link labels and destinations unchanged: %s', text => {
+    'See [docs][wash] and [ref_9 notes][wash] here.\n\n[wash]: https://example.com/?value=ok,ref_1 "ref_2"\n\nMore prose.',
+    'Visit https://example.com/?value=ok,ref_1 for notes.',
+    'Visit https://example.com/(ref_1, ref_2) for notes.',
+    'Visit www.example.com/?q=ok,ref_9 for notes.',
+  ])('leaves Markdown links, definitions and bare URLs unchanged: %s', text => {
     const { input, result, compact } = publish(text);
     expect(input.answer).toBe(`${text} [cite:t1]`);
     expect(result.citations.map(citation => citation.id)).toEqual(['t1']);
@@ -525,6 +535,29 @@ describe('model-written aliases and passage references', () => {
     const { compact } = publish('Second video first [cite:b1]. Then [cite:t4] [cite:t1].', ['t1']);
     expect(compact.answer).toBe('Second video first [1 · 0:10]. Then [2 · 0:10][2 · 0:40].');
     expect(compact.sources.map(source => source.videoId)).toEqual(['videoBBBBBB', 'videoAAAAAA']);
+  });
+  it('records each citation kind from persisted evidence and keeps it out of public evidence', () => {
+    const { result, compact } = publish('Claim.', ['t1', 'f1', 'u1']);
+    expect(result.citations.map(({ id, sourceKind }) => [id, sourceKind])).toEqual([['t1', 'transcript'], ['f1', 'frames'], ['u1', 'video']]);
+    expect(compact.evidence?.some(citation => 'sourceKind' in citation)).toBe(false);
+  });
+  it('does not merge excerpts of different kinds that share a source ID', () => {
+    const shared = (packetId: string, kind: 'transcript' | 'frames', excerpt: EvidencePacket['excerpts'][number]): EvidencePacket => ({
+      ...packet, packetId, sources: [{ id: 'shared', provider: 'youtube', kind, videoId: 'videoAAAAAA' }], excerpts: [excerpt] });
+    const packets = [shared('p:transcript', 'transcript', transcript('s1', 10_000, 20_000, 'shared')),
+      shared('p:frames', 'frames', transcript('s2', 15_000, 15_000, 'shared'))];
+    const { result, compact } = publish('Claim.', ['s1', 's2'], aliases, packets);
+    expect(result.citations.map(citation => citation.sourceKind)).toEqual(['transcript', 'frames']);
+    expect(compact.answer).toBe('Claim. [1 · 0:10][1 · 0:15]');
+  });
+  it('does not merge stored excerpts without a recorded kind', () => {
+    const { result } = publish('Claim.', ['t1', 't2']);
+    expect(compactAgentResult(result).answer).toBe('Claim. [1 · 0:10]');
+    const stored = structuredClone(result);
+    for (const citation of stored.citations) delete citation.sourceKind;
+    expect(compactAgentResult(stored).answer).toBe('Claim. [1 · 0:10][1 · 0:15]');
+    stored.citations[0]!.sourceKind = 'transcript';
+    expect(compactAgentResult(stored).answer).toBe('Claim. [1 · 0:10][1 · 0:15]');
   });
   it('does not merge stored excerpts whose times are not finite', () => {
     const { result } = publish('Claim.', ['t1', 't2']);

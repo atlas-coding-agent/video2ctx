@@ -132,9 +132,12 @@ const MODEL_REFERENCES = new RegExp([
 // Links, images and definitions are copied unchanged, so no citation lands inside a label or URL.
 const LINK_NODES = ['link', 'linkReference', 'image', 'imageReference', 'definition'] as const;
 
-/** Call-like text such as fn(value, ref_1) or outer(inner(ref_1)), from the name to its matching
- * parenthesis. An unclosed call extends to the end of its line. */
-function callSpans(text: string): Array<[number, number]> {
+/** Text an alias form must not touch: bare URLs up to the next whitespace, and call-like text such
+ * as fn(value, ref_1) or outer(inner(ref_1)) from the name to its matching parenthesis. An
+ * unclosed call extends to the end of its line. */
+function literalSpans(text: string): Array<[number, number]> {
+  const urls = [...text.matchAll(/(?:\b[A-Za-z][A-Za-z\d+.-]*:\/\/|\bwww\.)[^\s<>]+/g)]
+    .map((match): [number, number] => [match.index!, match.index! + match[0].length]);
   const spans: Array<[number, number]> = [];
   for (const match of text.matchAll(/[A-Za-z_$][\w$.]*\(/g)) {
     const start = match.index!;
@@ -148,20 +151,20 @@ function callSpans(text: string): Array<[number, number]> {
     }
     spans.push([start, end]);
   }
-  return spans;
+  return [...urls, ...spans];
 }
 
 /** Resolve parenthesized groups and bare aliases only when every alias names supplied evidence.
- * Ranges, unknown and mixed forms, call-like text and links stay as written: a range never
- * implies the references between its endpoints. */
+ * Ranges, unknown and mixed forms, URLs, call-like text and links stay as written: a range
+ * never implies the references between its endpoints. */
 function resolveAliasForms(text: string, aliases: ReadonlyMap<string, string>): string {
   if (!aliases.size) return text;
   return mapCitationProse(text, prose => {
-    const calls = callSpans(prose);
+    const literals = literalSpans(prose);
     return prose.replace(MODEL_REFERENCES, (marker: string, linked: string | undefined, group: string | undefined,
       bare: string | undefined, offset: number) => {
       const listed = group ?? bare;
-      if (!listed || linked || calls.some(([start, end]) => offset < end && offset + marker.length > start)) return marker;
+      if (!listed || linked || literals.some(([start, end]) => offset < end && offset + marker.length > start)) return marker;
       return listed.split(',').every(alias => aliases.has(alias.trim())) ? `[cite:${listed}]` : marker;
     });
   }, false, LINK_NODES);

@@ -39,7 +39,7 @@ export const compactAgentResultSchema = z.object({
   sources: z.array(compactAgentSourceSchema),
   warnings: z.array(agentWarningSchema),
   artifacts: z.array(agentArtifactSchema).optional(),
-  evidence: z.array(agentCitationSchema).optional().describe('Requested excerpts with original citation ids and timestamps. sourceId refers to the numbered source in this result.'),
+  evidence: z.array(agentCitationSchema.omit({ sourceKind: true })).optional().describe('Requested excerpts with original citation ids and timestamps. sourceId refers to the numbered source in this result.'),
 });
 export const compactAgentRunSchema = agentRunReceiptSchema.pick({
   runId: true, agentMessageId: true, status: true, request: true,
@@ -130,16 +130,16 @@ export function compactAgentResult(result: AgentTurnResult, include: AgentRespon
     outcome, answer, sources, coverage, warnings: result.warnings.filter(w => w.code !== 'RESEARCH_COVERAGE_SHORTFALL'),
     ...(include.includes('artifacts') ? { artifacts: result.artifacts } : {}),
     ...(include.includes('evidence') ? { evidence: result.citations.filter(citation => evidenceIds.has(citation.id))
-      .map(citation => ({ ...citation, sourceId: evidenceIds.get(citation.id)! })) } : {}),
+      .map(citation => ({ ...publicCitation(citation), sourceId: evidenceIds.get(citation.id)! })) } : {}),
   };
 }
 
 const validTime = (value: number | undefined): value is number => typeof value === 'number' && Number.isFinite(value) && value >= 0;
 
 /** Start times to show for one source's citations in a group, earliest first, then untimed.
- * Only cited excerpts of the same stored source and video merge, and only when their own
- * intervals overlap or touch. Uncited evidence never fills a gap, and an excerpt without a
- * valid start and end keeps its own reference. */
+ * Only cited excerpts with the same recorded kind, stored source and video merge, and only
+ * when their own intervals overlap or touch. Uncited evidence never fills a gap, and an
+ * excerpt without a valid start and end or a recorded kind keeps its own reference. */
 function passageStarts(cited: readonly AgentCitation[]): Array<number | undefined> {
   const intervals = new Map<string, Array<{ start: number; end: number }>>();
   const starts: number[] = [];
@@ -147,8 +147,10 @@ function passageStarts(cited: readonly AgentCitation[]): Array<number | undefine
   for (const citation of cited) {
     const { startMs, endMs } = citation;
     if (!citation.videoId || !validTime(startMs)) { untimed = true; continue; }
-    if (!validTime(endMs) || startMs > endMs) { starts.push(startMs); continue; }
-    const key = JSON.stringify([citation.sourceId, citation.videoId]);
+    // Without a recorded kind, a source ID alone does not show that two excerpts are the same
+    // kind of evidence, so the excerpt keeps its own reference.
+    if (!validTime(endMs) || startMs > endMs || !citation.sourceKind) { starts.push(startMs); continue; }
+    const key = JSON.stringify([citation.sourceKind, citation.sourceId, citation.videoId]);
     intervals.set(key, [...intervals.get(key) ?? [], { start: startMs, end: endMs }]);
   }
   for (const passage of intervals.values()) {
@@ -187,10 +189,18 @@ export function withSessionId<T extends { conversationId: string }>(value: T) {
   return { ...rest, sessionId: conversationId };
 }
 
-export function legacyAgentRun(run: AgentRunView) {
-  const { result, ...receipt } = run;
-  return { ...withSessionId(receipt), ...(result ? { result: withSessionId(result) } : {}) };
+/** Public citation fields. The recorded source kind stays internal. */
+function publicCitation(citation: AgentCitation): Omit<AgentCitation, 'sourceKind'> {
+  const { sourceKind: _sourceKind, ...rest } = citation;
+  return rest;
 }
 
+export function legacyAgentRun(run: AgentRunView) {
+  const { result, ...receipt } = run;
+  return { ...withSessionId(receipt), ...(result ? { result: withSessionId({ ...result, citations: result.citations.map(publicCitation) }) } : {}) };
+}
+
+const publicCitationSchema = agentCitationSchema.omit({ sourceKind: true });
 export const publicAgentRunReceiptSchema = agentRunReceiptSchema.omit({ conversationId: true }).extend({ sessionId: z.string().uuid() });
-export const publicAgentTurnResultSchema = agentTurnResultSchema.omit({ conversationId: true }).extend({ sessionId: z.string().uuid() });
+export const publicAgentTurnResultSchema = agentTurnResultSchema.omit({ conversationId: true })
+  .extend({ sessionId: z.string().uuid(), citations: z.array(publicCitationSchema) });
