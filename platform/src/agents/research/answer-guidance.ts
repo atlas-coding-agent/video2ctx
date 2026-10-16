@@ -8,7 +8,7 @@ Do not infer an overall win rate or say consistently faster from a few heterogen
 Before making a highest, lowest, fastest, cheapest or safest claim, compare the actual values and their units across the cited evidence. If measurements have different bases or test panels, state the values separately and do not rank them. A result below detection limits or within permitted limits does not mean contaminant-free or zero risk. Do not turn a qualified source claim into an absolute recommendation.
 When including a numerical comparison, preserve both sides when supported. Read all structured quantities, not just the shortened finding claim. If one side is missing or uncertain, state that limitation instead of presenting an incomplete pair as a comparison.
 Include costs, timings, and benchmark statistics only when they help answer the question and their workload, setup, and comparison are clear. Never present one task's measured cost as a general per-task price. Omit promotional claims and unrelated benchmarks.
-Select only necessary evidenceIds, usually one to three per point. Keep the answer useful on its own, with material limitations in warnings.
+Select only necessary evidenceIds, usually one per claim and more only for separate passages or compared sources. Keep the answer useful on its own, with material limitations in warnings.
 `.trim();
 /**
  * List entries reach the model in parser order. The parser groups renderer types and drops repeated
@@ -31,6 +31,7 @@ Honor the user's requested count, format, subquestions and level of detail. Neve
 Never use em dashes (—) or dashes (-) in responses. Use a comma, colon, parentheses, or two separate sentences instead.
 For ordinary requests, give a concise answer with the strongest distinct points. Combine each recommendation with a concrete use and benefit. Group comparisons by decision-relevant dimensions; omit secondary anecdotes, overlapping advice and repeated conclusions. Explicit requests for detailed reports or extensive examples warrant more explanation. Shorten each requested item before reducing the count.
 Use only the references needed to support each point. State each material source limitation once in warnings; preserve attribution and qualifications within claims that need them.
+Place citations next to the claims they support. Usually one reference supports one claim: for a passage that continues across neighboring excerpts, cite where it begins. Put separate claims that rely on different passages in separate blocks, so each block's references support its own text. Do not repeat a reference within a block. Cite several sources for one claim only when it genuinely needs them, such as a comparison that cites each compared video. Never write reference ranges such as "ref_3 to ref_7"; list each reference you rely on.
 For a detailed report, use compact sections or a comparison table to cover what each recommendation does, how to use it, an example and its limitations, followed by a short workflow. Avoid repeating the recommendations in a closing comparison. State objective measurements separately from subjective recommendations; do not invent best-for labels or composite metrics that the evidence does not establish.
 ${FINAL_FACT_GUIDANCE}
 ${LIST_ORDER_GUIDANCE}

@@ -107,10 +107,35 @@ export function renderPartialAnswer(value: { blocks?: Array<{ text?: string } | 
   }).filter(Boolean).join('\n\n').slice(0, 20_000);
 }
 
-/** Normalize model-written aliases before both reference checks and rendering. */
-function normalizeBareReferences(text: string): string {
-  return text.replace(/\[\s*(ref_\d+(?:\s*,\s*ref_\d+)*)\s*\]|【\s*(ref_\d+(?:\s*,\s*ref_\d+)*)\s*】/g,
-    (_marker, square: string | undefined, wide: string | undefined) => `[cite:${square ?? wide}]`);
+const ALIAS = String.raw`ref_\d+`;
+const ALIAS_LIST = String.raw`${ALIAS}(?:\s*,\s*${ALIAS})*`;
+// A bare alias must stand alone: not part of an identifier, path, URL, quotation or call.
+const ALIAS_BEFORE = String.raw`(?<![\w\-./:=#?&%@~+$\\\[【'"‘“\`])(?<!\w\()`;
+const ALIAS_AFTER = String.raw`(?![\w\-/:(\]】'"’”\`]|\.\w)`;
+// Alternatives are tried left to right at each position. Existing markers are consumed whole
+// so their contents are never rescanned, and a range is consumed before its endpoints can
+// match as bare aliases.
+const MODEL_REFERENCES = new RegExp([
+  String.raw`\[cite:[^\]]*\]|\(source marker:[^\]]*\]`,
+  String.raw`\[\s*(${ALIAS_LIST})\s*\]|【\s*(${ALIAS_LIST})\s*】`,
+  String.raw`${ALIAS_BEFORE}${ALIAS}\s*(?:-|–|—|\bto\b|\bthrough\b|\bthru\b)\s*(?:ref_)?\d+${ALIAS_AFTER}`,
+  // A group directly after a word or "]" is a call or link destination; it is consumed unchanged.
+  String.raw`([\w\]])?\(\s*(${ALIAS_LIST})\s*\)`,
+  String.raw`${ALIAS_BEFORE}(${ALIAS})${ALIAS_AFTER}`,
+].join('|'), 'g');
+
+/** Normalize model-written aliases before both reference checks and rendering. Bracketed
+ * groups keep their existing behavior. Parenthesized groups and bare aliases become citations
+ * only when every alias names supplied evidence. Ranges, unknown and mixed forms stay as written:
+ * a range never implies the references between its endpoints. */
+function normalizeBareReferences(text: string, aliases: ReadonlyMap<string, string>): string {
+  return text.replace(MODEL_REFERENCES, (marker, square: string | undefined, wide: string | undefined,
+    callee: string | undefined, group: string | undefined, bare: string | undefined) => {
+    if (square ?? wide) return `[cite:${square ?? wide}]`;
+    const listed = group ?? bare;
+    if (!listed || callee) return marker;
+    return listed.split(',').every(alias => aliases.has(alias.trim())) ? `[cite:${listed}]` : marker;
+  });
 }
 
 const INLINE_MARKER = /\[cite:([^\]]+)\]|\(source marker:([^\]]+)\]/g;
@@ -126,7 +151,7 @@ function markerReferences(raw: string, aliases: ReadonlyMap<string, string>): st
 export function blockReferences(block: { text: string; evidenceIds: readonly string[] }, aliases: ReadonlyMap<string, string> = new Map()): string[] {
   const inline: string[] = [];
   mapCitationProse(block.text, prose => {
-    inline.push(...[...normalizeBareReferences(prose).matchAll(INLINE_MARKER)]
+    inline.push(...[...normalizeBareReferences(prose, aliases).matchAll(INLINE_MARKER)]
       .flatMap(([, inlineId, escapedId]) => markerReferences((inlineId ?? escapedId)!, aliases)));
     return prose;
   });
@@ -145,7 +170,7 @@ export function renderStructuredAnswer(value: z.infer<typeof structuredAnswerSch
     // Inline references stay where the model placed them, even when the block did not
     // declare them; persisted evidence validation decides whether each one resolves.
     // A marker with no usable reference is shown as unavailable rather than dropped.
-    const text = mapCitationProse(block.text, prose => normalizeBareReferences(prose)
+    const text = mapCitationProse(block.text, prose => normalizeBareReferences(prose, aliases)
       .replace(INLINE_MARKER, (_marker, inlineId: string | undefined, escapedId: string | undefined) => {
         const ids = markerReferences((inlineId ?? escapedId)!, aliases);
         if (!ids.length) return '[source unavailable]';
