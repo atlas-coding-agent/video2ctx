@@ -890,7 +890,8 @@ async function runUnifiedFinalizer(options: {
     const answerSchema = baseOutputSchema.extend({
       blocks: z.array(baseOutputSchema.shape.blocks.element.extend({
         evidenceIds: z.array(reference).min(conversational || intent === 'context_answer' || !allowedIds.length ? 0 : 1)
-          .max(conversational || !allowedIds.length ? 0 : 12),
+          .max(conversational || !allowedIds.length ? 0 : 12)
+          .describe('Individual supplied IDs supporting this block. Prose citations come only from this array; inline prose annotations are removed. For tables, include the IDs used in Source cells. No ranges or duplicates.'),
       })).min(1).max(conversational ? 1 : 20),
     });
     // Answer and repair calls produce answers only. Unsolicited fields such as
