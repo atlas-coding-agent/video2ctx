@@ -133,25 +133,39 @@ const MODEL_REFERENCES = new RegExp([
 const LINK_NODES = ['link', 'linkReference', 'image', 'imageReference', 'definition'] as const;
 
 /** Text an alias form must not touch: bare URLs up to the next whitespace, and call-like text such
- * as fn(value, ref_1) or outer(inner(ref_1)) from the name to its matching parenthesis. An
- * unclosed call extends to the end of its line. */
-function literalSpans(text: string): Array<[number, number]> {
+ * as fn(value, ref_1), outer(inner(ref_1)) or a call split across lines, from the name to its
+ * matching parenthesis. Parentheses inside quoted strings, and escaped characters there, do not
+ * count. Calls start only in prose. Scan the whole block, not each prose chunk, so inline code
+ * or a line break inside a call cannot end it early. */
+function literalSpans(text: string, prose: ReadonlyArray<[number, number]>): Array<[number, number]> {
   const urls = [...text.matchAll(/(?:\b[A-Za-z][A-Za-z\d+.-]*:\/\/|\bwww\.)[^\s<>]+/g)]
     .map((match): [number, number] => [match.index!, match.index! + match[0].length]);
-  const spans: Array<[number, number]> = [];
+  const calls: Array<[number, number]> = [];
   for (const match of text.matchAll(/[A-Za-z_$][\w$.]*\(/g)) {
     const start = match.index!;
-    if (start < (spans.at(-1)?.[1] ?? 0)) continue;
+    // A call starts in prose. Text inside code or a link is already preserved.
+    if (start < (calls.at(-1)?.[1] ?? 0) || !prose.some(([from, to]) => start >= from && start < to)) continue;
     let depth = 0;
-    let end = text.length;
-    for (let index = start + match[0].length - 1; index < text.length; index += 1) {
-      if (text[index] === '\n') { end = index; break; }
-      if (text[index] === '(') depth += 1;
-      else if (text[index] === ')' && --depth === 0) { end = index + 1; break; }
+    let quote = '';
+    // An unclosed call ends at the next blank line, so it cannot hide later paragraphs.
+    const paragraphEnd = text.slice(start).search(/\n[ \t]*\n/);
+    const limit = paragraphEnd < 0 ? text.length : start + paragraphEnd;
+    let end = limit;
+    for (let index = start + match[0].length - 1; index < limit; index += 1) {
+      const char = text[index]!;
+      if (quote) {
+        if (char === '\\') index += 1;
+        else if (char === quote) quote = '';
+        // Quoted strings end at a line break, except template strings, so a stray apostrophe
+        // inside a call cannot hide its closing parenthesis on a later line.
+        else if (char === '\n' && quote !== '`') quote = '';
+      } else if (char === '"' || char === "'" || char === '`') quote = char;
+      else if (char === '(') depth += 1;
+      else if (char === ')' && --depth === 0) { end = index + 1; break; }
     }
-    spans.push([start, end]);
+    calls.push([start, end]);
   }
-  return [...urls, ...spans];
+  return [...urls, ...calls];
 }
 
 /** Resolve parenthesized groups and bare aliases only when every alias names supplied evidence.
@@ -159,12 +173,15 @@ function literalSpans(text: string): Array<[number, number]> {
  * never implies the references between its endpoints. */
 function resolveAliasForms(text: string, aliases: ReadonlyMap<string, string>): string {
   if (!aliases.size) return text;
-  return mapCitationProse(text, prose => {
-    const literals = literalSpans(prose);
-    return prose.replace(MODEL_REFERENCES, (marker: string, linked: string | undefined, group: string | undefined,
+  const prose: Array<[number, number]> = [];
+  mapCitationProse(text, (chunk, from, to) => { prose.push([from, to]); return chunk; }, false, LINK_NODES);
+  const literals = literalSpans(text, prose);
+  return mapCitationProse(text, (chunk, proseStart) => {
+    return chunk.replace(MODEL_REFERENCES, (marker: string, linked: string | undefined, group: string | undefined,
       bare: string | undefined, offset: number) => {
       const listed = group ?? bare;
-      if (!listed || linked || literals.some(([start, end]) => offset < end && offset + marker.length > start)) return marker;
+      const start = proseStart + offset;
+      if (!listed || linked || literals.some(([from, to]) => start < to && start + marker.length > from)) return marker;
       return listed.split(',').every(alias => aliases.has(alias.trim())) ? `[cite:${listed}]` : marker;
     });
   }, false, LINK_NODES);

@@ -470,6 +470,23 @@ describe('model-written aliases and passage references', () => {
     expect(compact.answer).toBe(`${text} [1 · 0:10]`);
   });
   it.each([
+    'Call fn(")", ref_1) here.',
+    'Call fn(\'close)\', ref_1) here.',
+    'Call fn("a\\")", ref_1) here.',
+    'Call fn(`)`, ref_1) here.',
+    'Call fn(\n  value, ref_1\n) here.',
+    'Call fn(\n  ")",\n  (ref_1, ref_2)\n) here.',
+    'Call fn(it\'s, ref_1\n) here.',
+  ])('leaves quoted and multiline call-like text unchanged: %s', text => {
+    const { input, result, compact } = publish(text);
+    expect(input.answer).toBe(`${text} [cite:t1]`);
+    expect(result.citations.map(citation => citation.id)).toEqual(['t1']);
+    expect(compact.answer).toBe(`${text} [1 · 0:10]`);
+  });
+  it.each([
+    ['Call fn(")", value) returns, then the wash dries ref_9.', 'Call fn(")", value) returns, then the wash dries [1 · 0:40]. [1 · 0:10]'],
+    ['Call fn(\n  value\n) returns, then the wash dries (ref_9).', 'Call fn(\n  value\n) returns, then the wash dries [1 · 0:40]. [1 · 0:10]'],
+    ['Call fn(value is unclosed.\n\nThe wash dries ref_9.', 'Call fn(value is unclosed.\n\nThe wash dries [1 · 0:40]. [1 · 0:10]'],
     ['After fn(value) returns, the wash dries ref_9.', 'After fn(value) returns, the wash dries [1 · 0:40]. [1 · 0:10]'],
     ['The wash dries (ref_9), as fn(x) shows.', 'The wash dries [1 · 0:40], as fn(x) shows. [1 · 0:10]'],
     ['Blooms appear (see ref_9) after fn(ref_2).', 'Blooms appear (see [1 · 0:40]) after fn(ref_2). [1 · 0:10]'],
