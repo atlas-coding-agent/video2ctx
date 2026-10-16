@@ -1,4 +1,4 @@
-import { answerCitationIds, mapCitationProse } from './markdown-citations';
+import { answerCitationIds, mapCitationText } from './markdown-citations';
 import { isDurationLimitFallback, type DurationLimitAnswerContext } from './research/duration-limit-answer';
 import { ApiError } from '../lib/http';
 import {
@@ -61,7 +61,7 @@ export function buildAgentTurnResult(
   }
   // The claim stays, visibly unsupported, as it does after a source is deleted.
   const answer = unresolved.size
-    ? mapCitationProse(input.answer, prose => prose.replace(CITATION_MARKER, (marker, id: string) => unresolved.has(id) ? '[source unavailable]' : marker))
+    ? mapCitationText(input.answer, prose => prose.replace(CITATION_MARKER, (marker, id: string) => unresolved.has(id) ? '[source unavailable]' : marker))
     : input.answer;
 
   // The application states playlist totals, the listing limit and reviewed content itself.

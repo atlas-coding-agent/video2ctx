@@ -1,5 +1,5 @@
 import { reconcileResearchMemory, type ResearchContext } from './runtime/context-handoff';
-import { answerCitationIds, mapCitationProse } from './markdown-citations';
+import { answerCitationIds, mapCitationText } from './markdown-citations';
 import { parseVideoDurationFailure, videoDurationFailure } from './runtime/video-duration-limit';
 import { createHash } from 'node:crypto';
 import { ToolCallTraceManager } from './runtime/tool-call-trace';
@@ -334,7 +334,7 @@ export class AgentRuntimeDO extends Agent<Env, AgentRuntimeState> {
       if (version && !affectedRuns.has(row.id) && !result.citations.some(citation=>deletedIds.has(citation.id))
         && !result.artifacts.some(artifact=>typeof artifact.data.videoId==='string' && removedVideos.has(artifact.data.videoId))) continue;
       result.citations = result.citations.filter(citation=>!deletedIds.has(citation.id));
-      result.answer = mapCitationProse(result.answer, prose => prose.replace(/\[cite:([^\]]+)\]/g,(marker,id)=>deletedIds.has(id) ? '[source deleted]' : marker));
+      result.answer = mapCitationText(result.answer, prose => prose.replace(/\[cite:([^\]]+)\]/g,(marker,id)=>deletedIds.has(id) ? '[source deleted]' : marker));
       result.artifacts = [];
       result.warnings.push({code:'SESSION_EVIDENCE_DELETED',message:'Supporting session evidence was deleted. This historical answer is not reusable source evidence.'});
       const serialized = JSON.stringify(result);

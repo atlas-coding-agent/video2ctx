@@ -57,6 +57,8 @@
     "he": "^1.2.0",
     "hono": "^4.13.1",
     "mdast-util-from-markdown": "^2.1.0",
+    "mdast-util-gfm-table": "^2.0.0",
+    "micromark-extension-gfm-table": "^2.1.2",
     "mp4box": "2.4.1",
     "react": "19.2.8",
     "react-email": "6.9.2",

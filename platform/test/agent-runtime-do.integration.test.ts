@@ -935,8 +935,8 @@ test('session assets enforce ownership and deletion removes run copies, citation
     const writer=instance as unknown as {performEvidenceTool(runId:string,execution:EvidenceToolExecution):Promise<EvidencePacket>;finalizeRun(runId:string,toolId:string,input:FinalizeAnswerInput):Promise<AgentTurnResult>};
     const packet=await writer.performEvidenceTool(runId,{toolCallId:'transcript',toolName:'get_video_transcript',semanticKey:'transcript',operation:'transcript',input:{videoId:'abcdefghijk'},execute:async()=>({packetId:'stored-private',kind:'youtube_transcript',assetVersions:[version],sources:[{id:'source',provider:'youtube',kind:'transcript',videoId:'abcdefghijk'}],excerpts:[{id:'legacy',sourceId:'source',text:'Private captions'}],artifacts:[],warnings:[],usage:[]})});
     instance.sql`INSERT INTO agent_routes VALUES (${runId},${JSON.stringify({route:'finalize',responseIntent:'context_answer',reason:'Stored evidence'})},0)`;
-    example = `Example: \`[cite:${packet.excerpts[0]!.id}]\`.`;
-    await writer.finalizeRun(runId,'finish',{intent:'context_answer',answer:`A caption [cite:${packet.excerpts[0]!.id}] Example: \`[cite:${packet.excerpts[0]!.id}]\`.`,confidence:'high',citations:[],artifacts:[],warnings:[]});
+    example = `Example: \`[cite:${packet.excerpts[0]!.id}]\` and "[cite:${packet.excerpts[0]!.id}]".`;
+    await writer.finalizeRun(runId,'finish',{intent:'context_answer',answer:`A caption [cite:${packet.excerpts[0]!.id}] ${example}`,confidence:'high',citations:[],artifacts:[],warnings:[]});
     const {remember}=await import('./fixtures/memory');
     remember(store,runId,[{kind:'finding',topic:'caption',text:'A finding',evidenceIds:[packet.excerpts[0]!.id]}]);
     expect(store.brief().memories).toHaveLength(1);

@@ -115,3 +115,65 @@ describe('table citation boundaries', () => {
       .toBe('| Claim | Source |\n| --- | --- |\n| Rule | |\n\nSources: [cite:e4]');
   });
 });
+
+describe('PR review regressions', () => {
+  it.each(['> ', '> > ', '- ', '  '])('preserves table citations in Markdown container %s', prefix => {
+    const rows = ['| Claim | Source |', '| --- | --- |', '| A | [cite:ref_1] |', '| B | [cite:ref_2] |'];
+    const text = rows.map((row, i) => (prefix === '- ' && i > 0 ? '  ' : prefix) + row).join('\n');
+    expect(render(text).answer).toBe(text.trimStart().replace('[cite:ref_1]', '[cite:e1]').replace('[cite:ref_2]', '[cite:e2]'));
+    expect(blockReferences({ text, evidenceIds: [] }, aliases)).toEqual(['e1', 'e2']);
+  });
+
+  it.each(['[docs](https://example.com)', '`example`'])('retains spacing after %s', literal => {
+    expect(render(`See ${literal} (ref_1) for details.`, ['ref_1']).answer)
+      .toBe(`See ${literal} for details. [cite:e1]`);
+    expect(render(`${literal} (ref_1) (ref_2) for details.`).answer).toBe(`${literal} for details.`);
+    expect(render(`See ${literal} (ref_1).`).answer).toBe(`See ${literal}.`);
+    expect(render(`See ${literal} (ref_1) [more](https://example.com).`).answer)
+      .toBe(`See ${literal} [more](https://example.com).`);
+  });
+
+  it('persists and displays both quoted-table citations without prose evidence', () => {
+    const text = '> | Claim | Source |\n> | --- | --- |\n> | A | [cite:ref_1] |\n> | B | [cite:ref_2] |';
+    const packet: EvidencePacket = { packetId: 'table-fixture', kind: 'youtube_transcript',
+      sources: [{ id: 'source', provider: 'youtube', kind: 'transcript', videoId: 'abcdefghijk' }],
+      excerpts: [
+        { id: 'e1', sourceId: 'source', text: 'First passage', startMs: 1000, endMs: 2000 },
+        { id: 'e2', sourceId: 'source', text: 'Second passage', startMs: 3000, endMs: 4000 },
+      ], artifacts: [], warnings: [], usage: [] };
+    const result = buildAgentTurnResult({ runId: crypto.randomUUID(), conversationId: crypto.randomUUID(),
+      userMessageId: crypto.randomUUID(), agentMessageId: crypto.randomUUID() },
+    { userId: 'test', creditsRemaining: 10 }, render(text), [packet], 1);
+    expect(result.citations.map(c => c.id)).toEqual(['e1', 'e2']);
+    expect(compactAgentResult(result, ['evidence']).answer)
+      .toBe(text.replace('[cite:ref_1]', '[1 · 0:01]').replace('[cite:ref_2]', '[1 · 0:03]'));
+  });
+
+  const first = `evidence:${'a'.repeat(64)}:0`;
+  const second = `evidence:${'b'.repeat(64)}:1`;
+  it.each([
+    `The notation is "[cite:${second}]".`,
+    `The notation is “[cite:${second}]”.`,
+    `The notation is \`[cite:${second}]\`.`,
+    `See [literal [cite:${second}]](https://example.com).`,
+    `Use fn([cite:${second}]).`,
+    `See https://example.com/[cite:${second}].`,
+  ])('keeps literal canonical markers out of persisted citations: %s', text => {
+    const packet: EvidencePacket = { packetId: 'literal-fixture', kind: 'youtube_transcript',
+      sources: [{ id: 'source', provider: 'youtube', kind: 'transcript', videoId: 'abcdefghijk' }],
+      excerpts: [
+        { id: first, sourceId: 'source', text: 'Declared evidence', startMs: 1000, endMs: 2000 },
+        { id: second, sourceId: 'source', text: 'Undeclared evidence', startMs: 3000, endMs: 4000 },
+      ], artifacts: [], warnings: [], usage: [] };
+    expect(blockReferences({ text, evidenceIds: [first] })).toEqual([first]);
+    const input = render(text, [first], new Map());
+    for (const excerpts of [packet.excerpts, packet.excerpts.slice(0, 1)]) {
+      const result = buildAgentTurnResult({ runId: crypto.randomUUID(), conversationId: crypto.randomUUID(),
+        userMessageId: crypto.randomUUID(), agentMessageId: crypto.randomUUID() },
+      { userId: 'test', creditsRemaining: 10 }, input, [{ ...packet, excerpts }], 1);
+      expect(result.citations.map(c => c.id)).toEqual([first]);
+      expect(result.warnings).toEqual([]);
+      expect(compactAgentResult(result, ['evidence']).answer).toBe(`${text} [1 · 0:01]`);
+    }
+  });
+});

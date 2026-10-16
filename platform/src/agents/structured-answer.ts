@@ -1,4 +1,4 @@
-import { endsInCodeBlock, mapCitationProse, trimCitationProse } from './markdown-citations';
+import { endsInCodeBlock, mapCitationProse, trimCitationProse, LINK_NODES, literalSpans, tableRanges } from './markdown-citations';
 import { parsePartialJson } from 'ai';
 import { z } from 'zod';
 import { finalizeAnswerInputSchema, type FinalizeAnswerInput } from './contracts';
@@ -123,74 +123,6 @@ const MODEL_REFERENCES = new RegExp(String.raw`(?<leading>(?:,[ \t]+)?[ \t]*)(?:
   String.raw`${ALIAS_BEFORE}(?<bare>${ALIAS_LIST})${ALIAS_AFTER}`,
 ].join('|') + String.raw`)(?<trailing>[ \t]*)`, 'gu');
 
-// Links, images and definitions are copied unchanged, so no citation lands inside a label or URL.
-const LINK_NODES = ['link', 'linkReference', 'image', 'imageReference', 'definition'] as const;
-
-/** Text an alias form must not touch: bare URLs up to the next whitespace, and call-like text such
- * as fn(value, ref_1), outer(inner(ref_1)) or a call split across lines, from the name to its
- * matching parenthesis. Parentheses inside quoted strings, and escaped characters there, do not
- * count. Calls start only in prose. Scan the whole block, not each prose chunk, so inline code
- * or a line break inside a call cannot end it early. */
-function literalSpans(text: string, prose: ReadonlyArray<[number, number]>): Array<[number, number]> {
-  const urls = [...text.matchAll(/(?:\b[A-Za-z][A-Za-z\d+.-]*:\/\/|\bwww\.)[^\s<>]+/g)]
-    .map((match): [number, number] => [match.index!, match.index! + match[0].length]);
-  // Quotes describe literal text. Do not turn their contents into evidence links.
-  // Apostrophes within words do not open a quotation.
-  const quotes = [...text.matchAll(/(?<![\p{L}\p{N}_\\])(?:"(?:\\.|[^"\\\n])*"|“[^”\n]*”|'(?:\\.|[^'\\\n])*'|‘[^’\n]*’)/gu)]
-    .map((match): [number, number] => [match.index!, match.index! + match[0].length]);
-  const calls: Array<[number, number]> = [];
-  for (const match of text.matchAll(/[A-Za-z_$][\w$.]*\(/g)) {
-    const start = match.index!;
-    // A call starts in prose. Text inside code or a link is already preserved.
-    if (start < (calls.at(-1)?.[1] ?? 0) || !prose.some(([from, to]) => start >= from && start < to)) continue;
-    let depth = 0;
-    let quote = '';
-    // An unclosed call ends at the next blank line, so it cannot hide later paragraphs.
-    const paragraphEnd = text.slice(start).search(/\n[ \t]*\n/);
-    const limit = paragraphEnd < 0 ? text.length : start + paragraphEnd;
-    let end = limit;
-    for (let index = start + match[0].length - 1; index < limit; index += 1) {
-      const char = text[index]!;
-      if (quote) {
-        if (char === '\\') index += 1;
-        else if (char === quote) quote = '';
-        // Quoted strings end at a line break, except template strings, so a stray apostrophe
-        // inside a call cannot hide its closing parenthesis on a later line.
-        else if (char === '\n' && quote !== '`') quote = '';
-      } else if (char === '"' || char === "'" || char === '`') quote = char;
-      else if (char === '(') depth += 1;
-      else if (char === ')' && --depth === 0) { end = index + 1; break; }
-    }
-    calls.push([start, end]);
-  }
-  return [...urls, ...quotes, ...calls];
-}
-
-/** Find pipe-table rows, requiring a header and delimiter row rather than treating
- * any prose containing a pipe as a table. Mask protected Markdown before detection. */
-function tableRanges(text: string): Array<[number, number]> {
-  const ranges: Array<[number, number]> = [];
-  const visible: Array<[number, number]> = [];
-  mapCitationProse(text, (chunk, from, to) => { visible.push([from, to]); return chunk; }, false, LINK_NODES);
-  // Use UTF-16 offsets, just like Markdown positions and String.replace.
-  const chars: string[] = text.split('').map(char => char === '\n' ? '\n' : ' ');
-  for (const [from, to] of visible) for (let i = from; i < to; i += 1) chars[i] = text[i]!;
-  const lines = [...chars.join('').matchAll(/[^\n]*(?:\n|$)/g)].filter(match => match[0]);
-  const delimiter = /^ {0,3}\|?[ \t]*:?-+:?[ \t]*(?:\|[ \t]*:?-+:?[ \t]*)*\|?[ \t]*$/;
-  for (let i = 1; i < lines.length; i += 1) {
-    const line = lines[i]![0].trimEnd();
-    if (!line.includes('|') || !delimiter.test(line) || !lines[i - 1]![0].includes('|')) continue;
-    const start = lines[i - 1]!.index!;
-    let end = lines[i]!.index! + lines[i]![0].length;
-    while (i + 1 < lines.length && lines[i + 1]![0].trim() && lines[i + 1]![0].includes('|')) {
-      i += 1;
-      end = lines[i]!.index! + lines[i]![0].length;
-    }
-    ranges.push([start, end]);
-  }
-  return ranges;
-}
-
 /** Only explicit table references can add evidence from text. Prose annotations
  * are removed, including unknown aliases and ranges, without validating or expanding
  * their IDs. Keep literal content and attribution names unchanged. */
@@ -225,8 +157,8 @@ function mapAnswerReferences(text: string, tableMarker: (raw: string) => string)
         // Remove only whitespace at a removed annotation's boundary. In particular,
         // adjacent markers must not leave a space before the sentence punctuation.
         rendered = rendered.replace(/[ \t]+$/, '');
-        const next = chunk[cursor];
-        if (rendered && next && !/[.,;:!?)\n]/.test(next) && (leading || trailing)) rendered += ' ';
+        const next = chunk[cursor] ?? text[proseStart + cursor];
+        if ((rendered || proseStart > 0) && next && !/[.,;:!?)\n]/.test(next) && (leading || trailing)) rendered += ' ';
       }
     }
     return rendered + chunk.slice(cursor);

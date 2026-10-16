@@ -1,4 +1,4 @@
-import { mapCitationProse } from './markdown-citations';
+import { mapCitationText } from './markdown-citations';
 import { clockTime } from './runtime/clock-time';
 import { storedExtractionDiagnosticSchema } from '../lib/extraction-diagnostics';
 import { transcriptDiagnosticSchema } from './runtime/transcript-diagnostics';
@@ -81,9 +81,9 @@ export function compactAgentResult(result: AgentTurnResult, include: AgentRespon
   // Replace a contiguous group together so repeated or continuous excerpts become one reference.
   // Earlier formatters escaped model-written table citations into visible IDs.
   // Restore only citations already validated for this stored answer.
-  const displayAnswer = mapCitationProse(result.answer, prose => prose.replace(/\(source marker:([^\]]+)\]/g,
+  const displayAnswer = mapCitationText(result.answer, prose => prose.replace(/\(source marker:([^\]]+)\]/g,
     (_marker, id: string) => citations.has(id) ? `[cite:${id}]` : '[source unavailable]'));
-  const answer = mapCitationProse(displayAnswer, prose => prose.replace(/\[cite:[A-Za-z0-9:_-]+\](?:[ \t]*\[cite:[A-Za-z0-9:_-]+\])*/g, group => {
+  const answer = mapCitationText(displayAnswer, prose => prose.replace(/\[cite:[A-Za-z0-9:_-]+\](?:[ \t]*\[cite:[A-Za-z0-9:_-]+\])*/g, group => {
     // Citations in one group are listed by public source number. Each source shows one
     // reference per distinct cited passage; the stored citations keep every excerpt.
     const refs = new Map<string, AgentCitation[]>();
