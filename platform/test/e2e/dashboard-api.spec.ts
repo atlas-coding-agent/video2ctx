@@ -1,4 +1,8 @@
 import { expect, test, type Page } from '@playwright/test';
+import { TRENDS_ENABLED } from '../../../web/lib/features';
+
+// Trends tests follow the dashboard switch, so re-enabling it needs no test edits.
+const firstNavigationLinks = ['Sources', 'Agent', TRENDS_ENABLED ? 'Trends' : 'Projects'];
 
 async function accountScenario(page: Page, input: { delays?: string[]; responses?: Record<string, { status?: number; body: unknown }> }) {
   const id = crypto.randomUUID();
@@ -1217,10 +1221,10 @@ test('settings renders while navigation access checks are pending', async ({page
   const navigation = page.getByRole('navigation', { name: 'Dashboard navigation' });
   await expect(page.getByRole('link',{name:'Agent',exact:true})).toBeVisible();
   await expect(page.getByRole('link',{name:'Admin',exact:true})).toHaveCount(0);
-  await expect.poll(async () => (await navigation.locator('a').allTextContents()).slice(0, 3).map(label => label.trim())).toEqual(['Sources', 'Agent', 'Trends']);
+  await expect.poll(async () => navigation.locator('a').evaluateAll(links => links.slice(0, 3).map(link => link.getAttribute('aria-label')))).toEqual(firstNavigationLinks);
   await scenario.release();
   await expect(page.getByRole('link',{name:'Agent',exact:true})).toBeVisible();
-  await expect.poll(async () => (await navigation.locator('a').allTextContents()).slice(0, 3).map(label => label.trim())).toEqual(['Sources', 'Agent', 'Trends']);
+  await expect.poll(async () => navigation.locator('a').evaluateAll(links => links.slice(0, 3).map(link => link.getAttribute('aria-label')))).toEqual(firstNavigationLinks);
  }finally{await scenario.clear();}
 });
 
@@ -1243,7 +1247,17 @@ test('an active transcript finishes in the background and the Sources sidebar re
  expect(reads).toBe(1);
 });
 
+test('disabled Trends has no navigation entry and its page is not found',async({page})=>{
+ test.skip(TRENDS_ENABLED, 'Trends is enabled in web/lib/features.ts.');
+ await page.goto('/dashboard/settings');
+ await expect(page.getByRole('link',{name:'Agent',exact:true})).toBeVisible();
+ await expect(page.getByRole('link',{name:'Trends',exact:true})).toHaveCount(0);
+ const response=await page.goto('/dashboard/trends');
+ expect(response?.status()).toBe(404);
+});
+
 test('an active trend request survives projects navigation without restarting',async({page})=>{
+ test.skip(!TRENDS_ENABLED, 'Trends is disabled in web/lib/features.ts.');
  let release!:()=>void;const gate=new Promise<void>(resolve=>{release=resolve;});let reads=0;
  await page.route('**/v1/trends?**',async route=>{reads++;await gate;await route.fulfill({status:503,json:{error:{message:'Retained scan completed with a provider error.'}}});});
  await page.goto('/dashboard/trends');
