@@ -203,19 +203,9 @@ export const memoryUpdateSchema = z.object({
 });
 export type MemoryUpdate = z.infer<typeof memoryUpdateSchema>;
 
-/** Application-owned citation locations in the rendered Markdown, using UTF-16 offsets.
- * Absent only on legacy inputs/results. An empty array explicitly means no citations. */
-export const answerCitationGroupSchema = z.object({
-  start: z.number().int().nonnegative(),
-  end: z.number().int().nonnegative(),
-  evidenceIds: z.array(z.string().regex(/^[A-Za-z0-9:_-]+$/).max(300)).min(1).max(50),
-});
-export type AnswerCitationGroup = z.infer<typeof answerCitationGroupSchema>;
-
 // Answers never carry memory. A separate updater proposes memory after the answer is persisted.
 export const finalizeAnswerInputSchema = z.object({
   answer: z.string().min(1).max(20_000),
-  citationGroups: z.array(answerCitationGroupSchema).max(50).optional(),
   intent: z.enum(['topic_research', 'inspect_video', 'context_answer', 'clarification', 'rejected']),
   confidence: z.enum(['high', 'medium', 'low']),
   citations: z.array(citationReferenceSchema).max(50),
@@ -229,7 +219,6 @@ export const agentTurnResultSchema = z.object({
   userMessageId: z.string().uuid(),
   agentMessageId: z.string().uuid(),
   answer: z.string(),
-  citationGroups: z.array(answerCitationGroupSchema).max(50).optional(),
   intent: z.enum(['topic_research', 'inspect_video', 'context_answer', 'clarification', 'rejected']),
   confidence: z.enum(['high', 'medium', 'low']),
   citations: z.array(agentCitationSchema),

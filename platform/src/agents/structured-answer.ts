@@ -1,11 +1,10 @@
-import { renderCitedBlocks } from './answer-citations';
-import { mapCitationProse, trimCitationProse, LINK_NODES, literalSpans } from './markdown-citations';
+import { endsInCodeBlock, mapCitationProse, trimCitationProse } from './markdown-citations';
 import { parsePartialJson } from 'ai';
 import { z } from 'zod';
 import { finalizeAnswerInputSchema, type FinalizeAnswerInput } from './contracts';
 
-/** Model-facing only. Citation placement metadata is owned by the application. */
-const fields = finalizeAnswerInputSchema.omit({ answer: true, citations: true, citationGroups: true, intent: true }).extend({
+/** Model-facing only. Persisted and public answers retain their existing format. */
+const fields = finalizeAnswerInputSchema.omit({ answer: true, citations: true, intent: true }).extend({
   warnings: z.array(z.object({
     code: z.enum(['SOURCE_CAVEAT', 'ANSWER_SCOPE_SHORTFALL']).describe('SOURCE_CAVEAT: limitations of sources, such as unverified demos. ANSWER_SCOPE_SHORTFALL: a specific requested item, count, or question could not be answered. Source uncertainty alone is not an unmet request.'),
     message: z.string().min(1).max(1_000),
@@ -15,7 +14,7 @@ const fields = finalizeAnswerInputSchema.omit({ answer: true, citations: true, c
 const block = z.object({
   // The SDK bounds generation tokens and the rendered contract bounds total
   // characters. A decoding limit on each paragraph can split words at its edge.
-  text: z.string().min(1).regex(/\S/, 'A block must contain non-whitespace text.').describe('One complete paragraph, list item, or Markdown table. Finish the table within this block. End prose at a natural sentence boundary; never continue a sentence in the next block. Put all citations only in evidenceIds, including for tables. The application strips inline citation annotations and appends block-level links. Do not add Source cells or row-level citation markers. Never write bare aliases or reference ranges as citations.'),
+  text: z.string().min(1).regex(/\S/, 'A block must contain non-whitespace text.').describe('One complete paragraph, list item, or Markdown table. Finish the table within this block. End prose at a natural sentence boundary; never continue a sentence in the next block. Put prose citations in evidenceIds, not in text: the application appends the links. For Markdown tables only, use [cite:ref_N] in Source cells and include those IDs in evidenceIds. Never write bare aliases or reference ranges as citations.'),
   evidenceIds: z.array(z.string().regex(/^[A-Za-z0-9:_-]+$/).max(300)).min(1).max(12).describe('Individual supplied evidence IDs supporting this block. List each ID separately, without ranges or duplicates. The application renders these as citations.'),
 });
 // Executable routes require references in the transmitted JSON schema itself.
@@ -41,7 +40,7 @@ export const contextAnswerSchema = fields.extend({
 export const finalizationOutputSchema = structuredAnswerSchema.omit({ intent: true, artifacts: true });
 export const contextFinalizationOutputSchema = contextAnswerSchema.omit({ intent: true, artifacts: true });
 export const conversationalFinalizationOutputSchema = clarificationAnswerSchema.omit({ intent: true, artifacts: true });
-export const FINALIZATION_SCHEMA_VERSION = 'answer-blocks-v5';
+export const FINALIZATION_SCHEMA_VERSION = 'answer-blocks-v4';
 
 /** Log-only signal. A count mismatch never rejects an answer. */
 export function numberedItemsMismatch(output: Pick<z.infer<typeof finalizationOutputSchema>, 'blocks' | 'warnings'>, expected: number | undefined): boolean {
@@ -108,57 +107,136 @@ export function renderPartialAnswer(value: { blocks?: Array<{ text?: string } | 
   }).filter(Boolean).join('\n\n').slice(0, 20_000);
 }
 
+/** Existing bracketed alias groups. Their behavior is unchanged. */
+function normalizeBareReferences(text: string): string {
+  return text.replace(/\[\s*(ref_\d+(?:\s*,\s*ref_\d+)*)\s*\]|【\s*(ref_\d+(?:\s*,\s*ref_\d+)*)\s*】/g,
+    (_marker, square: string | undefined, wide: string | undefined) => `[cite:${square ?? wide}]`);
+}
+
 const ALIAS = String.raw`ref_\d+`;
 const RANGE_SEPARATOR = String.raw`(?:-|–|—|\bto\b|\bthrough\b|\bthru\b)`;
 const ALIAS_ITEM = String.raw`${ALIAS}(?:\s*${RANGE_SEPARATOR}\s*(?:ref_)?\d+)?`;
 const ALIAS_LIST = String.raw`${ALIAS_ITEM}(?:\s*,\s*${ALIAS_ITEM})*`;
-const ALIAS_BEFORE = String.raw`(?<![\w\-./:=#?&%@~+$\\\[【'"‘“\x60])`;
-const ALIAS_AFTER = String.raw`(?![\w\-/:(\]】'"’”\x60]|\.\w)`;
-// Recognize annotation syntax, independent of whether its IDs exist. Inline IDs
-// never become evidence. Consume ranges without enumerating their members.
-const MODEL_REFERENCES = new RegExp(String.raw`(?<leading>(?:,[ \t]+)?[ \t]*)(?:` + [
-  String.raw`\[cite:(?<canonical>[^\]]*)\]|\(source marker:(?<escaped>[^\]]*)\]`,
+const ALIAS_RANGE = new RegExp(String.raw`^ref_(\d+)\s*${RANGE_SEPARATOR}\s*(?:ref_)?(\d+)$`);
+// A bare alias must stand alone: not part of an identifier, path, URL or quotation.
+const ALIAS_BEFORE = String.raw`(?<![\w\-./:=#?&%@~+$\\\[【'"‘“\`])`;
+const ALIAS_AFTER = String.raw`(?![\w\-/:(\]】'"’”\`]|\.\w)`;
+// Consume a range as one item before its endpoints can match separately. Bracketed
+// lists are checked as a whole, including lists mixing ranges and individual aliases.
+const MODEL_REFERENCES = new RegExp([
+  String.raw`\[cite:[^\]]*\]|\(source marker:[^\]]*\]`,
   String.raw`\[\s*(?<square>${ALIAS_LIST})\s*\]|【\s*(?<wide>${ALIAS_LIST})\s*】`,
-  String.raw`(?<linked>\])?\(\s*(?:(?<attribution>[\p{L}][\p{L}\p{N} .’'-]{0,80}),\s*)?(?<group>${ALIAS_LIST})\s*\)`,
-  String.raw`${ALIAS_BEFORE}(?<bare>${ALIAS_LIST})${ALIAS_AFTER}`,
-].join('|') + String.raw`)(?<trailing>[ \t]*)`, 'gu');
+  // A group directly after "]" is a link destination, not a citation.
+  String.raw`(?<linked>\])?\(\s*(?<group>${ALIAS_LIST})\s*\)`,
+  String.raw`${ALIAS_BEFORE}(?<bare>${ALIAS_ITEM})${ALIAS_AFTER}`,
+].join('|'), 'g');
 
-/** Remove citation annotations in prose and tables without adopting their IDs.
- * Keep literal examples and attribution names unchanged. */
-function stripAnswerReferences(text: string): string {
+/** Expand only complete, ascending ranges of supplied aliases. Bound work by the
+ * actual alias map before iterating, even for enormous model-written endpoints. */
+function expandAliasList(listed: string, aliases: ReadonlyMap<string, string>): string[] | undefined {
+  const resolved = new Set<string>();
+  for (const item of listed.split(',').map(part => part.trim())) {
+    const range = ALIAS_RANGE.exec(item);
+    if (!range) {
+      if (!aliases.has(item)) return undefined;
+      resolved.add(item);
+      continue;
+    }
+    const first = Number(range[1]), last = Number(range[2]);
+    if (!Number.isSafeInteger(first) || !Number.isSafeInteger(last) || first > last
+      || last - first + 1 > aliases.size) return undefined;
+    // Alias numbers are canonical decimal integers, never padded identifiers.
+    if (String(first) !== range[1] || String(last) !== range[2]) return undefined;
+    for (let number = first; number <= last; number += 1) {
+      const alias = `ref_${number}`;
+      if (!aliases.has(alias)) return undefined;
+      resolved.add(alias);
+    }
+  }
+  return [...resolved];
+}
+// Links, images and definitions are copied unchanged, so no citation lands inside a label or URL.
+const LINK_NODES = ['link', 'linkReference', 'image', 'imageReference', 'definition'] as const;
+
+/** Text an alias form must not touch: bare URLs up to the next whitespace, and call-like text such
+ * as fn(value, ref_1), outer(inner(ref_1)) or a call split across lines, from the name to its
+ * matching parenthesis. Parentheses inside quoted strings, and escaped characters there, do not
+ * count. Calls start only in prose. Scan the whole block, not each prose chunk, so inline code
+ * or a line break inside a call cannot end it early. */
+function literalSpans(text: string, prose: ReadonlyArray<[number, number]>): Array<[number, number]> {
+  const urls = [...text.matchAll(/(?:\b[A-Za-z][A-Za-z\d+.-]*:\/\/|\bwww\.)[^\s<>]+/g)]
+    .map((match): [number, number] => [match.index!, match.index! + match[0].length]);
+  // Quotes describe literal text. Do not turn their contents into evidence links.
+  // Apostrophes within words do not open a quotation.
+  const quotes = [...text.matchAll(/(?<![\p{L}\p{N}_\\])(?:"(?:\\.|[^"\\\n])*"|“[^”\n]*”|'(?:\\.|[^'\\\n])*'|‘[^’\n]*’)/gu)]
+    .map((match): [number, number] => [match.index!, match.index! + match[0].length]);
+  const calls: Array<[number, number]> = [];
+  for (const match of text.matchAll(/[A-Za-z_$][\w$.]*\(/g)) {
+    const start = match.index!;
+    // A call starts in prose. Text inside code or a link is already preserved.
+    if (start < (calls.at(-1)?.[1] ?? 0) || !prose.some(([from, to]) => start >= from && start < to)) continue;
+    let depth = 0;
+    let quote = '';
+    // An unclosed call ends at the next blank line, so it cannot hide later paragraphs.
+    const paragraphEnd = text.slice(start).search(/\n[ \t]*\n/);
+    const limit = paragraphEnd < 0 ? text.length : start + paragraphEnd;
+    let end = limit;
+    for (let index = start + match[0].length - 1; index < limit; index += 1) {
+      const char = text[index]!;
+      if (quote) {
+        if (char === '\\') index += 1;
+        else if (char === quote) quote = '';
+        // Quoted strings end at a line break, except template strings, so a stray apostrophe
+        // inside a call cannot hide its closing parenthesis on a later line.
+        else if (char === '\n' && quote !== '`') quote = '';
+      } else if (char === '"' || char === "'" || char === '`') quote = char;
+      else if (char === '(') depth += 1;
+      else if (char === ')' && --depth === 0) { end = index + 1; break; }
+    }
+    calls.push([start, end]);
+  }
+  return [...urls, ...quotes, ...calls];
+}
+
+/** Resolve parenthesized groups and bare aliases only when every alias names supplied evidence.
+ * Ranges include both endpoints and every supplied alias between them. Incomplete or
+ * reversed ranges, unknown groups, URLs, quoted literals, calls and links stay as written. */
+function resolveAliasForms(text: string, aliases: ReadonlyMap<string, string>): string {
+  if (!aliases.size) return text;
   const prose: Array<[number, number]> = [];
   mapCitationProse(text, (chunk, from, to) => { prose.push([from, to]); return chunk; }, false, LINK_NODES);
   const literals = literalSpans(text, prose);
   return mapCitationProse(text, (chunk, proseStart) => {
-    let rendered = '', cursor = 0;
-    for (const match of chunk.matchAll(MODEL_REFERENCES)) {
-      const groups = match.groups!;
-      const leading = groups.leading ?? '', trailing = groups.trailing ?? '';
-      const start = proseStart + match.index! + leading.length;
-      const end = proseStart + match.index! + match[0].length - trailing.length;
-      rendered += chunk.slice(cursor, match.index);
-      cursor = match.index! + match[0].length;
-      if (groups.linked || literals.some(([from, to]) => start < to && end > from)) {
-        rendered += match[0];
-        continue;
-      }
-      if (groups.attribution) {
-        rendered += `${leading}(${groups.attribution})${trailing}`;
-      } else {
-        // Remove only whitespace at a removed annotation's boundary. In particular,
-        // adjacent markers must not leave a space before the sentence punctuation.
-        rendered = rendered.replace(/[ \t]+$/, '');
-        const next = chunk[cursor] ?? text[proseStart + cursor];
-        if ((rendered || proseStart > 0) && next && !/[.,;:!?)\n]/.test(next) && (leading || trailing)) rendered += ' ';
-      }
-    }
-    return rendered + chunk.slice(cursor);
+    return chunk.replace(MODEL_REFERENCES, (marker: string, ...args: unknown[]) => {
+      const groups = args.at(-1) as Record<string, string | undefined>;
+      const offset = args.at(-3) as number;
+      const listed = groups.square ?? groups.wide ?? groups.group ?? groups.bare;
+      const start = proseStart + offset;
+      if (!listed || groups.linked || literals.some(([from, to]) => start < to && start + marker.length > from)) return marker;
+      const expanded = expandAliasList(listed, aliases);
+      return expanded ? `[cite:${expanded.join(',')}]` : marker;
+    });
   }, false, LINK_NODES);
 }
 
-/** Block arrays are the only citation authority, for prose and tables alike. */
+const INLINE_MARKER = /\[cite:([^\]]+)\]|\(source marker:([^\]]+)\]/g;
+
+/** References one inline marker names, after aliasing. Unusable text yields none. */
+function markerReferences(raw: string, aliases: ReadonlyMap<string, string>): string[] {
+  return raw.split(',').map(part => part.trim()).filter(Boolean)
+    .map(part => aliases.get(part) ?? part).filter(id => /^[A-Za-z0-9:_-]{1,300}$/.test(id));
+}
+
+/** Every reference a block's rendered citations come from: declared and inline. The
+ * figure and coverage checks use this same set, so they judge what the reader sees. */
 export function blockReferences(block: { text: string; evidenceIds: readonly string[] }, aliases: ReadonlyMap<string, string> = new Map()): string[] {
-  return [...new Set(block.evidenceIds.map(id => aliases.get(id) ?? id))];
+  const inline: string[] = [];
+  mapCitationProse(resolveAliasForms(block.text, aliases), prose => {
+    inline.push(...[...normalizeBareReferences(prose).matchAll(INLINE_MARKER)]
+      .flatMap(([, inlineId, escapedId]) => markerReferences((inlineId ?? escapedId)!, aliases)));
+    return prose;
+  });
+  return [...new Set([...block.evidenceIds.map(id => aliases.get(id) ?? id), ...inline])];
 }
 
 export function renderStructuredAnswer(value: z.infer<typeof structuredAnswerSchema> | z.infer<typeof clarificationAnswerSchema> | z.infer<typeof contextAnswerSchema>, aliases: ReadonlyMap<string, string> = new Map()): FinalizeAnswerInput {
@@ -167,9 +245,25 @@ export function renderStructuredAnswer(value: z.infer<typeof structuredAnswerSch
   // Not an answer at all: the one content check that still earns a repair.
   if (fillerOnlyAnswer(input)) throw new z.ZodError([{ code: 'custom', path: ['blocks'],
     message: 'The answer is only a fragment or promise of future work. Answer the request now, or state the concrete missing context. Do not report planned work as completed.' }]);
-  const rendered = renderCitedBlocks(input.blocks.map(block => ({
-    text: trimCitationProse(stripAnswerReferences(block.text)), evidenceIds: blockReferences(block, aliases),
-  })));
+  const answer = input.blocks.map(block => {
+    const declared = new Set(block.evidenceIds.map(id => aliases.get(id) ?? id));
+    const placed = new Set<string>();
+    // Inline references stay where the model placed them, even when the block did not
+    // declare them; persisted evidence validation decides whether each one resolves.
+    // A marker with no usable reference is shown as unavailable rather than dropped.
+    const text = mapCitationProse(resolveAliasForms(block.text, aliases), prose => normalizeBareReferences(prose)
+      .replace(INLINE_MARKER, (_marker, inlineId: string | undefined, escapedId: string | undefined) => {
+        const ids = markerReferences((inlineId ?? escapedId)!, aliases);
+        if (!ids.length) return '[source unavailable]';
+        for (const id of ids) placed.add(id);
+        return ids.map(id => `[cite:${id}]`).join(' ');
+      }));
+    const remaining = [...declared].filter(id => !placed.has(id)).map(id => `[cite:${id}]`).join(' ');
+    // Appending text to the final table row would create an extra cell.
+    if (remaining && endsInCodeBlock(text)) return `Sources: ${remaining}\n\n${text}`;
+    const separator = /(?:^|\n)\s*\|.*\|\s*(?:\n|$)/.test(text) ? '\n\nSources: ' : ' ';
+    return trimCitationProse(remaining ? `${text}${separator}${remaining}` : text);
+  }).join('\n\n');
   return finalizeAnswerInputSchema.parse({
     intent: input.intent,
     confidence: input.confidence,
@@ -184,6 +278,6 @@ export function renderStructuredAnswer(value: z.infer<typeof structuredAnswerSch
         : { code: 'SOURCE_CAVEAT', message: warning.message };
     }),
     citations: [],
-    ...rendered,
+    answer,
   });
 }

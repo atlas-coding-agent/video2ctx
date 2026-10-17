@@ -1,5 +1,4 @@
-import { rewriteAnswerCitations } from './answer-citations';
-import { mapCitationText } from './markdown-citations';
+import { mapCitationProse } from './markdown-citations';
 import { clockTime } from './runtime/clock-time';
 import { storedExtractionDiagnosticSchema } from '../lib/extraction-diagnostics';
 import { transcriptDiagnosticSchema } from './runtime/transcript-diagnostics';
@@ -82,17 +81,17 @@ export function compactAgentResult(result: AgentTurnResult, include: AgentRespon
   // Replace a contiguous group together so repeated or continuous excerpts become one reference.
   // Earlier formatters escaped model-written table citations into visible IDs.
   // Restore only citations already validated for this stored answer.
-  const displayAnswer = result.citationGroups !== undefined ? result.answer : mapCitationText(result.answer, prose => prose.replace(/\(source marker:([^\]]+)\]/g,
+  const displayAnswer = mapCitationProse(result.answer, prose => prose.replace(/\(source marker:([^\]]+)\]/g,
     (_marker, id: string) => citations.has(id) ? `[cite:${id}]` : '[source unavailable]'));
-  const answer = rewriteAnswerCitations({ ...result, answer: displayAnswer }, ids => {
+  const answer = mapCitationProse(displayAnswer, prose => prose.replace(/\[cite:[A-Za-z0-9:_-]+\](?:[ \t]*\[cite:[A-Za-z0-9:_-]+\])*/g, group => {
     // Citations in one group are listed by public source number. Each source shows one
     // reference per distinct cited passage; the stored citations keep every excerpt.
     const refs = new Map<string, AgentCitation[]>();
     const seen = new Set<string>();
-    for (const evidenceId of ids) {
-      if (seen.has(evidenceId)) continue;
-      seen.add(evidenceId);
-      const citation = citations.get(evidenceId);
+    for (const match of group.matchAll(/\[cite:([A-Za-z0-9:_-]+)\]/g)) {
+      if (seen.has(match[1]!)) continue;
+      seen.add(match[1]!);
+      const citation = citations.get(match[1]!);
       if (!citation) throw new ApiError(500, 'INVALID_AGENT_RESULT', 'A stored answer references missing evidence.');
       const key = citation.videoId ? `video:${citation.videoId}` : citation.channelId ? `channel:${citation.channelId}`
         : citation.playlistId ? `playlist:${citation.playlistId}` : citation.url ?? citation.sourceId;
@@ -112,8 +111,8 @@ export function compactAgentResult(result: AgentTurnResult, include: AgentRespon
     const labels = [...refs].flatMap(([id, cited]) => passageStarts(cited)
       .map(startMs => startMs === undefined ? `[${id}]` : `[${id} · ${clockTime(startMs)}]`));
     // Identical labels link to the same place, so repeating one adds nothing.
-    return { text: [...new Set(labels)].join(''), evidenceIds: [] };
-  }).answer;
+    return [...new Set(labels)].join('');
+  }));
   const codes = new Set(result.warnings.map(warning => warning.code));
   const outcome = result.intent === 'rejected' ? 'rejected'
     : result.intent === 'clarification' ? 'needs_clarification'
@@ -198,15 +197,10 @@ function publicCitation(citation: AgentCitation): Omit<AgentCitation, 'sourceKin
 
 export function legacyAgentRun(run: AgentRunView) {
   const { result, ...receipt } = run;
-  let publicResult: z.infer<typeof publicAgentTurnResultSchema> | undefined;
-  if (result) {
-    const { citationGroups: _citationGroups, ...fields } = result;
-    publicResult = withSessionId({ ...fields, citations: result.citations.map(publicCitation) });
-  }
-  return { ...withSessionId(receipt), ...(publicResult ? { result: publicResult } : {}) };
+  return { ...withSessionId(receipt), ...(result ? { result: withSessionId({ ...result, citations: result.citations.map(publicCitation) }) } : {}) };
 }
 
 const publicCitationSchema = agentCitationSchema.omit({ sourceKind: true });
 export const publicAgentRunReceiptSchema = agentRunReceiptSchema.omit({ conversationId: true }).extend({ sessionId: z.string().uuid() });
-export const publicAgentTurnResultSchema = agentTurnResultSchema.omit({ conversationId: true, citationGroups: true })
+export const publicAgentTurnResultSchema = agentTurnResultSchema.omit({ conversationId: true })
   .extend({ sessionId: z.string().uuid(), citations: z.array(publicCitationSchema) });

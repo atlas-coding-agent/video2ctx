@@ -1,4 +1,3 @@
-import { insertAnswerText } from '../answer-citations';
 import { ZodError } from 'zod';
 import { finalizeAnswerInputSchema, type EvidencePacket, type FinalizeAnswerInput } from '../contracts';
 import { formatVideoDuration, formatVideoLimit, videoDurationFailureSchema, type VideoDurationFailure } from '../runtime/video-duration-limit';
@@ -40,7 +39,7 @@ export function withDurationLimitNotice(input: FinalizeAnswerInput, notice: stri
   const maximum = finalizeAnswerInputSchema.shape.answer.maxLength;
   if (maximum !== null && answer.length > maximum) throw new ZodError([{ code: 'custom', path: ['blocks'],
     message: `Shorten the rendered answer, including citations, to at most ${maximum - notice.length - 2} characters to leave room for the required duration notice. Preserve supported findings and valid references.` }]);
-  return { ...input, ...insertAnswerText(input, { at: 0, text: `${notice}\n\n` }) };
+  return { ...input, answer };
 }
 
 /** Supplied by the runtime from persisted failures and the saved route, never model input. */

@@ -447,7 +447,7 @@ it('constrains generated citation IDs to supplied evidence and transmits no memo
   expect(format.schema).not.toHaveProperty('properties.memoryUpdates');
 });
 
-it.each(['generate', 'stream'] as const)('QA 012: %s uses only declared table evidence without regenerating a comparison', async mode => {
+it.each(['generate', 'stream'] as const)('QA 012: %s keeps a misplaced inline citation in place instead of regenerating a comparison', async mode => {
   const { options, classifier, output } = setup('context_answer', true);
   const second: EvidencePacket = { ...evidence, packetId: 'other-frame',
     sources: [{ id: 'other-video', provider: 'youtube', kind: 'video', videoId: 'zzzzzzzzzzz' }],
@@ -485,16 +485,16 @@ it.each(['generate', 'stream'] as const)('QA 012: %s uses only declared table ev
   expect(options.executeEvidenceTool).not.toHaveBeenCalled();
   const result: AgentTurnResult = await vi.mocked(options.finalize).mock.results[0]!.value;
   const compact = compactAgentResult(result);
-  // Inline table markers cannot introduce evidence missing from the block array.
-  expect(compact.answer).toBe(table.replace('[cite:ref_1] ', '').replace('[cite:ref_2] ', '') + '\n\nSources: [1 · 1:00]');
-  expect(compact.sources.map(source => source.videoId)).toEqual(['zzzzzzzzzzz']);
+  // The second row cites real evidence its block never declared; it stays where the model put it.
+  expect(compact.answer).toBe(table.replace('[cite:ref_1]', '[1 · 1:00]').replace('[cite:ref_2]', '[2 · 0:30]'));
+  expect(compact.sources.map(source => source.videoId)).toEqual(['zzzzzzzzzzz', 'abcdefghijk']);
   expect(result.citations.map(citation => [citation.id, citation.startMs])).toEqual([
-    ['other-observation', 60000],
+    ['other-observation', 60000], ['frame-observation', 30000],
   ]);
   expect(result.answer).not.toContain('[source unavailable]');
 });
 
-it('QA 012: strips an invented prose citation and saves the answer on the first attempt', async () => {
+it('QA 012: marks an invented inline citation unavailable and saves the answer on the first attempt', async () => {
   const { options, output } = setup('context_answer', true);
   const classifier = models.select({}, {}, '', { model_role: 'classifier' });
   const finalizer = new MockLanguageModelV4({ doGenerate: async () => ({
@@ -509,7 +509,7 @@ it('QA 012: strips an invented prose citation and saves the answer on the first 
 
   expect(finalizer.doGenerateCalls).toHaveLength(1);
   const result: AgentTurnResult = await vi.mocked(options.finalize).mock.results[0]!.value;
-  expect(result.answer).toBe('The woman holds the microphone. [cite:frame-observation]');
+  expect(result.answer).toBe('The woman holds the microphone. [source unavailable] [cite:frame-observation]');
   expect(result.citations.map(citation => citation.id)).toEqual(['frame-observation']);
   expect(options.executeEvidenceTool).not.toHaveBeenCalled();
 });
@@ -1417,7 +1417,7 @@ it.each(['generate', 'stream'] as const)('%s keeps complete blocks of a truncate
     warnings: expect.arrayContaining([expect.objectContaining({ code: 'ANSWER_TRUNCATED' })]) }));
 });
 
-it.each(['supported_inline', 'inline_only_mismatch'] as const)('judges prose figures by declared evidence only: %s', async scenario => {
+it.each(['supported_inline', 'inline_only_mismatch'] as const)('judges figures by the citations the answer renders, declared or inline: %s', async scenario => {
   const { options, classifier } = setup('context_answer', true);
   const percent = measurementPacket();
   const grams: EvidencePacket = { ...percent, packetId: 'grams', artifacts: [],
@@ -1437,12 +1437,12 @@ it.each(['supported_inline', 'inline_only_mismatch'] as const)('judges prose fig
   await executeResearchRun(options);
   const result: AgentTurnResult = await vi.mocked(options.finalize).mock.results[0]!.value;
   if (scenario === 'supported_inline') {
-    expect(result.citations.map(citation => citation.id)).toEqual(['e1']);
-    expect(result.answer).toContain('54.2g (unverified)');
-    expect(result.warnings.map(warning => warning.code)).toContain('UNVERIFIED_FIGURES');
+    expect(result.citations.map(citation => citation.id)).toContain('e2');
+    expect(result.answer).not.toContain('(unverified)');
+    expect(result.warnings.map(warning => warning.code)).not.toContain('UNVERIFIED_FIGURES');
   } else {
-    expect(result.citations).toEqual([]);
-    expect(result.answer).not.toContain('[cite:');
+    expect(result.citations.map(citation => citation.id)).toContain('e1');
+    expect(result.answer).toContain('54.2g (unverified)');
   }
 });
 
@@ -1892,10 +1892,10 @@ it('rechecks mutable memory before a recovered context reaches the answer prompt
 });
 
 it.each([
-  ['The woman holds the microphone (ref_1).', 'The woman holds the microphone. [cite:frame-observation]', 'The woman holds the microphone. [1 · 0:30]'],
-  ['The woman holds the microphone, ref_1.', 'The woman holds the microphone. [cite:frame-observation]', 'The woman holds the microphone. [1 · 0:30]'],
-  ['Unknown (ref_9) and range ref_1 to ref_2 stay.', 'Unknown and range stay. [cite:frame-observation]', 'Unknown and range stay. [1 · 0:30]'],
-])('strips prose annotations and cites declared evidence without a repair: %s', async (text, persisted, shown) => {
+  ['The woman holds the microphone (ref_1).', 'The woman holds the microphone [cite:frame-observation].', 'The woman holds the microphone [1 · 0:30].'],
+  ['The woman holds the microphone, ref_1.', 'The woman holds the microphone, [cite:frame-observation].', 'The woman holds the microphone, [1 · 0:30].'],
+  ['Unknown (ref_9) and range ref_1 to ref_2 stay.', 'Unknown (ref_9) and range ref_1 to ref_2 stay. [cite:frame-observation]', 'Unknown (ref_9) and range ref_1 to ref_2 stay. [1 · 0:30]'],
+])('resolves only known model-written aliases in a persisted answer, without a repair: %s', async (text, persisted, shown) => {
   const { options, classifier, output } = setup('context_answer', true);
   // Pass doGenerate to the constructor: the mock records calls only through that wrapper.
   const finalizer = new MockLanguageModelV4({ doGenerate: async () => ({
@@ -1911,7 +1911,7 @@ it.each([
   expect(JSON.stringify(finalizer.doGenerateCalls[0]!.prompt[0])).toContain('Never write reference ranges');
 });
 
-it.each(['generate', 'stream'] as const)('%s strips a prose range without adopting its undeclared endpoint or another model attempt', async mode => {
+it.each(['generate', 'stream'] as const)('%s resolves a range using supplied aliases without another model attempt', async mode => {
   const { options, classifier, output, identity } = setup('context_answer', true);
   const second: EvidencePacket = { ...evidence, packetId: 'other-frame',
     sources: [{ id: 'other-video', provider: 'youtube', kind: 'frames', videoId: 'zzzzzzzzzzz' }],
@@ -1937,6 +1937,6 @@ it.each(['generate', 'stream'] as const)('%s strips a prose range without adopti
   expect(mode === 'stream' ? finalizer.doStreamCalls : finalizer.doGenerateCalls).toHaveLength(1);
   expect(options.finalize).toHaveBeenCalledOnce();
   const result: AgentTurnResult = await vi.mocked(options.finalize).mock.results[0]!.value;
-  expect(result.citations.map(c => c.id)).toEqual(['other-observation']);
-  expect(compactAgentResult(result).answer).toBe('A rabbit and an interview. [1 · 1:00]');
+  expect(result.citations.map(c => c.id)).toEqual(['other-observation', 'frame-observation']);
+  expect(compactAgentResult(result).answer).toBe('A rabbit and an interview [1 · 1:00][2 · 0:30].');
 });

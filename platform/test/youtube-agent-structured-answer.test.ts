@@ -50,7 +50,7 @@ describe('structured answer citations', () => {
     const code = `Inline: \`${marker}\`.\n\n\`\`\`js\nconst refs = ${marker};\n\`\`\``;
     const text = `Claim ${marker}.\n\n${code}`;
     const aliases = new Map([['ref_2405', 'e1'], ['ref_2406', 'e2']]);
-    const block = { text, evidenceIds: ['e1', 'e2'] };
+    const block = { text, evidenceIds: ['e1'] };
     const evidence: EvidencePacket = { ...packet,
       sources: [{ ...packet.sources[0]!, videoId: 'video000001' },
         { ...packet.sources[0]!, id: 'source:2', videoId: 'video000002' }],
@@ -59,11 +59,11 @@ describe('structured answer citations', () => {
     expect(blockReferences({ text: code, evidenceIds: [] }, aliases)).toEqual([]);
     expect(blockReferences(block, aliases)).toEqual(['e1', 'e2']);
     const input = renderStructuredAnswer({ ...base, blocks: [block] }, aliases);
-    expect(input.answer).toBe(`Sources: [cite:e1] [cite:e2]\n\nClaim.\n\n${code}`);
+    expect(input.answer).toBe(`Claim [cite:e1] [cite:e2].\n\n${code}`);
     const result = buildAgentTurnResult({ runId: crypto.randomUUID(), conversationId: crypto.randomUUID(),
       userMessageId: crypto.randomUUID(), agentMessageId: crypto.randomUUID() },
     { userId: 'test', creditsRemaining: 10 }, input, [evidence], 1);
-    expect(compactAgentResult(result).answer).toBe(`Sources: [1 · 0:01][2]\n\nClaim.\n\n${code}`);
+    expect(compactAgentResult(result).answer).toBe(`Claim [1 · 0:01][2].\n\n${code}`);
     expect(renderPartialAnswer({ blocks: [block] })).toBe(`Claim .\n\n${code}`);
   });
   it.each([
@@ -76,10 +76,10 @@ describe('structured answer citations', () => {
     const rendered = renderStructuredAnswer({ ...base, blocks: [{ text, evidenceIds: ['e1'] }] });
     expect(rendered.answer).toBe(`Sources: [cite:e1]\n\n${text}`);
   });
-  it('preserves code literals while removing prose annotations', () => {
+  it('leaves literal canonical markers intact when a prose citation is unavailable', () => {
     const code = '`[cite:unknown]` and `[cite:e1]`';
     const result = finalize(['e1'], `Missing [cite:unknown]. Examples ${code}.`);
-    expect(compactAgentResult(result).answer).toBe(`Missing. Examples ${code}. [1]`);
+    expect(compactAgentResult(result).answer).toBe(`Missing [source unavailable]. Examples ${code}. [1]`);
     expect(result.citations.map(citation => citation.id)).toEqual(['e1']);
   });
   it.each(['[ref_2405, ref_2406]', '[cite:e1]', '[cite:unknown]', '(source marker:e1]'])('does not validate or format code-only markers: %s', marker => {
@@ -103,9 +103,9 @@ describe('structured answer citations', () => {
   ])('preserves unfinished code in streaming previews: %s', text => {
     expect(renderPartialAnswer({ blocks: [{ text }] })).toBe(text);
   });
-  it.each(['[ref_2405, ref_2406]', '【ref_2405, ref_2406】', '[ ref_2405,ref_2406 ]'])('renders declared evidence after stripping grouped prose references: %s', marker => {
+  it.each(['[ref_2405, ref_2406]', '【ref_2405, ref_2406】', '[ ref_2405,ref_2406 ]'])('resolves grouped bare references through validation and public formatting: %s', marker => {
     const aliases = new Map([['ref_2405', 'e1'], ['ref_2406', 'e2']]);
-    const block = { text: `Claim ${marker}.`, evidenceIds: ['e1', 'e2'] };
+    const block = { text: `Claim ${marker}.`, evidenceIds: ['e1'] };
     const evidence: EvidencePacket = { ...packet,
       sources: [{ ...packet.sources[0]!, videoId: 'video000001' },
         { ...packet.sources[0]!, id: 'source:2', videoId: 'video000002' }],
@@ -116,33 +116,33 @@ describe('structured answer citations', () => {
     { userId: 'test', creditsRemaining: 10 },
     renderStructuredAnswer({ ...base, blocks: [block] }, aliases), [evidence], 1);
     const compact = compactAgentResult(result);
-    expect(compact.answer).toBe('Claim. [1 · 0:01][2 · 0:03]');
+    expect(compact.answer).toBe('Claim [1 · 0:01][2 · 0:03].');
     expect(compact.sources.map(source => source.url)).toEqual([
       'https://www.youtube.com/watch?v=video000001',
       'https://www.youtube.com/watch?v=video000002',
     ]);
     expect(blockReferences(block, aliases)).toEqual(['e1', 'e2']);
   });
-  it('strips unknown grouped prose references without inventing a source', () => {
+  it('marks an unknown grouped bare reference unavailable without inventing a source', () => {
     const result = buildAgentTurnResult({ runId: crypto.randomUUID(), conversationId: crypto.randomUUID(),
       userMessageId: crypto.randomUUID(), agentMessageId: crypto.randomUUID() },
     { userId: 'test', creditsRemaining: 10 },
     renderStructuredAnswer({ ...base, blocks: [{ text: 'Claim [ref_2405, ref_9999].', evidenceIds: ['e1'] }] },
       new Map([['ref_2405', 'e1']])), [packet], 1);
-    expect(compactAgentResult(result).answer).toBe('Claim. [1]');
+    expect(compactAgentResult(result).answer).toBe('Claim [1] [source unavailable].');
     expect(result.citations.map(citation => citation.id)).toEqual(['e1']);
   });
   it.each(['[ref_2405, ref_2406]', '[ref_2405, ref_', '【ref_2405, ref_2406】'])('hides grouped references in provisional output: %s', marker => {
     expect(renderPartialAnswer({ blocks: [{ text: `Claim ${marker}` }] })).toBe('Claim');
   });
 
-  it('places declared comparison-table citations below the block', () => {
+  it('keeps validated row citations inside a comparison table without leaking evidence IDs', () => {
     const table='| Test | Result | Source |\n| --- | --- | --- |\n| Coding | Supported result | [cite:ref_1] |';
     const input=renderStructuredAnswer({...base,blocks:[{text:table,evidenceIds:['e1']}]},new Map([['ref_1','e1']]));
     const result=buildAgentTurnResult({runId:crypto.randomUUID(),conversationId:crypto.randomUUID(),userMessageId:crypto.randomUUID(),agentMessageId:crypto.randomUUID()},
       {userId:'test',creditsRemaining:10},input,[packet],1);
     const compact=compactAgentResult(result);
-    expect(compact.answer).toBe(table.replace('[cite:ref_1] ','') + '\n\nSources: [1]');
+    expect(compact.answer).toBe(table.replace('[cite:ref_1]','[1]'));
     expect(compact.sources).toHaveLength(1);
     expect(compact.answer).not.toContain('source marker:');
   });
@@ -156,29 +156,29 @@ describe('structured answer citations', () => {
       { text: `- A supported observation. ${marker}`, evidenceIds: ['e1'] },
     ] }, new Map([['ref_1', 'e1']])).answer).toBe('- A supported observation. [cite:e1]');
   });
-  it('strips undeclared inline table references', () => {
+  it('keeps an undeclared inline reference in place for persistence to verify', () => {
     const table='| Test | Source |\n| --- | --- |\n| Coding | [cite:ref_2] |';
     expect(renderStructuredAnswer({...base,blocks:[{text:table,evidenceIds:['e1']}]},new Map([['ref_2','e2']])).answer)
-      .toBe('| Test | Source |\n| --- | --- |\n| Coding | |\n\nSources: [cite:e1]');
+      .toBe('| Test | Source |\n| --- | --- |\n| Coding | [cite:e2] |\n\nSources: [cite:e1]');
   });
-  it.each(['[cite:ref_2]', '(source marker:ref_2]'])('does not borrow prose evidence from another block: %s', marker => {
+  it.each(['[cite:ref_2]', '(source marker:ref_2]'])('keeps a reference another block declares where the model placed it: %s', marker => {
     expect(renderStructuredAnswer({ ...base, blocks: [
       { text: `First source ${marker}.`, evidenceIds: ['e1'] },
       { text: 'Second source.', evidenceIds: ['e2'] },
-    ] }, new Map([['ref_2', 'e2']])).answer).toBe('First source. [cite:e1]\n\nSecond source. [cite:e2]');
+    ] }, new Map([['ref_2', 'e2']])).answer).toBe('First source [cite:e2]. [cite:e1]\n\nSecond source. [cite:e2]');
   });
-  it('strips a malformed prose marker without echoing its text', () => {
+  it('marks a marker with no usable reference as unavailable without echoing its text', () => {
     const answer = renderStructuredAnswer({ ...base, blocks: [
       { text: 'A supported first block.', evidenceIds: ['e1'] },
       { text: 'Another claim [cite:untrusted marker payload].', evidenceIds: ['e1'] },
     ] }).answer;
-    expect(answer).toBe('A supported first block. [cite:e1]\n\nAnother claim. [cite:e1]');
+    expect(answer).toBe('A supported first block. [cite:e1]\n\nAnother claim [source unavailable]. [cite:e1]');
     expect(answer).not.toContain('untrusted marker payload');
   });
   it.each([
-    ['[cite:ref_1, ref_2]', 'Claim. [cite:e1] [cite:e2]'],
-    ['[cite: ref_1]', 'Claim. [cite:e1] [cite:e2]'],
-  ])('takes prose references from the array for marker %s', (marker, expected) => {
+    ['[cite:ref_1, ref_2]', 'Claim [cite:e1] [cite:e2].'],
+    ['[cite: ref_1]', 'Claim [cite:e1]. [cite:e2]'],
+  ])('splits a marker holding several references: %s', (marker, expected) => {
     expect(renderStructuredAnswer({ ...base, blocks: [{ text: `Claim ${marker}.`, evidenceIds: ['e1', 'e2'] }] },
       new Map([['ref_1', 'e1'], ['ref_2', 'e2']])).answer).toBe(expected);
   });
@@ -315,16 +315,16 @@ describe('structured answer citations', () => {
   it('still requires at least one persisted citation for a research answer', () => {
     expect(() => finalize(['invented'])).toThrow(expect.objectContaining({ code: 'AGENT_CITATION_REQUIRED' }));
   });
-  it('strips an injected prose reference that matches no saved evidence', () => {
+  it('marks an injected reference that matches no saved evidence as unavailable', () => {
     const result = finalize(['e1'], 'Text [cite:invented]');
-    expect(result.answer).toBe('Text [cite:e1]');
+    expect(result.answer).toBe('Text [source unavailable] [cite:e1]');
     expect(result.citations.map(citation => citation.id)).toEqual(['e1']);
   });
-  it('strips prose references adjacent to words', () => {
+  it('resolves single bare references using the same validation path', () => {
     const rendered = renderStructuredAnswer({ ...base, blocks: [
       { text: 'Supported claim【ref_1】 with an example[ref_2].', evidenceIds: ['ref_1'] },
     ] }, new Map([['ref_1', 'e1'], ['ref_2', 'e2']]));
-    expect(rendered.answer).toBe('Supported claim with an example. [cite:e1]');
+    expect(rendered.answer).toBe('Supported claim[cite:e1] with an example[cite:e2].');
   });
 });
 
@@ -408,8 +408,129 @@ describe('model-written aliases and passage references', () => {
     return { input, result, compact: compactAgentResult(result, ['evidence']) };
   }
 
+  it('resolves a known parenthesized alias group into one reference for a continuous passage', () => {
+    const { input, result, compact } = publish('Blooms form when water meets a drying wash (ref_143, ref_144).');
+    expect(input.answer).toBe('Blooms form when water meets a drying wash [cite:t1] [cite:t2].');
+    expect(compact.answer).toBe('Blooms form when water meets a drying wash [1 · 0:10].');
+    expect(compact.answer).not.toMatch(/ref_\d/);
+    expect(result.citations.map(citation => citation.id)).toEqual(['t1', 't2']);
+    expect(compact.evidence?.map(({ id, startMs, endMs }) => ({ id, startMs, endMs }))).toEqual([
+      { id: 't1', startMs: 10_000, endMs: 15_000 }, { id: 't2', startMs: 15_000, endMs: 20_000 }]);
+  });
   it.each([
-    ['an exact duplicate', 'Claim [cite:t1] [cite:t1].', ['t1'], 'Claim. [1 · 0:10]'],
+    ['See ref_9.', 'See [1 · 0:40]. [1 · 0:10]'],
+    ['ref_9 shows the wash.', '[1 · 0:40] shows the wash. [1 · 0:10]'],
+    ['(see ref_9) and **ref_2**.', '(see [1 · 0:40]) and **[1 · 0:15]**. [1 · 0:10]'],
+    ['| Step | Source |\n| --- | --- |\n| Wash | ref_9 |', '| Step | Source |\n| --- | --- |\n| Wash | [1 · 0:40] |\n\nSources: [1 · 0:10]'],
+  ])('resolves a known bare alias where the model placed it: %s', (text, expected) => {
+    expect(publish(text).compact.answer).toBe(expected);
+  });
+  it('counts resolved aliases as block references for answer checks', () => {
+    expect(blockReferences({ text: 'Claim (ref_143, ref_144), ref_9, (ref_1, ref_404) and ref_30 to ref_36.', evidenceIds: [] }, aliases))
+      .toEqual(['t1', 't2', 't4']);
+  });
+  it.each([
+    'Unknown (ref_404) here.',
+    'Unknown ref_404 here.',
+    'Mixed (ref_1, ref_404) here.',
+    'The demo runs ref_30 to ref_36 here.',
+    'The demo runs ref_30 through ref_36 here.',
+    'The demo runs ref_30-ref_36 here.',
+    'The demo runs ref_30–36 here.',
+    'The demo runs (ref_30 to ref_36) here.',
+    'The demo runs [ref_30-ref_36] here.',
+  ])('leaves unknown, mixed and range forms exactly as written: %s', text => {
+    const { input, result } = publish(text);
+    expect(input.answer).toBe(`${text} [cite:t1]`);
+    expect(result.citations.map(citation => citation.id)).toEqual(['t1']);
+    expect(result.warnings.map(warning => warning.code)).not.toContain('CITATIONS_UNAVAILABLE');
+  });
+  it.each([
+    'Literal `ref_1` and `(ref_1, ref_2)` here.',
+    'Link https://example.com/ref_1 here.',
+    'Link [docs](https://example.com/a?id=ref_1) here.',
+    'Names my_ref_1, xref_1, ref_1x, ref_1.5, ref_1-based and ref_1\'s here.',
+    'Quoted "ref_1" and call(ref_1) and fn(ref_1, ref_2) here.',
+    'Bracketed [see ref_1] stays here.',
+  ])('leaves code, URLs, identifiers and quotations unchanged: %s', text => {
+    expect(publish(text).input.answer).toBe(`${text} [cite:t1]`);
+  });
+  it.each([
+    'Call fn(value, ref_1) here.',
+    'Call fn(ref_1, ref_2, value) here.',
+    'Call fn(ref_1, ref_2) here.',
+    'Call outer(inner(ref_1), ref_2) here.',
+    'Call fn(a, b(c), ref_1) here.',
+    'Call obj.method(ref_1) here.',
+    'Call fn(ref_1 here.',
+  ])('leaves aliases in call-like text unchanged in any argument position: %s', text => {
+    const { input, result, compact } = publish(text);
+    expect(input.answer).toBe(`${text} [cite:t1]`);
+    expect(result.citations.map(citation => citation.id)).toEqual(['t1']);
+    expect(compact.answer).toBe(`${text} [1 · 0:10]`);
+  });
+  it.each([
+    'Call fn(")", ref_1) here.',
+    'Call fn(\'close)\', ref_1) here.',
+    'Call fn("a\\")", ref_1) here.',
+    'Call fn(`)`, ref_1) here.',
+    'Call fn(\n  value, ref_1\n) here.',
+    'Call fn(\n  ")",\n  (ref_1, ref_2)\n) here.',
+    'Call fn(it\'s, ref_1\n) here.',
+  ])('leaves quoted and multiline call-like text unchanged: %s', text => {
+    const { input, result, compact } = publish(text);
+    expect(input.answer).toBe(`${text} [cite:t1]`);
+    expect(result.citations.map(citation => citation.id)).toEqual(['t1']);
+    expect(compact.answer).toBe(`${text} [1 · 0:10]`);
+  });
+  it.each([
+    ['Call fn(")", value) returns, then the wash dries ref_9.', 'Call fn(")", value) returns, then the wash dries [1 · 0:40]. [1 · 0:10]'],
+    ['Call fn(\n  value\n) returns, then the wash dries (ref_9).', 'Call fn(\n  value\n) returns, then the wash dries [1 · 0:40]. [1 · 0:10]'],
+    ['Call fn(value is unclosed.\n\nThe wash dries ref_9.', 'Call fn(value is unclosed.\n\nThe wash dries [1 · 0:40]. [1 · 0:10]'],
+    ['After fn(value) returns, the wash dries ref_9.', 'After fn(value) returns, the wash dries [1 · 0:40]. [1 · 0:10]'],
+    ['The wash dries (ref_9), as fn(x) shows.', 'The wash dries [1 · 0:40], as fn(x) shows. [1 · 0:10]'],
+    ['Blooms appear (see ref_9) after fn(ref_2).', 'Blooms appear (see [1 · 0:40]) after fn(ref_2). [1 · 0:10]'],
+    ['See [docs](https://example.com/wash) and ref_9.', 'See [docs](https://example.com/wash) and [1 · 0:40]. [1 · 0:10]'],
+    ['Visit https://example.com/wash, then ref_9.', 'Visit https://example.com/wash, then [1 · 0:40]. [1 · 0:10]'],
+    ['Visit https://example.com/wash (ref_9).', 'Visit https://example.com/wash [1 · 0:40]. [1 · 0:10]'],
+  ])('still resolves prose aliases beside call-like text, links and URLs: %s', (text, expected) => {
+    expect(publish(text).compact.answer).toBe(expected);
+  });
+  it.each([
+    'See [the wash ref_9](https://example.com/wash) here.',
+    'See [docs](https://example.com/ref_9) here.',
+    'See [docs](ref_9) here.',
+    'See [docs](https://example.com/wash "ref_9") here.',
+    'See [docs](https://example.com/wash "Notes (ref_1, ref_2)") here.',
+    '[See (ref_1)](https://example.com/docs) here.',
+    'See [docs](https://example.com/?value=ok,ref_1) here.',
+    'See ![frame (ref_143, ref_144)](https://example.com/frame.png) here.',
+    'See <https://example.com/ref_9> here.',
+    'See [docs][wash] and [ref_9 notes][wash] here.\n\n[wash]: https://example.com/?value=ok,ref_1 "ref_2"\n\nMore prose.',
+    'Visit https://example.com/?value=ok,ref_1 for notes.',
+    'Visit https://example.com/(ref_1, ref_2) for notes.',
+    'Visit www.example.com/?q=ok,ref_9 for notes.',
+  ])('leaves Markdown links, definitions and bare URLs unchanged: %s', text => {
+    const { input, result, compact } = publish(text);
+    expect(input.answer).toBe(`${text} [cite:t1]`);
+    expect(result.citations.map(citation => citation.id)).toEqual(['t1']);
+    expect(compact.answer).toBe(`${text} [1 · 0:10]`);
+  });
+  it('excludes aliases in call-like text and links from block references', () => {
+    expect(blockReferences({ text: 'fn(value, ref_1), [see ref_2](https://example.com) and ref_9.', evidenceIds: [] }, aliases))
+      .toEqual(['t4']);
+  });
+  it('leaves aliases inside a fenced code block unchanged', () => {
+    const text = 'Example:\n\n```text\n(ref_143, ref_144) ref_9\n```\n\nDone.';
+    expect(publish(text).input.answer).toBe(`${text} [cite:t1]`);
+  });
+  it('does not resolve parenthesized or bare aliases without a supplied alias map', () => {
+    const text = 'Claim (ref_1, ref_2) and ref_9.';
+    expect(publish(text, ['t1'], new Map()).input.answer).toBe(`${text} [cite:t1]`);
+  });
+
+  it.each([
+    ['an exact duplicate', 'Claim [cite:t1] [cite:t1].', ['t1'], 'Claim [1 · 0:10].'],
     ['touching intervals', 'Claim.', ['t1', 't2'], 'Claim. [1 · 0:10]'],
     ['overlapping intervals', 'Claim.', ['t1', 't3'], 'Claim. [1 · 0:10]'],
     ['out-of-order references', 'Claim.', ['t2', 't1'], 'Claim. [1 · 0:10]'],
@@ -428,8 +549,8 @@ describe('model-written aliases and passage references', () => {
     expect(compact.evidence?.map(citation => citation.id).sort()).toEqual([...new Set(evidenceIds)].sort());
   });
   it('keeps public source numbers in first-use order across groups', () => {
-    const { compact } = publish('| Passage | Source |\n| --- | --- |\n| Second video first | [cite:b1] |\n| Then | [cite:t4] [cite:t1] |', ['b1', 't1', 't4']);
-    expect(compact.answer).toBe('| Passage | Source |\n| --- | --- |\n| Second video first | |\n| Then | |\n\nSources: [1 · 0:10][2 · 0:10][2 · 0:40]');
+    const { compact } = publish('Second video first [cite:b1]. Then [cite:t4] [cite:t1].', ['t1']);
+    expect(compact.answer).toBe('Second video first [1 · 0:10]. Then [2 · 0:10][2 · 0:40].');
     expect(compact.sources.map(source => source.videoId)).toEqual(['videoBBBBBB', 'videoAAAAAA']);
   });
   it('records each citation kind from persisted evidence and keeps it out of public evidence', () => {

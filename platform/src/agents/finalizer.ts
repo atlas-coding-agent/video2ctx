@@ -1,4 +1,4 @@
-import { citedEvidenceIds, removeAnswerCitations, insertAnswerText } from './answer-citations';
+import { answerCitationIds, mapCitationProse } from './markdown-citations';
 import { isDurationLimitFallback, type DurationLimitAnswerContext } from './research/duration-limit-answer';
 import { ApiError } from '../lib/http';
 import {
@@ -9,8 +9,9 @@ import {
   type EvidencePacket,
   type FinalizeAnswerInput,
 } from './contracts';
-import { answerNoticeInsertion, playlistCoverageDisclosures } from './playlist-coverage';
+import { appendNotices, playlistCoverageDisclosures } from './playlist-coverage';
 
+const CITATION_MARKER = /\[cite:([A-Za-z0-9:_-]+)\]/g;
 
 export interface FinalizationIdentity {
   runId: string;
@@ -27,10 +28,10 @@ export function buildAgentTurnResult(
   creditsCharged: number,
   durationLimitContext?: DurationLimitAnswerContext,
 ): AgentTurnResult {
-  const evidenceIds = citedEvidenceIds(input);
+  const markers = answerCitationIds(input.answer);
   const citations: AgentCitation[] = [];
   const unresolved = new Set<string>();
-  for (const marker of evidenceIds) {
+  for (const marker of markers) {
     const matches = packets.flatMap((packet) => packet.excerpts
       .filter((excerpt) => excerpt.id === marker)
       .flatMap((excerpt) => {
@@ -56,15 +57,16 @@ export function buildAgentTurnResult(
   }
   if ((input.intent === 'topic_research' || input.intent === 'inspect_video') && citations.length === 0
     && !isDurationLimitFallback(input, packets, durationLimitContext)) {
-    throw new ApiError(422, 'AGENT_CITATION_REQUIRED', 'A research answer must cite persisted evidence.');
+    throw new ApiError(422, 'AGENT_CITATION_REQUIRED', 'A research answer must include persisted inline citation markers.');
   }
   // The claim stays, visibly unsupported, as it does after a source is deleted.
-  const rendered = removeAnswerCitations(input, unresolved, '[source unavailable]');
-  const answer = rendered.answer;
+  const answer = unresolved.size
+    ? mapCitationProse(input.answer, prose => prose.replace(CITATION_MARKER, (marker, id: string) => unresolved.has(id) ? '[source unavailable]' : marker))
+    : input.answer;
 
   // The application states playlist totals, the listing limit and reviewed content itself.
   const playlistCoverage = playlistCoverageDisclosures(packets, citations.map(citation => citation.id));
-  const disclosed = insertAnswerText(rendered, answerNoticeInsertion(answer, playlistCoverage.notes));
+  const disclosedAnswer = appendNotices(answer, playlistCoverage.notes);
 
   const warnings = deduplicateWarnings([
     ...packets.flatMap((packet) => packet.warnings),
@@ -74,7 +76,7 @@ export function buildAgentTurnResult(
 
   return agentTurnResultSchema.parse({
     ...identity,
-    ...disclosed,
+    answer: disclosedAnswer,
     intent: input.intent,
     confidence: input.confidence,
     citations,

@@ -1,4 +1,3 @@
-import { renderCitedBlocks } from '../answer-citations';
 import { z } from 'zod';
 import type { EvidencePacket, FinalizeAnswerInput } from '../contracts';
 
@@ -24,13 +23,13 @@ export function evidenceFallback(
   const accessWarnings = [...new Map(packets.flatMap(packet => packet.warnings)
     .filter(warning => ['CAPTIONS_UNAVAILABLE', 'REGION_RESTRICTED'].includes(warning.code))
     .map(warning => [JSON.stringify(warning), warning])).values()];
-  const blocks: { text: string; evidenceIds: string[] }[] = [];
+  const blocks: string[] = [];
   const seen = new Set<string>();
-  const add = (key: string, text: string, evidenceIds: string[]) => { if (!seen.has(key)) { seen.add(key); blocks.push({ text, evidenceIds }); } };
+  const add = (key: string, text: string) => { if (!seen.has(key)) { seen.add(key); blocks.push(text); } };
   if (!hasContentEvidence(packets)) {
     const links = packets.flatMap(packet => packet.sources.flatMap(source => {
       const excerpt = packet.excerpts.find(e => e.sourceId === source.id && /^[A-Za-z0-9:_-]+$/.test(e.id));
-      return excerpt ? [{ text: `- ${safeText(source.title ?? 'Video source')}`, evidenceIds: [excerpt.id] }] : [];
+      return excerpt ? [`- ${safeText(source.title ?? 'Video source')} [cite:${excerpt.id}]`] : [];
     })).slice(0, 3);
     if (!links.length && !durationNotice) return null;
     const explanation = links.length
@@ -38,7 +37,7 @@ export function evidenceFallback(
       : 'I could not analyze the requested video content in this run. I cannot give an evidence-backed summary without its content.';
     return {
       intent, confidence: 'low', citations: [], artifacts: [],
-      ...renderCitedBlocks([{ text: `${durationNotice ? `${durationNotice}\n\n` : ''}${explanation}${links.length ? '\n\nSources to explore, not verified recommendations:' : ''}`, evidenceIds: [] }, ...links]),
+      answer: `${durationNotice ? `${durationNotice}\n\n` : ''}${explanation}${links.length ? `\n\nSources to explore, not verified recommendations:\n${links.join('\n')}` : ''}`,
       warnings: [
       ...accessWarnings,
         { code: 'PARTIAL_EVIDENCE', message: 'Video content analysis did not complete; the requested answer is unavailable.' },
@@ -58,14 +57,14 @@ export function evidenceFallback(
     if (findings.length) {
       for (const finding of findings) {
         add(JSON.stringify([packet.sources.map(source => source.videoId).sort(), safeText(finding.claim).toLowerCase()]),
-          safeText(finding.claim), [...new Set(finding.excerptIds)]);
+          `${safeText(finding.claim)} ${[...new Set(finding.excerptIds)].map(id => `[cite:${id}]`).join(' ')}`);
       }
     } else if (['youtube_frames', 'youtube_storyboard'].includes(packet.kind)
       && !packet.artifacts.some(artifact => ['youtube_frame_retrieval', 'youtube_storyboard_retrieval'].includes(artifact.type))) {
       for (const excerpt of [...usable.values()].slice(0, 2)) {
         const source = packet.sources.find(source => source.id === excerpt.sourceId)!;
         add(JSON.stringify([source.videoId ?? source.id, safeText(excerpt.text).toLowerCase()]),
-          safeText(excerpt.text), [excerpt.id]);
+          `${safeText(excerpt.text)} [cite:${excerpt.id}]`);
       }
     }
     // Raw transcript segments and comments are not findings. Do not select
@@ -75,7 +74,7 @@ export function evidenceFallback(
   if (!blocks.length) return null;
   return {
     intent, confidence: 'low', citations: [], artifacts: [],
-    ...renderCitedBlocks([{ text: `Partial evidence summary\n\n${failureMessage ?? 'Final synthesis could not be completed.'} These are individually supported findings, not a completed comparison or recommendation.`, evidenceIds: [] }, ...blocks.slice(0, 8)]),
+    answer: `Partial evidence summary\n\n${failureMessage ?? 'Final synthesis could not be completed.'} These are individually supported findings, not a completed comparison or recommendation.\n\n${blocks.slice(0, 8).join('\n\n')}`,
     warnings: [
       ...accessWarnings,
       { code: 'PARTIAL_EVIDENCE', message: 'Returning supported findings because final synthesis did not complete. This is not a completed comparison or recommendation.' },

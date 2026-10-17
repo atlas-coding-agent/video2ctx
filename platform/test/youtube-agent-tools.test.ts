@@ -504,7 +504,7 @@ describe('YouTube agent deterministic finalizer', () => {
     expect(() => buildAgentTurnResult(identity(), admission(), {
       answer: 'An unsupported answer.', intent: 'topic_research', confidence: 'low',
       citations: [], artifacts: [], warnings: [],
-    }, [evidencePacket()], 1)).toThrow(/must cite persisted evidence/);
+    }, [evidencePacket()], 1)).toThrow(/inline citation markers/);
   });
 
   it('marks citation identifiers that were not persisted as unavailable', () => {
