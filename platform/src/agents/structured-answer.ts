@@ -1,10 +1,11 @@
-import { answerCitationIds, endsInCodeBlock, mapCitationProse, trimCitationProse, LINK_NODES, literalSpans, tableRanges } from './markdown-citations';
+import { renderCitedBlocks } from './answer-citations';
+import { mapCitationProse, trimCitationProse, LINK_NODES, literalSpans } from './markdown-citations';
 import { parsePartialJson } from 'ai';
 import { z } from 'zod';
 import { finalizeAnswerInputSchema, type FinalizeAnswerInput } from './contracts';
 
-/** Model-facing only. Persisted and public answers retain their existing format. */
-const fields = finalizeAnswerInputSchema.omit({ answer: true, citations: true, intent: true }).extend({
+/** Model-facing only. Citation placement metadata is owned by the application. */
+const fields = finalizeAnswerInputSchema.omit({ answer: true, citations: true, citationGroups: true, intent: true }).extend({
   warnings: z.array(z.object({
     code: z.enum(['SOURCE_CAVEAT', 'ANSWER_SCOPE_SHORTFALL']).describe('SOURCE_CAVEAT: limitations of sources, such as unverified demos. ANSWER_SCOPE_SHORTFALL: a specific requested item, count, or question could not be answered. Source uncertainty alone is not an unmet request.'),
     message: z.string().min(1).max(1_000),
@@ -14,7 +15,7 @@ const fields = finalizeAnswerInputSchema.omit({ answer: true, citations: true, i
 const block = z.object({
   // The SDK bounds generation tokens and the rendered contract bounds total
   // characters. A decoding limit on each paragraph can split words at its edge.
-  text: z.string().min(1).regex(/\S/, 'A block must contain non-whitespace text.').describe('One complete paragraph, list item, or Markdown table. Finish the table within this block. End prose at a natural sentence boundary; never continue a sentence in the next block. Put prose citations only in evidenceIds, not in text: the application strips inline prose citation annotations and appends links from evidenceIds. For Markdown tables only, use [cite:ref_N] in Source cells and include those IDs in evidenceIds. Never write bare aliases or reference ranges as citations.'),
+  text: z.string().min(1).regex(/\S/, 'A block must contain non-whitespace text.').describe('One complete paragraph, list item, or Markdown table. Finish the table within this block. End prose at a natural sentence boundary; never continue a sentence in the next block. Put all citations only in evidenceIds, including for tables. The application strips inline citation annotations and appends block-level links. Do not add Source cells or row-level citation markers. Never write bare aliases or reference ranges as citations.'),
   evidenceIds: z.array(z.string().regex(/^[A-Za-z0-9:_-]+$/).max(300)).min(1).max(12).describe('Individual supplied evidence IDs supporting this block. List each ID separately, without ranges or duplicates. The application renders these as citations.'),
 });
 // Executable routes require references in the transmitted JSON schema itself.
@@ -40,7 +41,7 @@ export const contextAnswerSchema = fields.extend({
 export const finalizationOutputSchema = structuredAnswerSchema.omit({ intent: true, artifacts: true });
 export const contextFinalizationOutputSchema = contextAnswerSchema.omit({ intent: true, artifacts: true });
 export const conversationalFinalizationOutputSchema = clarificationAnswerSchema.omit({ intent: true, artifacts: true });
-export const FINALIZATION_SCHEMA_VERSION = 'answer-blocks-v4';
+export const FINALIZATION_SCHEMA_VERSION = 'answer-blocks-v5';
 
 /** Log-only signal. A count mismatch never rejects an answer. */
 export function numberedItemsMismatch(output: Pick<z.infer<typeof finalizationOutputSchema>, 'blocks' | 'warnings'>, expected: number | undefined): boolean {
@@ -111,10 +112,9 @@ const ALIAS = String.raw`ref_\d+`;
 const RANGE_SEPARATOR = String.raw`(?:-|–|—|\bto\b|\bthrough\b|\bthru\b)`;
 const ALIAS_ITEM = String.raw`${ALIAS}(?:\s*${RANGE_SEPARATOR}\s*(?:ref_)?\d+)?`;
 const ALIAS_LIST = String.raw`${ALIAS_ITEM}(?:\s*,\s*${ALIAS_ITEM})*`;
-const ALIAS_RANGE = new RegExp(String.raw`${ALIAS}\s*${RANGE_SEPARATOR}\s*(?:ref_)?\d+`);
 const ALIAS_BEFORE = String.raw`(?<![\w\-./:=#?&%@~+$\\\[【'"‘“\x60])`;
 const ALIAS_AFTER = String.raw`(?![\w\-/:(\]】'"’”\x60]|\.\w)`;
-// Recognize annotation syntax, independent of whether its IDs exist. Prose IDs
+// Recognize annotation syntax, independent of whether its IDs exist. Inline IDs
 // never become evidence. Consume ranges without enumerating their members.
 const MODEL_REFERENCES = new RegExp(String.raw`(?<leading>(?:,[ \t]+)?[ \t]*)(?:` + [
   String.raw`\[cite:(?<canonical>[^\]]*)\]|\(source marker:(?<escaped>[^\]]*)\]`,
@@ -123,14 +123,12 @@ const MODEL_REFERENCES = new RegExp(String.raw`(?<leading>(?:,[ \t]+)?[ \t]*)(?:
   String.raw`${ALIAS_BEFORE}(?<bare>${ALIAS_LIST})${ALIAS_AFTER}`,
 ].join('|') + String.raw`)(?<trailing>[ \t]*)`, 'gu');
 
-/** Only explicit table references can add evidence from text. Prose annotations
- * are removed, including unknown aliases and ranges, without validating or expanding
- * their IDs. Keep literal content and attribution names unchanged. */
-function mapAnswerReferences(text: string, tableMarker: (raw: string) => string): string {
+/** Remove citation annotations in prose and tables without adopting their IDs.
+ * Keep literal examples and attribution names unchanged. */
+function stripAnswerReferences(text: string): string {
   const prose: Array<[number, number]> = [];
   mapCitationProse(text, (chunk, from, to) => { prose.push([from, to]); return chunk; }, false, LINK_NODES);
   const literals = literalSpans(text, prose);
-  const tables = tableRanges(text);
   return mapCitationProse(text, (chunk, proseStart) => {
     let rendered = '', cursor = 0;
     for (const match of chunk.matchAll(MODEL_REFERENCES)) {
@@ -144,14 +142,7 @@ function mapAnswerReferences(text: string, tableMarker: (raw: string) => string)
         rendered += match[0];
         continue;
       }
-      const listed = groups.canonical ?? groups.escaped ?? groups.square ?? groups.wide ?? groups.group ?? groups.bare ?? '';
-      const isTable = tables.some(([from, to]) => start >= from && end <= to);
-      // A table range is removed too; declared IDs still render below the table.
-      const isRange = ALIAS_RANGE.test(listed);
-      if (isTable && !isRange) {
-        const citation = tableMarker(listed);
-        rendered += `${leading}${groups.attribution ? `(${groups.attribution}, ${citation})` : citation}${trailing}`;
-      } else if (groups.attribution) {
+      if (groups.attribution) {
         rendered += `${leading}(${groups.attribution})${trailing}`;
       } else {
         // Remove only whitespace at a removed annotation's boundary. In particular,
@@ -165,21 +156,9 @@ function mapAnswerReferences(text: string, tableMarker: (raw: string) => string)
   }, false, LINK_NODES);
 }
 
-/** References one inline marker names, after aliasing. Unusable text yields none. */
-function markerReferences(raw: string, aliases: ReadonlyMap<string, string>): string[] {
-  return raw.split(',').map(part => part.trim()).filter(Boolean)
-    .map(part => aliases.get(part) ?? part).filter(id => /^[A-Za-z0-9:_-]{1,300}$/.test(id));
-}
-
-/** Every reference a block's rendered citations come from: declared IDs and table cells. The
- * figure and coverage checks use this same set, so they judge what the reader sees. */
+/** Block arrays are the only citation authority, for prose and tables alike. */
 export function blockReferences(block: { text: string; evidenceIds: readonly string[] }, aliases: ReadonlyMap<string, string> = new Map()): string[] {
-  const inline: string[] = [];
-  mapAnswerReferences(block.text, raw => {
-    inline.push(...markerReferences(raw, aliases));
-    return '';
-  });
-  return [...new Set([...block.evidenceIds.map(id => aliases.get(id) ?? id), ...inline])];
+  return [...new Set(block.evidenceIds.map(id => aliases.get(id) ?? id))];
 }
 
 export function renderStructuredAnswer(value: z.infer<typeof structuredAnswerSchema> | z.infer<typeof clarificationAnswerSchema> | z.infer<typeof contextAnswerSchema>, aliases: ReadonlyMap<string, string> = new Map()): FinalizeAnswerInput {
@@ -188,29 +167,9 @@ export function renderStructuredAnswer(value: z.infer<typeof structuredAnswerSch
   // Not an answer at all: the one content check that still earns a repair.
   if (fillerOnlyAnswer(input)) throw new z.ZodError([{ code: 'custom', path: ['blocks'],
     message: 'The answer is only a fragment or promise of future work. Answer the request now, or state the concrete missing context. Do not report planned work as completed.' }]);
-  const answer = input.blocks.map(block => {
-    const declared = new Set(block.evidenceIds.map(id => aliases.get(id) ?? id));
-    const placed = new Set<string>();
-    const text = mapAnswerReferences(block.text, raw => {
-      const ids = markerReferences(raw, aliases);
-      if (!ids.length) return '[source unavailable]';
-      for (const id of ids) placed.add(id);
-      return ids.map(id => `[cite:${id}]`).join(' ');
-    });
-    const remainingIds = [...declared].filter(id => !placed.has(id));
-    const remaining = remainingIds.map(id => `[cite:${id}]`).join(' ');
-    // Appending text to the final table row would create an extra cell.
-    if (remaining && endsInCodeBlock(text)) return `Sources: ${remaining}\n\n${text}`;
-    const separator = tableRanges(text).length ? '\n\nSources: ' : ' ';
-    const answer = remaining ? `${text}${separator}${remaining}` : text;
-    // An unfinished literal call can consume the appended markers. Use the same
-    // discovery rules as persistence, then end that paragraph before our sources.
-    const discoverable = new Set(answerCitationIds(answer));
-    if (remainingIds.some(id => !discoverable.has(id))) {
-      return trimCitationProse(`${text}\n\nSources: ${remaining}`);
-    }
-    return trimCitationProse(answer);
-  }).join('\n\n');
+  const rendered = renderCitedBlocks(input.blocks.map(block => ({
+    text: trimCitationProse(stripAnswerReferences(block.text)), evidenceIds: blockReferences(block, aliases),
+  })));
   return finalizeAnswerInputSchema.parse({
     intent: input.intent,
     confidence: input.confidence,
@@ -225,6 +184,6 @@ export function renderStructuredAnswer(value: z.infer<typeof structuredAnswerSch
         : { code: 'SOURCE_CAVEAT', message: warning.message };
     }),
     citations: [],
-    answer,
+    ...rendered,
   });
 }

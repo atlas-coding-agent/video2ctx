@@ -2,7 +2,7 @@ import { describe, expect, it } from 'vitest';
 import { blockReferences, renderStructuredAnswer } from '../src/agents/structured-answer';
 import { buildAgentTurnResult } from '../src/agents/finalizer';
 import { compactAgentResult } from '../src/agents/response';
-import { answerCitationIds, mapCitationText } from '../src/agents/markdown-citations';
+import { citedEvidenceIds, rewriteAnswerCitations } from '../src/agents/answer-citations';
 import type { EvidencePacket } from '../src/agents/contracts';
 
 const aliases = new Map(Array.from({ length: 202 }, (_, i) => [`ref_${i + 1}`, `e${i + 1}`]));
@@ -22,14 +22,14 @@ describe('citation regressions from reported sessions', () => {
   });
 
   // Session 1c875330-dac3-4a5b-9acb-0123f23af6dc.
-  it('keeps chess table citations while stripping ranges in surrounding prose', () => {
+  it('uses only declared evidence for chess tables and surrounding prose', () => {
     const text = 'The general rule (ref_4 through ref_7, ref_33, ref_34).\n\n'
       + '| Observation | Source |\n| --- | --- |\n| Pawn moves | (ref_84) |\n\n'
       + 'Narrated examples (ref_62 through ref_65, ref_70, ref_72, ref_73 through ref_75).';
     expect(render(text, ['ref_4']).answer).toBe('The general rule.\n\n'
-      + '| Observation | Source |\n| --- | --- |\n| Pawn moves | [cite:e84] |\n\n'
+      + '| Observation | Source |\n| --- | --- |\n| Pawn moves | |\n\n'
       + 'Narrated examples.\n\nSources: [cite:e4]');
-    expect(blockReferences({ text, evidenceIds: ['ref_4'] }, aliases)).toEqual(['e4', 'e84']);
+    expect(blockReferences({ text, evidenceIds: ['ref_4'] }, aliases)).toEqual(['e4']);
   });
 
   it('persists only array evidence for prose and keeps distinct passages reachable', () => {
@@ -89,18 +89,18 @@ describe('prose annotation removal', () => {
 });
 
 describe('table citation boundaries', () => {
-  it.each(['[cite:ref_4]', '[ref_4]', '(ref_4)', 'ref_4'])('retains explicit cell marker %s', marker => {
+  it.each(['[cite:ref_4]', '[ref_4]', '(ref_4)', 'ref_4'])('strips explicit cell marker %s', marker => {
     const table = `| Claim | Source |\n| --- | --- |\n| Rule | ${marker} |`;
-    expect(render(table).answer).toBe(table.replace(marker, '[cite:e4]'));
-    expect(blockReferences({ text: table, evidenceIds: [] }, aliases)).toEqual(['e4']);
+    expect(render(table, ['ref_1']).answer).toBe(table.replace(`${marker} `, '') + '\n\nSources: [cite:e1]');
+    expect(blockReferences({ text: table, evidenceIds: [] }, aliases)).toEqual([]);
   });
   it('supports tables without outer pipes and with alignment markers', () => {
     const table = 'Claim | Source\n:--- | ---:\nRule | [cite:ref_4]';
-    expect(render(table).answer).toBe(table.replace('[cite:ref_4]', '[cite:e4]'));
+    expect(render(table, ['ref_4']).answer).toBe(table.replace(' [cite:ref_4]', '') + '\n\nSources: [cite:e4]');
   });
   it('appends unplaced references below a table without outer pipes', () => {
     expect(render('Claim | Source\n--- | ---\nRule | [cite:ref_4]', ['ref_5']).answer)
-      .toBe('Claim | Source\n--- | ---\nRule | [cite:e4]\n\nSources: [cite:e5]');
+      .toBe('Claim | Source\n--- | ---\nRule |\n\nSources: [cite:e5]');
   });
   it('does not treat a pipe in prose as a table', () => {
     expect(render('Option A | Option B [cite:ref_4].', ['ref_1']).answer).toBe('Option A | Option B. [cite:e1]');
@@ -118,11 +118,11 @@ describe('table citation boundaries', () => {
 });
 
 describe('PR review regressions', () => {
-  it.each(['> ', '> > ', '- ', '  '])('preserves table citations in Markdown container %s', prefix => {
+  it.each(['> ', '> > ', '- ', '  '])('renders declared block citations for Markdown container %s', prefix => {
     const rows = ['| Claim | Source |', '| --- | --- |', '| A | [cite:ref_1] |', '| B | [cite:ref_2] |'];
     const text = rows.map((row, i) => (prefix === '- ' && i > 0 ? '  ' : prefix) + row).join('\n');
-    expect(render(text).answer).toBe(text.trimStart().replace('[cite:ref_1]', '[cite:e1]').replace('[cite:ref_2]', '[cite:e2]'));
-    expect(blockReferences({ text, evidenceIds: [] }, aliases)).toEqual(['e1', 'e2']);
+    expect(render(text, ['ref_1']).answer).toBe(text.trimStart().replace('[cite:ref_1] ', '').replace('[cite:ref_2] ', '') + '\n\nSources: [cite:e1]');
+    expect(blockReferences({ text, evidenceIds: ['ref_1'] }, aliases)).toEqual(['e1']);
   });
 
   it.each(['[docs](https://example.com)', '`example`'])('retains spacing after %s', literal => {
@@ -134,7 +134,7 @@ describe('PR review regressions', () => {
       .toBe(`See ${literal} [more](https://example.com).`);
   });
 
-  it('persists and displays both quoted-table citations without prose evidence', () => {
+  it('persists and displays declared references below a quoted table', () => {
     const text = '> | Claim | Source |\n> | --- | --- |\n> | A | [cite:ref_1] |\n> | B | [cite:ref_2] |';
     const packet: EvidencePacket = { packetId: 'table-fixture', kind: 'youtube_transcript',
       sources: [{ id: 'source', provider: 'youtube', kind: 'transcript', videoId: 'abcdefghijk' }],
@@ -144,10 +144,10 @@ describe('PR review regressions', () => {
       ], artifacts: [], warnings: [], usage: [] };
     const result = buildAgentTurnResult({ runId: crypto.randomUUID(), conversationId: crypto.randomUUID(),
       userMessageId: crypto.randomUUID(), agentMessageId: crypto.randomUUID() },
-    { userId: 'test', creditsRemaining: 10 }, render(text), [packet], 1);
+    { userId: 'test', creditsRemaining: 10 }, render(text, ['ref_1', 'ref_2']), [packet], 1);
     expect(result.citations.map(c => c.id)).toEqual(['e1', 'e2']);
     expect(compactAgentResult(result, ['evidence']).answer)
-      .toBe(text.replace('[cite:ref_1]', '[1 · 0:01]').replace('[cite:ref_2]', '[1 · 0:03]'));
+      .toBe(text.replace('[cite:ref_1] ', '').replace('[cite:ref_2] ', '') + '\n\nSources: [1 · 0:01][1 · 0:03]');
   });
 
   const first = `evidence:${'a'.repeat(64)}:0`;
@@ -194,17 +194,17 @@ describe('appended citations after unfinished literals', () => {
       'An unfinished example: fn(\n  value,', `An unfinished example: fn([cite:${literal}],`]) {
       const block = { text, evidenceIds: [declared] };
       const input = renderStructuredAnswer({ ...base, intent, blocks: [block] });
-      expect(input.answer).toBe(`${text}\n\nSources: [cite:${declared}]`);
+      expect(input.answer).toBe(`${text} [cite:${declared}]`);
       expect(blockReferences(block)).toEqual([declared]);
-      expect(answerCitationIds(input.answer)).toEqual([declared]);
+      expect(citedEvidenceIds(input)).toEqual([declared]);
       const result = buildAgentTurnResult({ runId: crypto.randomUUID(), conversationId: crypto.randomUUID(),
         userMessageId: crypto.randomUUID(), agentMessageId: crypto.randomUUID() },
       { userId: 'test', creditsRemaining: 10 }, input, [packet], 1);
       expect(result.citations.map(c => c.id)).toEqual([declared]);
       expect(result.warnings).toEqual([]);
-      expect(compactAgentResult(result, ['evidence']).answer).toBe(`${text}\n\nSources: [1 · 0:01]`);
-      expect(mapCitationText(result.answer, prose => prose.replace(`[cite:${declared}]`, '[source deleted]')))
-        .toBe(`${text}\n\nSources: [source deleted]`);
+      expect(compactAgentResult(result, ['evidence']).answer).toBe(`${text} [1 · 0:01]`);
+      expect(rewriteAnswerCitations(result, () => ({ text: '[source deleted]', evidenceIds: [] })).answer)
+        .toBe(`${text} [source deleted]`);
     }
   });
 

@@ -925,6 +925,7 @@ test.each(['context_answer', 'topic_research', 'inspect_video'] as const)('sessi
   const {runtime,runId,userId,conversationId}=await seed(`session-asset-owner-${intent}`,'running');
   let version='';
   let example='';
+  const table='| Finding |\n| --- |\n| Summarized observation |';
   let sharedReference: import('../src/lib/video-catalog').VideoAssetReference;
   await runInDurableObject(runtime,async (instance,state)=>{
     const {SessionEvidenceStore}=await import('../src/agents/runtime/session-evidence');
@@ -938,10 +939,15 @@ test.each(['context_answer', 'topic_research', 'inspect_video'] as const)('sessi
     example = `Example: \`[cite:${packet.excerpts[0]!.id}]\` and "[cite:${packet.excerpts[0]!.id}]".`;
     example = 'A caption. ' + example + ' An unfinished example: fn(';
     const {renderStructuredAnswer}=await import('../src/agents/structured-answer');
-    const input=renderStructuredAnswer({intent,blocks:[{text:example,evidenceIds:[packet.excerpts[0]!.id]}],confidence:'high',artifacts:[],warnings:[]});
+    const input=renderStructuredAnswer({intent,blocks:[{text:example,evidenceIds:[packet.excerpts[0]!.id]},{text:table,evidenceIds:[packet.excerpts[0]!.id]}],confidence:'high',artifacts:[],warnings:[]});
     const saved=await writer.finalizeRun(runId,'finish',input);
     expect(saved.citations.map(citation=>citation.id)).toEqual([packet.excerpts[0]!.id]);
-    expect(saved.answer).toBe(`${example}\n\nSources: [cite:${packet.excerpts[0]!.id}]`);
+    expect(saved.answer).toBe(`${example} [cite:${packet.excerpts[0]!.id}]\n\n${table}\n\nSources: [cite:${packet.excerpts[0]!.id}]`);
+    const reloaded=await instance.getRun(runId);
+    expect(reloaded?.result?.citationGroups).toEqual(saved.citationGroups);
+    expect(saved.citationGroups).toHaveLength(2);
+    const {compactAgentResult}=await import('../src/agents/response');
+    expect(compactAgentResult(reloaded!.result!).answer).toBe(`${example} [1]\n\n${table}\n\nSources: [1]`);
     const {remember}=await import('./fixtures/memory');
     remember(store,runId,[{kind:'finding',topic:'caption',text:'A finding',evidenceIds:[packet.excerpts[0]!.id]}]);
     expect(store.brief().memories).toHaveLength(1);
@@ -959,7 +965,8 @@ test.each(['context_answer', 'topic_research', 'inspect_video'] as const)('sessi
     expect(JSON.stringify(instance.sql`SELECT result_json FROM agent_tool_calls`)).not.toContain('Private captions');
     const run=await instance.getRun(runId);
     expect(run?.result?.citations).toEqual([]);
-    expect(run?.result?.answer).toBe(`${example}\n\nSources: [source deleted]`);
+    expect(run?.result?.answer).toBe(`${example} [source deleted]\n\n${table}\n\nSources: [source deleted]`);
+    expect(run?.result?.citationGroups).toEqual([]);
     const {SessionEvidenceStore}=await import('../src/agents/runtime/session-evidence');
     const store=(instance as unknown as {sessionStore:InstanceType<typeof SessionEvidenceStore>}).sessionStore;
     expect(await store.search.searchHistory('A caption')).toEqual([]);

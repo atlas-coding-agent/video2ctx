@@ -136,13 +136,13 @@ describe('structured answer citations', () => {
     expect(renderPartialAnswer({ blocks: [{ text: `Claim ${marker}` }] })).toBe('Claim');
   });
 
-  it('keeps validated row citations inside a comparison table without leaking evidence IDs', () => {
+  it('places declared comparison-table citations below the block', () => {
     const table='| Test | Result | Source |\n| --- | --- | --- |\n| Coding | Supported result | [cite:ref_1] |';
     const input=renderStructuredAnswer({...base,blocks:[{text:table,evidenceIds:['e1']}]},new Map([['ref_1','e1']]));
     const result=buildAgentTurnResult({runId:crypto.randomUUID(),conversationId:crypto.randomUUID(),userMessageId:crypto.randomUUID(),agentMessageId:crypto.randomUUID()},
       {userId:'test',creditsRemaining:10},input,[packet],1);
     const compact=compactAgentResult(result);
-    expect(compact.answer).toBe(table.replace('[cite:ref_1]','[1]'));
+    expect(compact.answer).toBe(table.replace('[cite:ref_1] ','') + '\n\nSources: [1]');
     expect(compact.sources).toHaveLength(1);
     expect(compact.answer).not.toContain('source marker:');
   });
@@ -156,10 +156,10 @@ describe('structured answer citations', () => {
       { text: `- A supported observation. ${marker}`, evidenceIds: ['e1'] },
     ] }, new Map([['ref_1', 'e1']])).answer).toBe('- A supported observation. [cite:e1]');
   });
-  it('keeps an undeclared inline reference in place for persistence to verify', () => {
+  it('strips undeclared inline table references', () => {
     const table='| Test | Source |\n| --- | --- |\n| Coding | [cite:ref_2] |';
     expect(renderStructuredAnswer({...base,blocks:[{text:table,evidenceIds:['e1']}]},new Map([['ref_2','e2']])).answer)
-      .toBe('| Test | Source |\n| --- | --- |\n| Coding | [cite:e2] |\n\nSources: [cite:e1]');
+      .toBe('| Test | Source |\n| --- | --- |\n| Coding | |\n\nSources: [cite:e1]');
   });
   it.each(['[cite:ref_2]', '(source marker:ref_2]'])('does not borrow prose evidence from another block: %s', marker => {
     expect(renderStructuredAnswer({ ...base, blocks: [
@@ -428,8 +428,8 @@ describe('model-written aliases and passage references', () => {
     expect(compact.evidence?.map(citation => citation.id).sort()).toEqual([...new Set(evidenceIds)].sort());
   });
   it('keeps public source numbers in first-use order across groups', () => {
-    const { compact } = publish('| Passage | Source |\n| --- | --- |\n| Second video first | [cite:b1] |\n| Then | [cite:t4] [cite:t1] |', ['t1']);
-    expect(compact.answer).toBe('| Passage | Source |\n| --- | --- |\n| Second video first | [1 · 0:10] |\n| Then | [2 · 0:10][2 · 0:40] |');
+    const { compact } = publish('| Passage | Source |\n| --- | --- |\n| Second video first | [cite:b1] |\n| Then | [cite:t4] [cite:t1] |', ['b1', 't1', 't4']);
+    expect(compact.answer).toBe('| Passage | Source |\n| --- | --- |\n| Second video first | |\n| Then | |\n\nSources: [1 · 0:10][2 · 0:10][2 · 0:40]');
     expect(compact.sources.map(source => source.videoId)).toEqual(['videoBBBBBB', 'videoAAAAAA']);
   });
   it('records each citation kind from persisted evidence and keeps it out of public evidence', () => {

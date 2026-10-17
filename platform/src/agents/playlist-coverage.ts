@@ -204,13 +204,19 @@ function noticesAreProse(markdown: string, start: number, end: number): boolean 
  * notice inside code, the notices go first.
  */
 export function appendNotices(answer: string, notices: readonly string[]): string {
+  const insertion = answerNoticeInsertion(answer, notices);
+  return insertion ? answer.slice(0, insertion.at) + insertion.text + answer.slice(insertion.at) : answer;
+}
+
+/** The insertion location lets citation metadata follow notice placement without reparsing. */
+export function answerNoticeInsertion(answer: string, notices: readonly string[]): { at: number; text: string } | null {
   const pending = notices.filter(notice => !answer.includes(notice));
-  if (!pending.length) return answer;
+  if (!pending.length) return null;
   const block = pending.join('\n\n');
   const appended = `${answer}\n\n${block}`;
   const root = fromMarkdown(appended);
   const absorbing = absorbingBlock(root, answer.length, appended.length);
-  if (!absorbing) return appended;
+  if (!absorbing) return { at: answer.length, text: `\n\n${block}` };
 
   // The top-level block that holds the absorbing code, from the start of its first line.
   const topLevel = root.children.find(child => (child.position?.start.offset ?? Infinity) <= absorbing.start
@@ -221,6 +227,7 @@ export function appendNotices(answer: string, notices: readonly string[]): strin
   const before = answer.slice(0, lineStart);
   const leading = before ? `${before}${before.endsWith('\n\n') ? '' : '\n'}` : '';
   const placed = `${leading}${block}\n\n${answer.slice(lineStart)}`;
-  if (noticesAreProse(placed, leading.length, leading.length + block.length)) return placed;
-  return `${block}\n\n${answer}`;
+  if (noticesAreProse(placed, leading.length, leading.length + block.length))
+    return { at: lineStart, text: `${leading.slice(before.length)}${block}\n\n` };
+  return { at: 0, text: `${block}\n\n` };
 }

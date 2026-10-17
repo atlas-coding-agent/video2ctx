@@ -447,7 +447,7 @@ it('constrains generated citation IDs to supplied evidence and transmits no memo
   expect(format.schema).not.toHaveProperty('properties.memoryUpdates');
 });
 
-it.each(['generate', 'stream'] as const)('QA 012: %s keeps a misplaced inline citation in place instead of regenerating a comparison', async mode => {
+it.each(['generate', 'stream'] as const)('QA 012: %s uses only declared table evidence without regenerating a comparison', async mode => {
   const { options, classifier, output } = setup('context_answer', true);
   const second: EvidencePacket = { ...evidence, packetId: 'other-frame',
     sources: [{ id: 'other-video', provider: 'youtube', kind: 'video', videoId: 'zzzzzzzzzzz' }],
@@ -485,11 +485,11 @@ it.each(['generate', 'stream'] as const)('QA 012: %s keeps a misplaced inline ci
   expect(options.executeEvidenceTool).not.toHaveBeenCalled();
   const result: AgentTurnResult = await vi.mocked(options.finalize).mock.results[0]!.value;
   const compact = compactAgentResult(result);
-  // The second row cites real evidence its block never declared; it stays where the model put it.
-  expect(compact.answer).toBe(table.replace('[cite:ref_1]', '[1 · 1:00]').replace('[cite:ref_2]', '[2 · 0:30]'));
-  expect(compact.sources.map(source => source.videoId)).toEqual(['zzzzzzzzzzz', 'abcdefghijk']);
+  // Inline table markers cannot introduce evidence missing from the block array.
+  expect(compact.answer).toBe(table.replace('[cite:ref_1] ', '').replace('[cite:ref_2] ', '') + '\n\nSources: [1 · 1:00]');
+  expect(compact.sources.map(source => source.videoId)).toEqual(['zzzzzzzzzzz']);
   expect(result.citations.map(citation => [citation.id, citation.startMs])).toEqual([
-    ['other-observation', 60000], ['frame-observation', 30000],
+    ['other-observation', 60000],
   ]);
   expect(result.answer).not.toContain('[source unavailable]');
 });
