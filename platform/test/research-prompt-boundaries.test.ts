@@ -22,6 +22,9 @@ describe('research and answer responsibilities', () => {
   }
   it.each(['inspect_video', 'topic_research'] as const)('keeps answer guidance in the %s finalizer', route => {
     expect(finalizationAnswerGuidance(route)).toContain('For a detailed report, use compact sections');
+    expect(finalizationAnswerGuidance(route)).toContain('Prefer short bullet points for distinct takeaways');
+    expect(finalizationAnswerGuidance(route)).toContain('This is a preference, not a required template');
+    expect(finalizationAnswerGuidance(route)).toContain('Markdown list markers and table syntax are allowed');
   });
   it('teaches every answer path to replace the YC research preamble with useful content', () => {
     const answerPrompts = [
