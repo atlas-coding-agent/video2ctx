@@ -107,10 +107,19 @@ export function renderPartialAnswer(value: { blocks?: Array<{ text?: string } | 
   }).filter(Boolean).join('\n\n').slice(0, 20_000);
 }
 
-/** Existing bracketed alias groups. Their behavior is unchanged. */
+/** Legacy bracketed aliases use the same literal/link protection as the range pass.
+ * Scan the whole block so quotes and calls spanning Markdown chunks stay protected. */
 function normalizeBareReferences(text: string): string {
-  return text.replace(/\[\s*(ref_\d+(?:\s*,\s*ref_\d+)*)\s*\]|【\s*(ref_\d+(?:\s*,\s*ref_\d+)*)\s*】/g,
-    (_marker, square: string | undefined, wide: string | undefined) => `[cite:${square ?? wide}]`);
+  const prose: Array<[number, number]> = [];
+  mapCitationProse(text, (chunk, from, to) => { prose.push([from, to]); return chunk; }, false, LINK_NODES);
+  const literals = literalSpans(text, prose);
+  return mapCitationProse(text, (chunk, proseStart) => chunk.replace(
+    /\[\s*(ref_\d+(?:\s*,\s*ref_\d+)*)\s*\]|【\s*(ref_\d+(?:\s*,\s*ref_\d+)*)\s*】/g,
+    (marker: string, square: string | undefined, wide: string | undefined, offset: number) => {
+      const start = proseStart + offset;
+      if (literals.some(([from, to]) => start < to && start + marker.length > from)) return marker;
+      return `[cite:${square ?? wide}]`;
+    }), false, LINK_NODES);
 }
 
 const ALIAS = String.raw`ref_\d+`;
@@ -231,8 +240,8 @@ function markerReferences(raw: string, aliases: ReadonlyMap<string, string>): st
  * figure and coverage checks use this same set, so they judge what the reader sees. */
 export function blockReferences(block: { text: string; evidenceIds: readonly string[] }, aliases: ReadonlyMap<string, string> = new Map()): string[] {
   const inline: string[] = [];
-  mapCitationProse(resolveAliasForms(block.text, aliases), prose => {
-    inline.push(...[...normalizeBareReferences(prose).matchAll(INLINE_MARKER)]
+  mapCitationProse(normalizeBareReferences(resolveAliasForms(block.text, aliases)), prose => {
+    inline.push(...[...prose.matchAll(INLINE_MARKER)]
       .flatMap(([, inlineId, escapedId]) => markerReferences((inlineId ?? escapedId)!, aliases)));
     return prose;
   });
@@ -251,7 +260,7 @@ export function renderStructuredAnswer(value: z.infer<typeof structuredAnswerSch
     // Inline references stay where the model placed them, even when the block did not
     // declare them; persisted evidence validation decides whether each one resolves.
     // A marker with no usable reference is shown as unavailable rather than dropped.
-    const text = mapCitationProse(resolveAliasForms(block.text, aliases), prose => normalizeBareReferences(prose)
+    const text = mapCitationProse(normalizeBareReferences(resolveAliasForms(block.text, aliases)), prose => prose
       .replace(INLINE_MARKER, (_marker, inlineId: string | undefined, escapedId: string | undefined) => {
         const ids = markerReferences((inlineId ?? escapedId)!, aliases);
         if (!ids.length) return '[source unavailable]';
