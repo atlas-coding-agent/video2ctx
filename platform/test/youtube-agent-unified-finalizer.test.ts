@@ -1940,3 +1940,21 @@ it.each(['generate', 'stream'] as const)('%s resolves a range using supplied ali
   expect(result.citations.map(c => c.id)).toEqual(['other-observation', 'frame-observation']);
   expect(compactAgentResult(result).answer).toBe('A rabbit and an interview [1 · 1:00][2 · 0:30].');
 });
+
+it('sends inline prose guidance and supplied-ID constraints to the finalizer', async () => {
+  const { options, finalizer, output } = setup('context_answer', true);
+  output.blocks[0]!.text = 'The woman holds the microphone [cite:ref_1].';
+  await executeResearchRun(options);
+  const call = finalizer.doGenerateCalls[0]!;
+  const prompt = JSON.stringify(call.prompt);
+  expect(prompt).toContain('beside the claim it supports in prose');
+  expect(prompt).toContain('share one natural paragraph');
+  expect(prompt).toContain('include every cited ID in the block evidenceIds array');
+  expect(prompt).not.toContain('Outside tables, omit inline citation markers');
+  expect(prompt).not.toContain('Put prose citations only in evidenceIds');
+  expect(JSON.stringify(call.responseFormat)).toContain('ref_1');
+  expect(JSON.stringify(call.responseFormat)).toContain('List individual supplied evidence IDs');
+  expect(options.finalize).toHaveBeenCalledWith(expect.any(String), expect.objectContaining({
+    answer: 'The woman holds the microphone [cite:frame-observation].',
+  }));
+});

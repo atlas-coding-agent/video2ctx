@@ -11,10 +11,11 @@ const fields = finalizeAnswerInputSchema.omit({ answer: true, citations: true, i
     unansweredPart: z.string().max(400).optional().describe('Required to mark ANSWER_SCOPE_SHORTFALL as partial: identify the specific requested item, count, or question that this answer leaves unanswered. Do not list a source limitation or an extra requirement the user did not ask for. Omit for SOURCE_CAVEAT. Without a nonblank unansweredPart the warning remains a source caveat.'),
   })).max(3).default([]).describe('At most three distinct, material limitations. The application already returns warnings from the evidence packets. Do not repeat inherited warnings, summarize the answer, or discuss generating the response.'),
 });
+export const ANSWER_CITATION_GUIDANCE = 'Place [cite:ref_N] beside the claim it supports in prose, or in Markdown table Source cells. Use only supplied evidence IDs, and include every cited ID in the block evidenceIds array. Related claims with different sources can share one natural paragraph, with a citation beside each claim. For example: "The query stays live [cite:ref_1]. Moving a card updates other users [cite:ref_2]." Use that example only when supported by the supplied evidence, with evidenceIds ["ref_1", "ref_2"]. List each ID separately in evidenceIds, without ranges or duplicates. Never write reference ranges or bare aliases as citations. The application renders inline markers as source links and appends any evidenceIds not placed inline.';
 const block = z.object({
   // The SDK bounds generation tokens and the rendered contract bounds total
   // characters. A decoding limit on each paragraph can split words at its edge.
-  text: z.string().min(1).regex(/\S/, 'A block must contain non-whitespace text.').describe('One complete paragraph, list item, or Markdown table. Finish the table within this block. End prose at a natural sentence boundary; never continue a sentence in the next block. Put prose citations in evidenceIds, not in text: the application appends the links. For Markdown tables only, use [cite:ref_N] in Source cells and include those IDs in evidenceIds. Never write bare aliases or reference ranges as citations.'),
+  text: z.string().min(1).regex(/\S/, 'A block must contain non-whitespace text.').describe(`One complete paragraph, list item, or Markdown table. Finish the table within this block. End prose at a natural sentence boundary; never continue a sentence in the next block. ${ANSWER_CITATION_GUIDANCE}`),
   evidenceIds: z.array(z.string().regex(/^[A-Za-z0-9:_-]+$/).max(300)).min(1).max(12).describe('Individual supplied evidence IDs supporting this block. List each ID separately, without ranges or duplicates. The application renders these as citations.'),
 });
 // Executable routes require references in the transmitted JSON schema itself.
@@ -40,7 +41,7 @@ export const contextAnswerSchema = fields.extend({
 export const finalizationOutputSchema = structuredAnswerSchema.omit({ intent: true, artifacts: true });
 export const contextFinalizationOutputSchema = contextAnswerSchema.omit({ intent: true, artifacts: true });
 export const conversationalFinalizationOutputSchema = clarificationAnswerSchema.omit({ intent: true, artifacts: true });
-export const FINALIZATION_SCHEMA_VERSION = 'answer-blocks-v4';
+export const FINALIZATION_SCHEMA_VERSION = 'answer-blocks-v5';
 
 /** Log-only signal. A count mismatch never rejects an answer. */
 export function numberedItemsMismatch(output: Pick<z.infer<typeof finalizationOutputSchema>, 'blocks' | 'warnings'>, expected: number | undefined): boolean {
