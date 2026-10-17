@@ -2,6 +2,7 @@ import { describe, expect, it } from 'vitest';
 import { blockReferences, renderStructuredAnswer } from '../src/agents/structured-answer';
 import { buildAgentTurnResult } from '../src/agents/finalizer';
 import { compactAgentResult } from '../src/agents/response';
+import { answerCitationIds, mapCitationText } from '../src/agents/markdown-citations';
 import type { EvidencePacket } from '../src/agents/contracts';
 
 const aliases = new Map(Array.from({ length: 202 }, (_, i) => [`ref_${i + 1}`, `e${i + 1}`]));
@@ -175,5 +176,40 @@ describe('PR review regressions', () => {
       expect(result.warnings).toEqual([]);
       expect(compactAgentResult(result, ['evidence']).answer).toBe(`${text} [1 · 0:01]`);
     }
+  });
+});
+
+
+describe('appended citations after unfinished literals', () => {
+  const declared = `evidence:${'a'.repeat(64)}:0`;
+  const literal = `evidence:${'b'.repeat(64)}:1`;
+  it.each(['context_answer', 'topic_research', 'inspect_video'] as const)('discovers, saves and displays declared evidence for %s', intent => {
+    const packet: EvidencePacket = { packetId: 'unfinished-call', kind: 'youtube_transcript',
+      sources: [{ id: 'source', provider: 'youtube', kind: 'transcript', videoId: 'abcdefghijk' }],
+      excerpts: [
+        { id: declared, sourceId: 'source', text: 'Declared evidence', startMs: 1000, endMs: 2000 },
+        { id: literal, sourceId: 'source', text: 'Literal example', startMs: 3000, endMs: 4000 },
+      ], artifacts: [], warnings: [], usage: [] };
+    for (const text of ['An unfinished example: fn(', 'An unfinished example: outer(inner(value),',
+      'An unfinished example: fn(\n  value,', `An unfinished example: fn([cite:${literal}],`]) {
+      const block = { text, evidenceIds: [declared] };
+      const input = renderStructuredAnswer({ ...base, intent, blocks: [block] });
+      expect(input.answer).toBe(`${text}\n\nSources: [cite:${declared}]`);
+      expect(blockReferences(block)).toEqual([declared]);
+      expect(answerCitationIds(input.answer)).toEqual([declared]);
+      const result = buildAgentTurnResult({ runId: crypto.randomUUID(), conversationId: crypto.randomUUID(),
+        userMessageId: crypto.randomUUID(), agentMessageId: crypto.randomUUID() },
+      { userId: 'test', creditsRemaining: 10 }, input, [packet], 1);
+      expect(result.citations.map(c => c.id)).toEqual([declared]);
+      expect(result.warnings).toEqual([]);
+      expect(compactAgentResult(result, ['evidence']).answer).toBe(`${text}\n\nSources: [1 · 0:01]`);
+      expect(mapCitationText(result.answer, prose => prose.replace(`[cite:${declared}]`, '[source deleted]')))
+        .toBe(`${text}\n\nSources: [source deleted]`);
+    }
+  });
+
+  it('keeps closed calls inline and leaves undeclared unfinished examples alone', () => {
+    expect(render('Example: fn(value)', ['ref_1']).answer).toBe('Example: fn(value) [cite:e1]');
+    expect(render('Example: fn(').answer).toBe('Example: fn(');
   });
 });

@@ -921,8 +921,8 @@ test('an exhausted transcript can be requested in another run', async () => {
   });
 });
 
-test('session assets enforce ownership and deletion removes run copies, citations and memory', async()=> {
-  const {runtime,runId,userId,conversationId}=await seed('session-asset-owner','running');
+test.each(['context_answer', 'topic_research', 'inspect_video'] as const)('session assets enforce ownership and deletion removes run copies, citations and memory (%s)', async(intent)=> {
+  const {runtime,runId,userId,conversationId}=await seed(`session-asset-owner-${intent}`,'running');
   let version='';
   let example='';
   let sharedReference: import('../src/lib/video-catalog').VideoAssetReference;
@@ -934,9 +934,14 @@ test('session assets enforce ownership and deletion removes run copies, citation
     sharedReference=JSON.parse(state.storage.sql.exec<{reference_json:string}>('SELECT reference_json FROM session_asset_catalog_refs WHERE version=?',version).one().reference_json).asset;
     const writer=instance as unknown as {performEvidenceTool(runId:string,execution:EvidenceToolExecution):Promise<EvidencePacket>;finalizeRun(runId:string,toolId:string,input:FinalizeAnswerInput):Promise<AgentTurnResult>};
     const packet=await writer.performEvidenceTool(runId,{toolCallId:'transcript',toolName:'get_video_transcript',semanticKey:'transcript',operation:'transcript',input:{videoId:'abcdefghijk'},execute:async()=>({packetId:'stored-private',kind:'youtube_transcript',assetVersions:[version],sources:[{id:'source',provider:'youtube',kind:'transcript',videoId:'abcdefghijk'}],excerpts:[{id:'legacy',sourceId:'source',text:'Private captions'}],artifacts:[],warnings:[],usage:[]})});
-    instance.sql`INSERT INTO agent_routes VALUES (${runId},${JSON.stringify({route:'finalize',responseIntent:'context_answer',reason:'Stored evidence'})},0)`;
+    instance.sql`INSERT INTO agent_routes VALUES (${runId},${JSON.stringify(intent === 'context_answer' ? {route:'finalize',responseIntent:intent,reason:'Stored evidence'} : intent === 'inspect_video' ? {route:intent,videoId:'abcdefghijk',useStoryboard:false} : {route:intent})},0)`;
     example = `Example: \`[cite:${packet.excerpts[0]!.id}]\` and "[cite:${packet.excerpts[0]!.id}]".`;
-    await writer.finalizeRun(runId,'finish',{intent:'context_answer',answer:`A caption [cite:${packet.excerpts[0]!.id}] ${example}`,confidence:'high',citations:[],artifacts:[],warnings:[]});
+    example = 'A caption. ' + example + ' An unfinished example: fn(';
+    const {renderStructuredAnswer}=await import('../src/agents/structured-answer');
+    const input=renderStructuredAnswer({intent,blocks:[{text:example,evidenceIds:[packet.excerpts[0]!.id]}],confidence:'high',artifacts:[],warnings:[]});
+    const saved=await writer.finalizeRun(runId,'finish',input);
+    expect(saved.citations.map(citation=>citation.id)).toEqual([packet.excerpts[0]!.id]);
+    expect(saved.answer).toBe(`${example}\n\nSources: [cite:${packet.excerpts[0]!.id}]`);
     const {remember}=await import('./fixtures/memory');
     remember(store,runId,[{kind:'finding',topic:'caption',text:'A finding',evidenceIds:[packet.excerpts[0]!.id]}]);
     expect(store.brief().memories).toHaveLength(1);
@@ -954,7 +959,7 @@ test('session assets enforce ownership and deletion removes run copies, citation
     expect(JSON.stringify(instance.sql`SELECT result_json FROM agent_tool_calls`)).not.toContain('Private captions');
     const run=await instance.getRun(runId);
     expect(run?.result?.citations).toEqual([]);
-    expect(run?.result?.answer).toBe(`A caption [source deleted] ${example}`);
+    expect(run?.result?.answer).toBe(`${example}\n\nSources: [source deleted]`);
     const {SessionEvidenceStore}=await import('../src/agents/runtime/session-evidence');
     const store=(instance as unknown as {sessionStore:InstanceType<typeof SessionEvidenceStore>}).sessionStore;
     expect(await store.search.searchHistory('A caption')).toEqual([]);

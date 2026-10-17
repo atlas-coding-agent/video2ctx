@@ -1,4 +1,4 @@
-import { endsInCodeBlock, mapCitationProse, trimCitationProse, LINK_NODES, literalSpans, tableRanges } from './markdown-citations';
+import { answerCitationIds, endsInCodeBlock, mapCitationProse, trimCitationProse, LINK_NODES, literalSpans, tableRanges } from './markdown-citations';
 import { parsePartialJson } from 'ai';
 import { z } from 'zod';
 import { finalizeAnswerInputSchema, type FinalizeAnswerInput } from './contracts';
@@ -197,11 +197,19 @@ export function renderStructuredAnswer(value: z.infer<typeof structuredAnswerSch
       for (const id of ids) placed.add(id);
       return ids.map(id => `[cite:${id}]`).join(' ');
     });
-    const remaining = [...declared].filter(id => !placed.has(id)).map(id => `[cite:${id}]`).join(' ');
+    const remainingIds = [...declared].filter(id => !placed.has(id));
+    const remaining = remainingIds.map(id => `[cite:${id}]`).join(' ');
     // Appending text to the final table row would create an extra cell.
     if (remaining && endsInCodeBlock(text)) return `Sources: ${remaining}\n\n${text}`;
     const separator = tableRanges(text).length ? '\n\nSources: ' : ' ';
-    return trimCitationProse(remaining ? `${text}${separator}${remaining}` : text);
+    const answer = remaining ? `${text}${separator}${remaining}` : text;
+    // An unfinished literal call can consume the appended markers. Use the same
+    // discovery rules as persistence, then end that paragraph before our sources.
+    const discoverable = new Set(answerCitationIds(answer));
+    if (remainingIds.some(id => !discoverable.has(id))) {
+      return trimCitationProse(`${text}\n\nSources: ${remaining}`);
+    }
+    return trimCitationProse(answer);
   }).join('\n\n');
   return finalizeAnswerInputSchema.parse({
     intent: input.intent,
