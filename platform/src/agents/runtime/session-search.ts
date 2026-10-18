@@ -161,10 +161,16 @@ export class SessionSearch {
     if (!tokens.length) return [];
     // Exclusions apply before the limit, so excluded rows can never fill the top 20.
     const excluded = excludedOwners.length ? ` AND owner NOT IN (${excludedOwners.map(() => '?').join(',')})` : '';
+    // A comment packet repeats entries of its saved page. Once that page is indexed, its rows
+    // represent every comment, so the packet copies must not take result slots before the limit.
+    // Packets whose page is not indexed, such as unreadable legacy pages, stay searchable.
+    const duplicates = scope === 'evidence' ? ` AND NOT EXISTS (SELECT 1 FROM session_packets p
+      WHERE owner='packet:' || p.packet_id AND json_extract(p.packet_json,'$.kind')='youtube_comments'
+      AND EXISTS (SELECT 1 FROM json_each(p.versions_json) v WHERE v.value IN (SELECT version FROM session_search_assets)))` : '';
     return this.sql
       .exec<SearchRow>(
         `SELECT id,owner,content,metadata FROM session_context_fts
-      WHERE session_context_fts MATCH ? AND scope=?${excluded} ORDER BY rank LIMIT 20`,
+      WHERE session_context_fts MATCH ? AND scope=?${excluded}${duplicates} ORDER BY rank LIMIT 20`,
         tokens.map((t) => `"${t}"`).join(' AND '),
         scope,
         ...excludedOwners,
@@ -186,12 +192,14 @@ export class SessionSearch {
     // Long transcripts indexed before the length limit existed are left out of the query itself.
     // Their index rows stay, so raising the limit makes them searchable again without reindexing.
     const excluded = store.overLimitTranscriptVersions().map((version) => `asset:${version}`);
+    // One parsed page and asset record per version for this search; availability is rechecked per hit.
+    const pages = store.commentPageCache();
     for (const row of this.matches('evidence', query, excluded)) {
       if (seen.has(row.id)) continue;
       const metadata = JSON.parse(row.metadata) as { version?: string; offset?: number; packetId?: string; kind?: string };
       if (metadata.kind === 'comments' && metadata.version) {
         // A comment hit is shown around the matched terms, which may lie past one excerpt's length.
-        const found = store.has(metadata.version) ? (await store.readSavedComment(metadata.version, metadata.offset ?? 0, queryTokens(query))).packets : [];
+        const found = store.has(metadata.version) ? (await store.readSavedComment(metadata.version, metadata.offset ?? 0, queryTokens(query), pages)).packets : [];
         const excerpt = found[0]?.excerpts[0];
         if (found[0] && excerpt) {
           packets.push({ ...found[0], packetId: `search:${excerpt.id}`, excerpts: [excerpt], artifacts: [] });

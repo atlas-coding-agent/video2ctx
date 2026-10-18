@@ -1149,3 +1149,82 @@ test('versioned shared observations keep resolvable references, and search keeps
       expect(hit.warnings.map(warning => warning.code)).toContain('LEGACY_VISUAL_PROVENANCE');
     }
   }));
+
+function commentPage(count: number, text: (index: number) => string) {
+  return { videoId: id, totalCount: count, replyContinuations: [], meta: transcript().meta,
+    comments: Array.from({ length: count }, (_, index) => ({ id: `c${index + 1}`, author: { name: `Viewer ${index + 1}`, thumbnails: [] },
+      text: text(index), isPinned: false, isHearted: false, replies: [] })) };
+}
+
+/** The first eight-comment packet a get_video_comments read saves for this page. */
+function firstCommentPacket(version: string, page: ReturnType<typeof commentPage>): EvidencePacket {
+  const sourceId = `youtube:${id}:comments`;
+  return { packetId: 'packet:run:comments', kind: 'youtube_comments', assetVersions: [version],
+    sources: [{ id: sourceId, provider: 'youtube', kind: 'comments', videoId: id }],
+    excerpts: page.comments.slice(0, 8).map((comment, index) => ({ id: `comment:${comment.id}:${index}`, sourceId,
+      text: `${comment.text}\nAuthor: ${comment.author.name}` })),
+    artifacts: [{ type: 'youtube_comments', data: {} }], warnings: [], usage: [] };
+}
+
+test('comment search returns distinct comments, not packet copies of an indexed page', async () =>
+  within('comment-search-dedup', async (store, reopen) => {
+    const page = commentPage(30, index => `Brush review ${index + 1}. ${'Detail. '.repeat(500)}`);
+    const p = provider();
+    p.comments = vi.fn(async () => ({ cacheStatus: 'miss' as const, value: page }));
+    const version = (await sessionProvider(p, store).comments(id)).assetVersions![0]!;
+    store.savePacket(firstCommentPacket(version, page));
+    const found = await reopen().search.searchEvidence(reopen(), 'brush review');
+    expect(found.packets).toHaveLength(20);
+    const positions = found.packets.map(packet => packet.excerpts[0]!.id.match(new RegExp(`^evidence:${version}:(\\d+)`))?.[1]);
+    expect(positions.every(Boolean)).toBe(true);
+    expect(new Set(positions).size).toBe(20);
+    // Packet citations still resolve for answers that cited them.
+    expect(reopen().evidenceForCitations(['comment:c1:0'])).toHaveLength(1);
+  }));
+
+test('a legacy comment packet stays searchable when its saved page cannot be indexed', async () =>
+  within('comment-search-legacy', async (store, reopen, sql) => {
+    const page = commentPage(10, index => `Legacy opinion ${index + 1}`);
+    const p = provider();
+    p.comments = vi.fn(async () => ({ cacheStatus: 'miss' as const, value: page }));
+    const version = (await sessionProvider(p, store).comments(id)).assetVersions![0]!;
+    store.savePacket(firstCommentPacket(version, page));
+    // The page blob is unreadable, so the page is never indexed and only the packet rows remain.
+    const blob = sql.exec<{ blob_key: string }>('SELECT blob_key FROM session_assets WHERE version=?', version).one().blob_key;
+    await env.RESEARCH.delete(blob);
+    const found = await reopen().search.searchEvidence(reopen(), 'legacy opinion');
+    expect(found.packets.map(packet => packet.excerpts[0]!.id).sort()).toEqual(
+      Array.from({ length: 8 }, (_, index) => `comment:c${index + 1}:${index}`).sort());
+  }));
+
+test('one search reads and parses each saved comment page once', async () =>
+  within('comment-search-cache', async (store) => {
+    const page = commentPage(20, index => `Palette note ${index + 1}`);
+    const p = provider();
+    p.comments = vi.fn(async () => ({ cacheStatus: 'miss' as const, value: page }));
+    await sessionProvider(p, store).comments(id);
+    await store.ensureSearchIndexed();
+    const read = vi.spyOn(store, 'read');
+    const brief = vi.spyOn(store, 'brief');
+    const found = await store.search.searchEvidence(store, 'palette note');
+    expect(found.packets).toHaveLength(20);
+    expect(read).toHaveBeenCalledTimes(1);
+    expect(brief).toHaveBeenCalledTimes(1);
+    // A new search after deletion never serves the page from an earlier cache.
+    const version = found.packets[0]!.assetVersions![0]!;
+    await store.delete(version);
+    expect((await store.search.searchEvidence(store, 'palette note')).packets).toEqual([]);
+  }));
+
+test('an unfiltered saved comment read names its page version for continuation', async () =>
+  within('comment-saved-read-version', async (store) => {
+    const page = commentPage(14, index => `Opinion ${index + 1}`);
+    const p = provider();
+    p.comments = vi.fn(async () => ({ cacheStatus: 'miss' as const, value: page }));
+    const version = (await sessionProvider(p, store).comments(id)).assetVersions![0]!;
+    const first = await store.readEvidence(version);
+    expect(first.packets[0]!.artifacts[0]!.data.collection).toMatchObject({ nextPageOffset: 8, pageVersion: version });
+    const filtered = await store.readEvidence(version, 0, 'opinion 1');
+    expect(filtered.packets[0]!.artifacts[0]!.data.collection).toMatchObject({ matchesOnly: true });
+    expect(filtered.packets[0]!.artifacts[0]!.data.collection).not.toHaveProperty('pageVersion');
+  }));

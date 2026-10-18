@@ -131,7 +131,8 @@ export function executeGetVideoComments(
           ...(remaining > 0 ? [{
             code: 'COMMENT_PAGE_REMAINING',
             message: nextOffset !== undefined
-              ? `This read holds comments ${slice.start + 1} to ${slice.start + slice.page.length} of ${value.comments.length} on the saved provider page. Read offset ${nextOffset} with pageVersion ${savedVersion} and the same continuation for the rest; do not describe unread comments.`
+              // How to read the rest is stated once, in the packet's collection coverage and nextOffset.
+              ? `This read holds comments ${slice.start + 1} to ${slice.start + slice.page.length} of ${value.comments.length} on the saved provider page. The rest were not read in this packet.`
               : `This read holds comments ${slice.start + 1} to ${slice.start + slice.page.length} of ${value.comments.length} on the provider page. The page was not saved, so the other ${remaining} cannot be read without fetching it again; do not describe them.`,
           }] : []),
         ],
@@ -173,15 +174,61 @@ export function commentPassage(comment: Comment, terms: readonly string[] = []):
   const body = normalizeCommentText(comment.text ?? '');
   const budget = COMMENT_EXCERPT_CHARACTERS - attribution.length - 1;
   if (body.length <= budget) return { text: body ? `${body}\n${attribution}` : attribution };
-  const lower = body.toLowerCase();
-  const match = terms.map(term => ({ term, at: lower.indexOf(term.toLowerCase()) }))
-    .filter(item => item.term && item.at >= 0).sort((a, b) => a.at - b.at)[0];
-  if (!match || match.at + match.term.length <= budget - 1)
+  const match = earliestTokenMatch(body, terms);
+  if (!match || match.end <= budget - 1)
     return { text: `${body.slice(0, budget - 1)}…\n${attribution}` };
   // Start just before the match, so a later shortening of the passage keeps the match.
   const start = Math.max(0, match.at - PASSAGE_LEAD_CHARACTERS);
   const end = Math.min(body.length, start + budget - 2);
   return { text: `…${body.slice(start, end)}${end < body.length ? '…' : ''}\n${attribution}`, start };
+}
+
+/** Characters the search tokenizer keeps inside a token: letters and numbers, with their marks. */
+const TOKEN_CHARACTER = /[\p{L}\p{N}\p{M}]/u;
+
+/**
+ * Lowercased text without diacritics, with each folded character mapped to its original
+ * index. This mirrors the session search tokenizer (SQLite FTS5 unicode61, which removes
+ * diacritics by default), so "cafe" finds "café".
+ */
+function foldedText(text: string): { folded: string; origin: number[] } {
+  let folded = '';
+  const origin: number[] = [];
+  for (let index = 0; index < text.length;) {
+    const point = text.codePointAt(index)!;
+    const character = String.fromCodePoint(point);
+    for (const part of character.normalize('NFKD').replace(/\p{M}/gu, '').toLowerCase()) {
+      folded += part;
+      for (let unit = 0; unit < part.length; unit += 1) origin.push(index);
+    }
+    index += character.length;
+  }
+  return { folded, origin };
+}
+
+/**
+ * The earliest whole-token occurrence of any search term, in original-text offsets. A term
+ * inside a longer word, such as "art" in "start", is not a match, as in session search.
+ */
+export function earliestTokenMatch(text: string, terms: readonly string[]): { at: number; end: number } | undefined {
+  const { folded, origin } = foldedText(text);
+  let best: { at: number; end: number } | undefined;
+  for (const term of terms) {
+    const needle = foldedText(term).folded.trim();
+    if (!needle) continue;
+    for (let offset = folded.indexOf(needle); offset >= 0; offset = folded.indexOf(needle, offset + 1)) {
+      const before = folded[offset - 1];
+      const after = folded[offset + needle.length];
+      if ((before && TOKEN_CHARACTER.test(before)) || (after && TOKEN_CHARACTER.test(after))) continue;
+      const at = origin[offset]!;
+      // The end is the original index just after the last folded character of the match.
+      const last = origin[offset + needle.length - 1]!;
+      const end = last + String.fromCodePoint(text.codePointAt(last)!).length;
+      if (!best || at < best.at) best = { at, end };
+      break;
+    }
+  }
+  return best;
 }
 
 /** Full searchable comment content: the whole body and the author, never a shortened excerpt. */

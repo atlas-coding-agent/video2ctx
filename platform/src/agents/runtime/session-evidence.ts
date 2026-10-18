@@ -551,21 +551,38 @@ export class SessionEvidenceStore implements SessionAccess {
         savedPageCount: comments.length,
         ...(query ? { matchingCount: positions.length } : {}),
         ...(slice.nextOffset !== undefined ? { nextOffset: slice.nextOffset } : {}),
-        // Counts describe the matching entries when a query filters the saved page.
+        // With a query, counts and offsets count matching entries, not saved-page positions.
+        // Without one they are page positions, readable from this exact version.
         collection: collectionRetrieval({ fetchedCount: positions.length, retainedCount: slice.page.length,
-          continuationAccepted: true, pageOffset: slice.start, nextPageOffset: slice.nextOffset }),
+          continuationAccepted: true, pageOffset: slice.start, nextPageOffset: slice.nextOffset,
+          ...(needle ? { matchesOnly: true } : { pageVersion: slice.nextOffset !== undefined ? asset.version : undefined }) }),
       });
     this.savePacket(packet);
     return { packets: [packet], nextOffset: slice.nextOffset };
   }
+  /**
+   * A per-search cache of saved comment pages. Versions are immutable, so a parsed page can
+   * be reused within one search; readSavedComment still rejects a version deleted meanwhile.
+   */
+  commentPageCache(): CommentPageCache {
+    return { generation: this.generation(), pages: new Map() };
+  }
   /** One saved comment for a search hit, shown around the earliest matching term. */
-  async readSavedComment(version: string, position: number, terms: readonly string[]) {
-    const asset = this.brief().assets.find((item) => item.version === version);
-    if (asset?.kind !== 'comments') throw new Error('Session asset is unavailable or deleted.');
-    const comment = (await this.savedCommentPage(asset))[position];
+  async readSavedComment(version: string, position: number, terms: readonly string[], cache?: CommentPageCache) {
+    const cached = cache && cache.generation === this.generation() ? cache.pages.get(version) : undefined;
+    const loaded = cached ?? (async () => {
+      const asset = this.brief().assets.find((item) => item.version === version);
+      if (asset?.kind !== 'comments') throw new Error('Session asset is unavailable or deleted.');
+      return { asset, comments: await this.savedCommentPage(asset), current: this.currentVersions().has(version) };
+    })();
+    if (!cached && cache && cache.generation === this.generation()) cache.pages.set(version, loaded);
+    const page = await loaded;
+    // Deletion advances the generation and removes the asset; never serve a deleted page from memory.
+    if (!this.has(version) || (cache && cache.generation !== this.generation())) throw new Error('Session asset is unavailable or deleted.');
+    const comment = page.comments[position];
     if (!comment) return { packets: [] };
-    const packet = await this.commentPacket(asset, [{ comment, position }], terms,
-      `session:${version}:comment:${position}:${await sha256(terms.join(' '))}`, { savedPageCount: 1 });
+    const packet = await this.commentPacket(page.asset, [{ comment, position }], terms,
+      `session:${version}:comment:${position}:${await sha256(terms.join(' '))}`, { savedPageCount: 1 }, page.current);
     this.savePacket(packet);
     return { packets: [packet] };
   }
@@ -576,7 +593,7 @@ export class SessionEvidenceStore implements SessionAccess {
     return comments;
   }
   private async commentPacket(asset: SessionAsset, entries: Array<{ comment: Comment; position: number }>, terms: readonly string[],
-    packetId: string, data: Record<string, unknown>) {
+    packetId: string, data: Record<string, unknown>, current = this.currentVersions().has(asset.version)) {
     const sourceId = `youtube:${asset.videoId}:comments`;
     return evidencePacketSchema.parse({
       packetId,
@@ -591,7 +608,7 @@ export class SessionEvidenceStore implements SessionAccess {
         return { id: `evidence:${asset.version}:${position}${passage.start === undefined ? '' : `:${passage.start}`}`, sourceId, text: passage.text };
       }),
       artifacts: [{ type: 'youtube_comments', title: `Saved comments for ${asset.videoId}`, data: { returnedCount: entries.length, ...data } }],
-      warnings: this.currentVersions().has(asset.version) ? [] : [{ code: 'SUPERSEDED_SESSION_EVIDENCE',
+      warnings: current ? [] : [{ code: 'SUPERSEDED_SESSION_EVIDENCE',
         message: 'This evidence refers to an older stored comment page. Use the current version for current facts.' }],
       usage: [],
     });
@@ -924,6 +941,12 @@ export async function versionEvidencePacket(packet: EvidencePacket): Promise<Evi
           : shared);
   }
   return result;
+}
+
+/** Saved comment pages loaded during one search, valid only for the generation they were read in. */
+export interface CommentPageCache {
+  generation: number;
+  pages: Map<string, Promise<{ asset: SessionAsset; comments: Comment[]; current: boolean }>>;
 }
 
 /** Comments of a saved provider page, or undefined for an unexpected payload. */
