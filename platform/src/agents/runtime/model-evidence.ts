@@ -54,6 +54,11 @@ const transcriptAnalysisDataSchema = z.object({
   selectedExcerptCount: z.number().int().nonnegative(),
 });
 
+// Analysts receive the full description. Their supported entities and quotes
+// carry its relevant facts forward; the citable metadata packet retains the text.
+// Repeating it in every analysis can displace completed findings under a budget.
+const modelTranscriptSourceContextSchema = transcriptSourceContextSchema.omit({ description: true });
+
 export const modelEvidencePacketSchema = z.object({
   packetId: z.string().min(1).max(300),
   kind: z.string().min(1).max(100),
@@ -61,7 +66,7 @@ export const modelEvidencePacketSchema = z.object({
   sources: z.array(evidenceSourceSchema).max(24),
   transcriptAnalysis: z.object({
     groundingVersion: z.literal(1).optional(),
-    sourceContext: transcriptSourceContextSchema.optional(),
+    sourceContext: modelTranscriptSourceContextSchema.optional(),
     summary: z.string().trim().min(1).max(MODEL_ANALYSIS_SUMMARY_CHARACTERS),
     findings: z.array(transcriptFactsSchema.extend({
       claim: z.string().trim().min(1).max(MODEL_ANALYSIS_FINDING_CHARACTERS),
@@ -137,7 +142,8 @@ export function evidencePacketForModel(packet: EvidencePacket): ModelEvidencePac
       assetVersions: packet.assetVersions,
       transcriptAnalysis: {
         groundingVersion: transcriptAnalysis.groundingVersion,
-        sourceContext: transcriptAnalysis.sourceContext,
+        sourceContext: transcriptAnalysis.sourceContext
+          ? modelTranscriptSourceContextSchema.parse(transcriptAnalysis.sourceContext) : undefined,
         summary: boundedText(transcriptAnalysis.summary, MODEL_ANALYSIS_SUMMARY_CHARACTERS),
         findings: transcriptAnalysis.findings.slice(0, MODEL_ANALYSIS_FINDINGS).map((finding) => ({
           ...finding,
@@ -161,9 +167,11 @@ export function evidencePacketForModel(packet: EvidencePacket): ModelEvidencePac
   const frameCoverage = packet.kind === 'youtube_frames'
     ? frameCoverageSchema.safeParse(packet.artifacts.find(artifact => ['youtube_frame_analysis','youtube_frame_retrieval'].includes(artifact.type))?.data)
     : undefined;
-  const excerpts = ordered.slice(0, MODEL_EXCERPTS_PER_PACKET).map((excerpt) => ({
+  const fullMetadata = packet.kind === 'youtube_video' && packet.artifacts.some(artifact =>
+    artifact.type === 'youtube_video_metadata' && typeof artifact.data.description === 'string');
+  const excerpts = (fullMetadata ? ordered : ordered.slice(0, MODEL_EXCERPTS_PER_PACKET)).map((excerpt) => ({
     ...excerpt,
-    text: boundedText(excerpt.text, packet.kind === 'youtube_transcript' ? MODEL_TRANSCRIPT_EXCERPT_CHARACTERS : MODEL_EXCERPT_CHARACTERS),
+    text: fullMetadata ? excerpt.text : boundedText(excerpt.text, packet.kind === 'youtube_transcript' ? MODEL_TRANSCRIPT_EXCERPT_CHARACTERS : MODEL_EXCERPT_CHARACTERS),
   }));
   const sourceIds = new Set(excerpts.map((excerpt) => excerpt.sourceId));
   const sources = packet.sources.filter((source) => sourceIds.has(source.id));
