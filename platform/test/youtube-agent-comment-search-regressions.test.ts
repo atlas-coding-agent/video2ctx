@@ -2,6 +2,7 @@ import { describe, expect, it } from 'vitest';
 import type { Comment } from 'all-things-youtube';
 import { commentPassage } from '../src/agents/providers/youtube/tools/get-video-comments';
 import { collectionRetrieval, modelCollection } from '../src/agents/runtime/collection-coverage';
+import { firstMatchOffset, matchMarkers } from '../src/agents/runtime/search-highlight';
 
 // Regressions for comment-search issues found in the independent PR211 review.
 
@@ -57,5 +58,29 @@ describe('filtered saved reads describe offsets as matches', () => {
     const coverage = modelCollection({ shown: 8, retained: 8, retrieval, continuationShown: false }).coverage;
     expect(coverage).toContain('The provider page had 14 entries.');
     expect(coverage).toContain(`Read offset 8 with pageVersion ${version}`);
+  });
+});
+
+describe('highlight offsets are safe against marker text in untrusted content', () => {
+  const mark = (content: string, at: number, length: number, markers: { start: string; end: string }) =>
+    `${content.slice(0, at)}${markers.start}${content.slice(at, at + length)}${markers.end}${content.slice(at + length)}`;
+
+  it('ignores control characters and old fixed markers in the content', () => {
+    const content = 'early \u0001\u0002 noise [[match-start:x]] then the real art here\nViewer';
+    const markers = matchMarkers();
+    const at = content.indexOf('art here');
+    expect(firstMatchOffset({ content, marked: mark(content, at, 3, markers), markers })).toBe(at);
+  });
+
+  it('uses fresh markers per query', () => {
+    expect(matchMarkers().start).not.toBe(matchMarkers().start);
+  });
+
+  it('rejects an offset when the content contains the markers or does not round-trip', () => {
+    const markers = matchMarkers();
+    const content = `prefix ${markers.start} art`;
+    expect(firstMatchOffset({ content, marked: mark(content, content.length - 3, 3, markers), markers })).toBeUndefined();
+    expect(firstMatchOffset({ content: 'plain art', marked: `plain ${markers.start}ART${markers.end}`, markers })).toBeUndefined();
+    expect(firstMatchOffset({ content: 'plain art', marked: 'plain art', markers })).toBeUndefined();
   });
 });

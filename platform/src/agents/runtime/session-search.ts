@@ -3,6 +3,7 @@ import { tool, type ToolSet } from 'ai';
 import { z } from 'zod';
 import type { EvidencePacket } from '../contracts';
 import type { SessionEvidenceStore } from './session-evidence';
+import { firstMatchOffset, matchMarkers, type MatchMarkers } from './search-highlight';
 import { withVisualProvenanceWarning } from './model-evidence';
 
 export interface HistoryEntry {
@@ -14,11 +15,8 @@ export interface HistoryEntry {
   createdAt: number;
 }
 
-type SearchRow = { id: string; owner: string; content: string; metadata: string; marked?: string };
+type SearchRow = { id: string; owner: string; content: string; metadata: string; marked?: string; markers?: MatchMarkers };
 
-/** Marks FTS5 places around matched tokens in highlight(); never present in stored text. */
-const MATCH_START = '\u0001';
-const MATCH_END = '\u0002';
 
 /** The only dependency on the experimental SDK. agents is pinned in package.json. */
 export class SessionSearch {
@@ -171,16 +169,20 @@ export class SessionSearch {
     const duplicates = scope === 'evidence' ? ` AND NOT EXISTS (SELECT 1 FROM session_packets p
       WHERE owner='packet:' || p.packet_id AND json_extract(p.packet_json,'$.kind')='youtube_comments'
       AND EXISTS (SELECT 1 FROM json_each(p.versions_json) v WHERE v.value IN (SELECT version FROM session_search_assets)))` : '';
+    const markers = matchMarkers();
     return this.sql
       .exec<SearchRow>(
         // highlight() reports where the tokenizer itself matched, so passages never re-derive matching.
-        `SELECT id,owner,content,metadata,highlight(session_context_fts, 3, char(1), char(2)) AS marked FROM session_context_fts
+        `SELECT id,owner,content,metadata,highlight(session_context_fts, 3, ?, ?) AS marked FROM session_context_fts
       WHERE session_context_fts MATCH ? AND scope=?${excluded}${duplicates} ORDER BY rank LIMIT 20`,
+        markers.start,
+        markers.end,
         tokens.map((t) => `"${t}"`).join(' AND '),
         scope,
         ...excludedOwners,
       )
-      .toArray();
+      .toArray()
+      .map((row) => ({ ...row, markers }));
   }
   searchMemory(query: string) {
     return this.matches('memory', query).flatMap((row) => {
@@ -297,13 +299,4 @@ export class SessionSearch {
 
 function queryTokens(query: string): string[] {
   return query.slice(0, 200).match(/[\p{L}\p{N}_]+/gu)?.slice(0, 20) ?? [];
-}
-
-/**
- * Offset of the first matched token in the indexed content, from FTS5 highlight(). Content
- * before the first marker is unmarked original text, so its length is the original offset.
- */
-function firstMatchOffset(row: SearchRow): number | undefined {
-  const at = row.marked?.indexOf(MATCH_START) ?? -1;
-  return at >= 0 && row.marked!.includes(MATCH_END, at) ? at : undefined;
 }

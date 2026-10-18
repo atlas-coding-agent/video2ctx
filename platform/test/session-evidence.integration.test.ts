@@ -1264,3 +1264,22 @@ test('an author-only comment match shows the comment start with its author', asy
     expect(excerpt.text.startsWith('Opening line.')).toBe(true);
     expect(excerpt.text).toContain('Author: Janine');
   }));
+
+test('control characters and marker-like text in a comment cannot move the reported match', async () =>
+  within('comment-search-marker-collision', async (store) => {
+    const early = 'Start \u0001early\u0002 [[match-start:00000000-0000-0000-0000-000000000000]] note. ';
+    const page = commentPage(1, () => `${early}${'Padding words here. '.repeat(160)} the real art is patience.`);
+    const p = provider();
+    p.comments = vi.fn(async () => ({ cacheStatus: 'miss' as const, value: page }));
+    const version = (await sessionProvider(p, store).comments(id)).assetVersions![0]!;
+    const excerpt = (await store.search.searchEvidence(store, 'art')).packets[0]!.excerpts[0]!;
+    expect(excerpt.text).toContain('the real art is patience.');
+    // The passage is an unmodified slice of the saved comment, and its ID records where it starts.
+    const body = excerpt.text.split('\nAuthor: ')[0]!.replace(/^…/, '').replace(/…$/, '');
+    expect(page.comments[0]!.text.replace(/[ \t]+/g, ' ')).toContain(body);
+    const start = Number(excerpt.id.split(':').at(-1));
+    expect(excerpt.id.startsWith(`evidence:${version}:0:`)).toBe(true);
+    expect(page.comments[0]!.text.replace(/[ \t]+/g, ' ').slice(start).startsWith(body)).toBe(true);
+    // The early control characters remain in the saved page.
+    expect((await store.readEvidence(version)).packets[0]!.excerpts[0]!.text).toContain('\u0001early\u0002');
+  }));
