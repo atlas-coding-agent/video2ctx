@@ -2,7 +2,7 @@ import { describe, expect, it } from 'vitest';
 import type { Comment } from 'all-things-youtube';
 import { commentPassage } from '../src/agents/providers/youtube/tools/get-video-comments';
 import { collectionRetrieval, modelCollection } from '../src/agents/runtime/collection-coverage';
-import { firstMatchOffset, matchMarkers } from '../src/agents/runtime/search-highlight';
+import { firstMatchSpan, matchMarkers } from '../src/agents/runtime/search-highlight';
 
 // Regressions for comment-search issues found in the independent PR211 review.
 
@@ -15,7 +15,7 @@ describe('search passages are placed at the match offset session search reports'
   // Matching itself is decided by SQLite FTS5; session-evidence.integration.test.ts checks real tokenizer cases.
   it('shows the passage at a late reported offset even when an earlier substring exists', () => {
     const text = `Before we start, ${filler} the real art of it is patience.`;
-    const passage = commentPassage(longComment(text), [], text.lastIndexOf('art'));
+    const passage = commentPassage(longComment(text), [], { at: text.lastIndexOf('art'), end: text.lastIndexOf('art') + 3 });
     expect(passage.start).toBeGreaterThan(0);
     expect(passage.text).toContain('the real art of it is patience');
     expect(passage.text).toContain('Author: Janine');
@@ -23,15 +23,23 @@ describe('search passages are placed at the match offset session search reports'
 
   it('maps a raw offset through whitespace normalization', () => {
     const text = `${'Padding   with \t extra   spaces. '.repeat(90)}The objection is here.`;
-    const passage = commentPassage(longComment(text), [], text.indexOf('The objection'));
+    const passage = commentPassage(longComment(text), [], { at: text.indexOf('The objection'), end: text.indexOf('The objection') + 3 });
     expect(passage.text).toContain('The objection is here.');
   });
 
   it('starts at the beginning for an author-only match, keeping the attribution', () => {
     const text = filler;
-    const passage = commentPassage(longComment(text), [], text.length + 1);
+    const passage = commentPassage(longComment(text), [], { at: text.length + 1, end: text.length + 7 });
     expect(passage.start).toBeUndefined();
     expect(passage.text).toContain('Author: Janine');
+  });
+
+  it('keeps the whole matched token when it ends at the excerpt cutoff', () => {
+    // "Author: Janine" and "Replies: 0" leave a 1,974-character body budget; cross that cutoff.
+    for (let at = 1964; at <= 1976; at += 1) {
+      const text = `${'w'.repeat(at - 1)} needle ${'tail '.repeat(100)}`;
+      expect(commentPassage(longComment(text), [], { at, end: at + 6 }).text, `offset ${at}`).toContain('needle');
+    }
   });
 
   it('keeps literal matching for filtered saved reads without a reported offset', () => {
@@ -69,7 +77,7 @@ describe('highlight offsets are safe against marker text in untrusted content', 
     const content = 'early \u0001\u0002 noise [[match-start:x]] then the real art here\nViewer';
     const markers = matchMarkers();
     const at = content.indexOf('art here');
-    expect(firstMatchOffset({ content, marked: mark(content, at, 3, markers), markers })).toBe(at);
+    expect(firstMatchSpan({ content, marked: mark(content, at, 3, markers), markers })).toEqual({ at, end: at + 3 });
   });
 
   it('uses fresh markers per query', () => {
@@ -79,8 +87,8 @@ describe('highlight offsets are safe against marker text in untrusted content', 
   it('rejects an offset when the content contains the markers or does not round-trip', () => {
     const markers = matchMarkers();
     const content = `prefix ${markers.start} art`;
-    expect(firstMatchOffset({ content, marked: mark(content, content.length - 3, 3, markers), markers })).toBeUndefined();
-    expect(firstMatchOffset({ content: 'plain art', marked: `plain ${markers.start}ART${markers.end}`, markers })).toBeUndefined();
-    expect(firstMatchOffset({ content: 'plain art', marked: 'plain art', markers })).toBeUndefined();
+    expect(firstMatchSpan({ content, marked: mark(content, content.length - 3, 3, markers), markers })).toBeUndefined();
+    expect(firstMatchSpan({ content: 'plain art', marked: `plain ${markers.start}ART${markers.end}`, markers })).toBeUndefined();
+    expect(firstMatchSpan({ content: 'plain art', marked: 'plain art', markers })).toBeUndefined();
   });
 });

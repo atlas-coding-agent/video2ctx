@@ -1283,3 +1283,17 @@ test('control characters and marker-like text in a comment cannot move the repor
     // The early control characters remain in the saved page.
     expect((await store.readEvidence(version)).packets[0]!.excerpts[0]!.text).toContain('\u0001early\u0002');
   }));
+
+// Author "Reviewer" leaves a 1,983-character body budget. Real SQLite reports the span of
+// a token placed on every offset around that cutoff; the passage must contain all of it.
+test.each(Array.from({ length: 11 }, (_, index) => 1975 + index))('a matched token at offset %i near the excerpt cutoff stays whole', async at =>
+  within(`comment-search-cutoff-${at}`, async (store) => {
+    const page = commentPage(1, () => `${'w'.repeat(at - 1)} needle ${'tail '.repeat(100)}`);
+    page.comments[0]!.author.name = 'Reviewer';
+    const p = provider();
+    p.comments = vi.fn(async () => ({ cacheStatus: 'miss' as const, value: page }));
+    await sessionProvider(p, store).comments(id);
+    const excerpt = (await store.search.searchEvidence(store, 'needle')).packets[0]!.excerpts[0]!;
+    expect(excerpt.text).toMatch(/\bneedle\b/);
+    expect(excerpt.text).toContain('Author: Reviewer');
+  }));

@@ -10,15 +10,22 @@ export function matchMarkers(): MatchMarkers {
   return { start: `[[match-start:${nonce}]]`, end: `[[match-end:${nonce}]]` };
 }
 
+/** A matched span in the original indexed content: `at` inclusive, `end` exclusive. */
+export type MatchSpan = { at: number; end: number };
+
 /**
- * Offset of the first matched token in indexed content, from FTS5 highlight(). Text before
- * the first marker is unmodified content, so its length is the original offset. Returns
- * undefined unless removing the markers reproduces the content exactly.
+ * The first matched span in indexed content, from FTS5 highlight(). Text before the first
+ * marker is unmodified content, so its length is the original start; the matched text
+ * between the markers gives the end. Returns undefined unless removing the markers
+ * reproduces the content exactly.
  */
-export function firstMatchOffset(row: { content: string; marked?: string; markers?: MatchMarkers }): number | undefined {
+export function firstMatchSpan(row: { content: string; marked?: string; markers?: MatchMarkers }): MatchSpan | undefined {
   const { marked, markers, content } = row;
   if (!marked || !markers || content.includes(markers.start) || content.includes(markers.end)) return undefined;
   if (marked.split(markers.start).join('').split(markers.end).join('') !== content) return undefined;
   const at = marked.indexOf(markers.start);
-  return at >= 0 ? at : undefined;
+  if (at < 0) return undefined;
+  const close = marked.indexOf(markers.end, at + markers.start.length);
+  if (close < 0) return undefined;
+  return { at, end: close - markers.start.length };
 }

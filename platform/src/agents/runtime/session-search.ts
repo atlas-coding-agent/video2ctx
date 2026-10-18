@@ -3,7 +3,7 @@ import { tool, type ToolSet } from 'ai';
 import { z } from 'zod';
 import type { EvidencePacket } from '../contracts';
 import type { SessionEvidenceStore } from './session-evidence';
-import { firstMatchOffset, matchMarkers, type MatchMarkers } from './search-highlight';
+import { firstMatchSpan, matchMarkers, type MatchMarkers } from './search-highlight';
 import { withVisualProvenanceWarning } from './model-evidence';
 
 export interface HistoryEntry {
@@ -208,7 +208,7 @@ export class SessionSearch {
       const metadata = JSON.parse(row.metadata) as { version?: string; offset?: number; packetId?: string; kind?: string };
       if (metadata.kind === 'comments' && metadata.version) {
         // A comment hit is shown around the matched terms, which may lie past one excerpt's length.
-        const found = store.has(metadata.version) ? (await store.readSavedComment(metadata.version, metadata.offset ?? 0, firstMatchOffset(row), pages)).packets : [];
+        const found = store.has(metadata.version) ? (await store.readSavedComment(metadata.version, metadata.offset ?? 0, firstMatchSpan(row), pages)).packets : [];
         const excerpt = found[0]?.excerpts[0];
         if (found[0] && excerpt) {
           packets.push({ ...found[0], packetId: `search:${excerpt.id}`, excerpts: [excerpt], artifacts: [] });

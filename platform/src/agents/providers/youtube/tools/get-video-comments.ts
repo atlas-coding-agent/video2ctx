@@ -166,17 +166,17 @@ export function summarizeComment(comment: Comment): string {
 
 /**
  * A bounded passage of one comment. A body longer than one excerpt is shown around a match,
- * so a match in its tail stays visible. `rawMatchAt` is a match offset in the unmodified
+ * so a match in its tail stays visible. `rawMatch` is the matched span in the unmodified
  * comment text, as reported by session search; without it the earliest literal occurrence
  * of a term is used, the same substring rule a filtered saved read applies.
  * `start` is set only when the passage does not begin at the start of the body.
  */
-export function commentPassage(comment: Comment, terms: readonly string[] = [], rawMatchAt?: number): { text: string; start?: number } {
+export function commentPassage(comment: Comment, terms: readonly string[] = [], rawMatch?: { at: number; end: number }): { text: string; start?: number } {
   const attribution = commentAttribution(comment);
   const body = normalizeCommentText(comment.text ?? '');
   const budget = COMMENT_EXCERPT_CHARACTERS - attribution.length - 1;
   if (body.length <= budget) return { text: body ? `${body}\n${attribution}` : attribution };
-  const match = rawMatchAt !== undefined ? normalizedMatch(comment.text ?? '', rawMatchAt) : literalMatch(body, terms);
+  const match = rawMatch ? normalizedMatch(comment.text ?? '', rawMatch) : literalMatch(body, terms);
   if (!match || match.end <= budget - 1)
     return { text: `${body.slice(0, budget - 1)}…\n${attribution}` };
   // Start just before the match, so a later shortening of the passage keeps the match.
@@ -192,14 +192,16 @@ function literalMatch(body: string, terms: readonly string[]): { at: number; end
 }
 
 /**
- * A raw-text offset translated into the whitespace-normalized body. Normalizing only the
- * prefix can differ from the full body by one trimmed space, well inside the passage lead.
- * An offset past the body, such as an author-only match, has no body position.
+ * A raw-text span translated into the whitespace-normalized body, keeping the whole matched
+ * token. Normalizing only a prefix can differ from the full body by one trimmed space, which
+ * the passage lead absorbs; the end is extended by that space so the token is never cut.
+ * A span past the body, such as an author-only match, has no body position.
  */
-function normalizedMatch(raw: string, rawAt: number): { at: number; end: number } | undefined {
-  if (rawAt < 0 || rawAt >= raw.length) return undefined;
-  const at = normalizeCommentText(raw.slice(0, rawAt)).length;
-  return { at, end: at + 1 };
+function normalizedMatch(raw: string, span: { at: number; end: number }): { at: number; end: number } | undefined {
+  if (span.at < 0 || span.at >= raw.length || span.end <= span.at) return undefined;
+  const at = normalizeCommentText(raw.slice(0, span.at)).length;
+  const end = normalizeCommentText(raw.slice(0, Math.min(span.end, raw.length))).length + 1;
+  return { at, end: Math.max(end, at + 1) };
 }
 
 /** Full searchable comment content: the whole body and the author, never a shortened excerpt. */
