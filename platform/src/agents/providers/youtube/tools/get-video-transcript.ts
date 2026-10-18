@@ -171,16 +171,7 @@ export function completeTranscriptEvidence(
   segments: TranscriptSegment[],
   sourceId: string,
 ) {
-  const excerpts = segments.flatMap((segment, segmentIndex) => {
-    const chunks = chunkText(segment.text, 2_000);
-    return chunks.map((text, chunkIndex) => ({
-      id: `transcript:${safeIdPart(videoId)}:${segmentIndex}:${segment.startMs}:${chunkIndex}`,
-      sourceId,
-      text,
-      startMs: segment.startMs,
-      endMs: segment.endMs,
-    }));
-  });
+  const excerpts = segments.flatMap((segment, segmentIndex) => transcriptCueExcerpts(videoId, segment, segmentIndex, sourceId));
   return {
     excerpts,
     artifactType: 'youtube_complete_transcript',
@@ -195,6 +186,17 @@ export function completeTranscriptEvidence(
     },
     warnings: [],
   };
+}
+
+/** Caption cue excerpts for one segment. Their IDs and boundaries are the finest transcript citations. */
+export function transcriptCueExcerpts(videoId: string, segment: TranscriptSegment, segmentIndex: number, sourceId: string) {
+  return chunkText(segment.text, 2_000).map((text, chunkIndex) => ({
+    id: `transcript:${safeIdPart(videoId)}:${segmentIndex}:${segment.startMs}:${chunkIndex}`,
+    sourceId,
+    text,
+    startMs: segment.startMs,
+    endMs: segment.endMs,
+  }));
 }
 
 function chunkText(value: string, maximum: number): string[] {

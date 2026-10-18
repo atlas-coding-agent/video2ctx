@@ -5,6 +5,7 @@ import { evidencePacketSchema } from '../../../contracts';
 import type { AgentToolContext } from '../tool-context';
 import { readAnalysisAssets, storedVisualInputSchema } from './stored-analysis';
 import { safeIdPart, youtubeVideoUrl } from './provider-evidence';
+import { visualObservationText } from '../visual-provenance';
 
 export const analyzeVideoFramesInputSchema = storedVisualInputSchema.extend({
   assetVersions: storedVisualInputSchema.shape.assetVersions.max(6),
@@ -77,7 +78,7 @@ export function executeAnalyzeVideoFrames(
             return {
               id: `frames:${videoId}:${safeIdPart(toolCallId)}:${index}:${time}`,
               sourceId,
-              text: `Visual observation at requested frame: ${finding.observation}`,
+              text: visualObservationText('requested', finding.observation, finding.timestampsMs),
               startMs: time,
               endMs: time,
             };

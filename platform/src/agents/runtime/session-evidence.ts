@@ -3,8 +3,10 @@ import type { VerifiedImage } from '../../lib/verified-image';
 import { SessionSearch } from './session-search';
 import { VideoTooLongError } from './video-duration-limit';
 import type { ToolSet } from 'ai';
-import type { Transcript } from 'all-things-youtube';
+import type { Comment, Transcript } from 'all-things-youtube';
 import { completeTranscriptEvidence } from '../providers/youtube/tools/get-video-transcript';
+import { commentPageSlice, summarizeComment } from '../providers/youtube/tools/get-video-comments';
+import { COLLECTION_ITEM_LIMIT, collectionRetrieval } from './collection-coverage';
 import { sha256 } from '../../lib/http';
 import type { CachedResult } from '../../lib/youtube';
 import { memoryUpdateSchema, evidencePacketSchema, type EvidencePacket } from '../contracts';
@@ -162,17 +164,23 @@ export class SessionEvidenceStore implements SessionAccess {
     const generation = this.generation();
     const rows = this.sql
       .exec<{ version: string; video_id: string; details_json: string }>(
-        `SELECT version, video_id, details_json FROM session_assets WHERE kind='transcript'
+        `SELECT version, kind, video_id, details_json FROM session_assets WHERE kind IN ('transcript','comments')
       AND version NOT IN (SELECT version FROM session_search_assets)`,
       )
-      .toArray();
-    for (const { version, video_id: videoId, details_json: details } of rows) {
+      .toArray() as { version: string; kind: SessionAssetKind; video_id: string; details_json: string }[];
+    for (const { version, kind, video_id: videoId, details_json: details } of rows) {
       // Over-limit transcripts saved before the limit existed stay out of the search index.
-      if (this.overLimit({ kind: 'transcript', videoId, details: JSON.parse(details) })) continue;
-      const transcript = (await this.read(version)) as Transcript | null;
+      if (this.overLimit({ kind, videoId, details: JSON.parse(details) })) continue;
+      const value = await this.read(version);
       if (generation !== this.generation())
         throw new Error('Session evidence changed during indexing. Retry the search.');
-      if (transcript) this.indexTranscript(version, transcript);
+      if (!value) continue;
+      if (kind === 'transcript') this.indexTranscript(version, value as Transcript);
+      else {
+        // Index every saved comment, including those past one read's limit, so search can reach them.
+        const comments = savedComments(value);
+        if (comments) this.search.indexAsset(version, comments.map(summarizeComment));
+      }
     }
   }
   private indexTranscript(version: string, transcript: Transcript) {
@@ -513,6 +521,7 @@ export class SessionEvidenceStore implements SessionAccess {
         nextOffset: offset + page.length < matching.length ? offset + page.length : undefined,
       };
     }
+    if (asset.kind === 'comments') return this.readCommentEvidence(asset, offset, query);
     const packets = this.evidence(version);
     const selected = packets
       .flatMap((packet) => {
@@ -523,6 +532,44 @@ export class SessionEvidenceStore implements SessionAccess {
       })
       .slice(0, 4);
     return { packets: selected, needsInspection: selected.length === 0 };
+  }
+  /** A bounded read of one saved comment page, by offset and optional literal text. */
+  private async readCommentEvidence(asset: SessionAsset, offset: number, query?: string) {
+    const value = await this.read(asset.version);
+    const comments = value === null ? undefined : savedComments(value);
+    if (!comments) throw new Error('Session asset is unavailable or deleted.');
+    const needle = query?.toLowerCase();
+    const positions = comments.map((comment, position) => ({ comment, position }))
+      .filter(({ comment }) => !needle || summarizeComment(comment).toLowerCase().includes(needle));
+    const slice = commentPageSlice(positions.map(({ comment }) => comment), offset, COLLECTION_ITEM_LIMIT);
+    const sourceId = `youtube:${asset.videoId}:comments`;
+    const current = this.currentVersions().has(asset.version);
+    const packet = evidencePacketSchema.parse({
+      packetId: `session:${asset.version}:${slice.start}:${COLLECTION_ITEM_LIMIT}:${await sha256(query ?? '')}`,
+      kind: 'youtube_comments',
+      assetVersions: [asset.version],
+      sources: [{ id: sourceId, provider: 'youtube', kind: 'comments', videoId: asset.videoId,
+        url: `https://www.youtube.com/watch?v=${asset.videoId}` }],
+      // Version-specific IDs: a refreshed page can reuse comment IDs with different text.
+      excerpts: slice.page.map(({ position }) => {
+        const entry = positions[position]!;
+        return { id: `evidence:${asset.version}:${entry.position}`, sourceId, text: summarizeComment(entry.comment) };
+      }),
+      artifacts: [{ type: 'youtube_comments', title: `Saved comments for ${asset.videoId}`, data: {
+        returnedCount: slice.page.length,
+        savedPageCount: comments.length,
+        ...(query ? { matchingCount: positions.length } : {}),
+        ...(slice.nextOffset !== undefined ? { nextOffset: slice.nextOffset } : {}),
+        // Counts describe the matching entries when a query filters the saved page.
+        collection: collectionRetrieval({ fetchedCount: positions.length, retainedCount: slice.page.length,
+          continuationAccepted: true, pageOffset: slice.start, nextPageOffset: slice.nextOffset }),
+      } }],
+      warnings: current ? [] : [{ code: 'SUPERSEDED_SESSION_EVIDENCE',
+        message: 'This evidence refers to an older stored comment page. Use the current version for current facts.' }],
+      usage: [],
+    });
+    this.savePacket(packet);
+    return { packets: [packet], nextOffset: slice.nextOffset };
   }
   alias(key: string, version: string) {
     if (this.has(version)) this.sql.exec('INSERT OR REPLACE INTO session_asset_keys VALUES (?, ?)', key, version);
@@ -835,4 +882,10 @@ export async function versionEvidencePacket(packet: EvidencePacket): Promise<Evi
       });
   }
   return result;
+}
+
+/** Comments of a saved provider page, or undefined for an unexpected payload. */
+function savedComments(value: unknown): Comment[] | undefined {
+  const comments = (value as { comments?: unknown } | null)?.comments;
+  return Array.isArray(comments) ? comments as Comment[] : undefined;
 }

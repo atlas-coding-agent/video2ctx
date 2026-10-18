@@ -7,6 +7,7 @@ import { analyzeStoryboardBatches } from '../storyboard-analysis-batches';
 import type { AgentToolContext } from '../tool-context';
 import { readAnalysisAssets, storedVisualInputSchema } from './stored-analysis';
 import { safeIdPart, youtubeVideoUrl } from './provider-evidence';
+import { visualObservationText } from '../visual-provenance';
 
 export function createAnalyzeVideoStoryboardTool(context: AgentToolContext) {
   return tool({
@@ -98,7 +99,7 @@ export function executeAnalyzeVideoStoryboard(
             return {
               id: `storyboard:${videoId}:${safeIdPart(toolCallId)}:${index}:${frame}`,
               sourceId,
-              text: `Visual observation from sampled frame: ${finding.observation}`,
+              text: visualObservationText('sampled', finding.observation, finding.frameIndexes.map(index => index * storyboard.intervalMs)),
               startMs: time,
               endMs: time,
             };

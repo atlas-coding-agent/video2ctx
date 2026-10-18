@@ -804,6 +804,19 @@ async function runResearchAgentWithModelWithinDeadline(options: {
   }
 }
 
+/** Describing what was read must match what this turn's context actually holds. */
+export const EVIDENCE_DELIVERY_GUIDANCE = 'Each evidence packet\'s delivery.origin states whether a tool produced or read it during this turn (this_turn) or it was saved from an earlier turn (earlier_turn). Describe reading, rereading, checking or rewatching only for this_turn evidence; attribute earlier_turn evidence to the earlier conversation. transcriptAnalysis.delivery states how many saved findings are shown and that caption text is not included: never claim you read or reread a full transcript. Describe only the comments, frames or entries actually supplied, using collection counts and truncation warnings.';
+
+/**
+ * Packets the finalizer receives from earlier turns. Tool packets of this run and
+ * this run's session search hits are never earlier, even when history holds the same saved read.
+ */
+export function earlierTurnPacketIds(evidence: readonly EvidencePacket[], history: readonly ConversationTurn[], runId: string): Set<string> {
+  const historical = new Set(history.flatMap(turn => [...turn.evidence ?? [], ...turn.metadata ?? []]).map(packet => packet.packetId));
+  return new Set(evidence.map(packet => packet.packetId).filter(id => !id.startsWith(`packet:${runId}:`)
+    && !id.startsWith('search:') && (historical.has(id) || id.startsWith('memory:'))));
+}
+
 function transcriptAnalysisKeys(recoveredEvidence: readonly EvidencePacket[]): string[] {
   return recoveredEvidence.flatMap((packet) => {
     if (packet.kind !== 'youtube_transcript') return [];
@@ -863,7 +876,8 @@ async function runUnifiedFinalizer(options: {
       ? [options.decision.videoId] : comparisonVideoIds) : '';
   const evidenceBudget = comparisonVideoIds.length ? 160_000
     : options.decision.route === 'inspect_video' ? INSPECTION_FINALIZER_EVIDENCE_CHARACTERS : TIMEOUT_FINALIZER_EVIDENCE_CHARACTERS;
-  const prepared = finalizationEvidenceForModel(options.evidence, evidenceBudget, comparisonVideoIds);
+  const prepared = finalizationEvidenceForModel(options.evidence, evidenceBudget, comparisonVideoIds,
+    earlierTurnPacketIds(options.evidence, options.conversationHistory ?? [], options.context.runId));
   const intent = options.decision.route === 'finalize' ? options.decision.responseIntent : options.decision.route;
   const conversational = intent === 'clarification' || intent === 'rejected';
   const baseOutputSchema = conversational ? conversationalFinalizationOutputSchema
@@ -963,6 +977,7 @@ async function runUnifiedFinalizer(options: {
           'Answer the request now. Never return only a plan, progress update, promise to look something up, or a sentence fragment. If context is unavailable, explain that concrete limitation instead.',
           `Return blocks containing text and evidenceIds. Use the short ref_N excerpt IDs from supplied evidence, including transcriptAnalysis.findings.excerptIds. ${ANSWER_CITATION_GUIDANCE}`,
           'Keep JSON compact. Use short ref_N citations rather than full evidence IDs. For specific-video comparisons cite every subject, or explicitly state the missing side and add ANSWER_SCOPE_SHORTFALL. If contextIncomplete is true, do not claim exhaustive coverage unless the supplied evidence establishes it.',
+          EVIDENCE_DELIVERY_GUIDANCE,
           'Recovery has a limited token budget. Preserve the requested count where evidence permits by shortening each item before reducing the count. If scope remains incomplete, state the shortfall and add ANSWER_SCOPE_SHORTFALL. Do not pad or invent findings.',
           'State important evidence gaps plainly. Do not claim that a failed provider operation succeeded.',
           'For list evidence such as playlists, take counts from collection: entriesShown are the entries supplied here, and collection.coverage states what was not retained, not shown, or not stated by the provider. Never report fewer available entries than are shown. Describe unshown or unretained entries as a context limit, not as absent from the source. When the answer cites a playlist entry, or reviewed transcript or visual content for a listed video, the application appends a playlist coverage note stating the provider total, the 12-video listing limit and which videos had content reviewed; do not contradict it. Otherwise no note is appended, so state any material playlist coverage limit yourself. Never present listing details as reviewed video content. evidenceOmittedFromContext counts saved list packets that did not fit at all; notListed of them are counted but not named.',

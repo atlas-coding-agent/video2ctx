@@ -289,6 +289,7 @@ describe('TranscriptAnalyst', () => {
       segmentCount: 3,
       startMs: 0,
       endMs: 73_000,
+      windowCount: 2,
     });
   });
 

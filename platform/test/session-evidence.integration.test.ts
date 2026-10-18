@@ -1065,3 +1065,30 @@ test('single-sheet storyboard reuses the processor middle sheet across restored 
       }
     }
   }));
+
+test('searches and pages every saved comment on a provider page with version-specific citations', async () =>
+  within('saved-comment-search', async (store, reopen) => {
+    const authors = Array.from({ length: 14 }, (_, index) => index === 11 ? 'Janine' : index === 13 ? 'Gale' : `Viewer ${index + 1}`);
+    const p = provider();
+    p.comments = vi.fn(async () => ({ cacheStatus: 'miss' as const, value: { videoId: id, totalCount: 14, replyContinuations: [],
+      comments: authors.map((name, index) => ({ id: `c${index + 1}`, text: `Opinion ${index + 1}`, author: { name, thumbnails: [] },
+        isPinned: false, isHearted: false, replies: [] })), meta: transcript().meta } }));
+    const saved = await sessionProvider(p, store).comments(id);
+    const version = saved.assetVersions![0]!;
+    // Comment 14 sits past one read's limit; search still reaches it without a provider call.
+    const gale = await reopen().search.searchEvidence(reopen(), 'Gale');
+    expect(gale.packets).toHaveLength(1);
+    expect(gale.packets[0]).toMatchObject({ kind: 'youtube_comments', assetVersions: [version],
+      excerpts: [{ id: `evidence:${version}:13`, text: expect.stringContaining('Author: Gale') }] });
+    const page = await reopen().readEvidence(version, 12);
+    expect(page.packets[0]!.excerpts.map(excerpt => excerpt.id)).toEqual([`evidence:${version}:12`, `evidence:${version}:13`]);
+    expect(page.nextOffset).toBeUndefined();
+    const first = await reopen().readEvidence(version);
+    expect(first.packets[0]!.excerpts).toHaveLength(12);
+    expect(first.nextOffset).toBe(12);
+    const janine = await reopen().readEvidence(version, 0, 'Janine');
+    expect(janine.packets[0]!.excerpts.map(excerpt => excerpt.id)).toEqual([`evidence:${version}:11`]);
+    expect(p.comments).toHaveBeenCalledOnce();
+    await reopen().delete(version);
+    expect((await reopen().search.searchEvidence(reopen(), 'Gale')).packets).toEqual([]);
+  }));

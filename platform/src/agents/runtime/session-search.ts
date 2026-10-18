@@ -133,10 +133,14 @@ export class SessionSearch {
     for (const excerpt of packet.excerpts) this.insert(excerpt.id, owner, 'evidence', excerpt.text, { packetId: id });
   }
   indexTranscript(version: string, excerpts: EvidencePacket['excerpts']) {
+    this.indexAsset(version, excerpts.map(excerpt => excerpt.text));
+  }
+  /** Index one saved asset by entry position. Row IDs equal the saved-read citation IDs. */
+  indexAsset(version: string, texts: readonly string[]) {
     const owner = `asset:${version}`;
     this.sql.exec('DELETE FROM session_context_fts WHERE owner=?', owner);
-    excerpts.forEach((excerpt, index) =>
-      this.insert(`evidence:${version}:${index}`, owner, 'evidence', excerpt.text, { version, offset: index }),
+    texts.forEach((text, index) =>
+      this.insert(`evidence:${version}:${index}`, owner, 'evidence', text, { version, offset: index }),
     );
     this.sql.exec('INSERT OR IGNORE INTO session_search_assets VALUES (?)', version);
   }
@@ -239,7 +243,7 @@ export class SessionSearch {
       .withContext('evidence', {
         provider: {
           get: async () =>
-            'Search transcript passages and saved visual/comment analysis across session assets. Queries match all words. Results contain version-specific citation IDs; older versions are labelled.',
+            'Search transcript passages, every saved comment on fetched comment pages, and saved visual analysis across session assets. Queries match all words, for example an author name. Results contain version-specific citation IDs; older versions are labelled.',
           search: async (query) => {
             check();
             const found = await this.searchEvidence(store, query);
