@@ -15,7 +15,9 @@ export interface HistoryEntry {
   createdAt: number;
 }
 
-type SearchRow = { id: string; owner: string; content: string; metadata: string; marked?: string; markers?: MatchMarkers };
+type SearchRow = { id: string; owner: string; content: string; metadata: string; marked?: string };
+/** A matched row with the markers its highlight() used. */
+type MatchedRow = SearchRow & { markers?: MatchMarkers };
 
 
 /** The only dependency on the experimental SDK. agents is pinned in package.json. */
@@ -157,7 +159,7 @@ export class SessionSearch {
       JSON.stringify(metadata),
     );
   }
-  private matches(scope: 'memory' | 'evidence', query: string, excludedOwners: readonly string[] = []): SearchRow[] {
+  private matches(scope: 'memory' | 'evidence', query: string, excludedOwners: readonly string[] = []): MatchedRow[] {
     // Literal tokens joined with AND support nonadjacent terms without exposing FTS operators.
     const tokens = queryTokens(query);
     if (!tokens.length) return [];
