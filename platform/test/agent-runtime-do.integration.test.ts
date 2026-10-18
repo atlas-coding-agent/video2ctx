@@ -2038,6 +2038,42 @@ test('reports current-run evidence operations from durable tool and delivery rec
     expect(Object.fromEntries([`packet:${runId}:analyze`, 'session:v1:0:30:hash', 'packet:earlier:tool', 'search:old']
       .map(id => [id, evidenceDeliveryOperation(records.get(id))]))).toEqual({
       [`packet:${runId}:analyze`]: 'image_analysis', 'session:v1:0:30:hash': 'saved_read',
-      'packet:earlier:tool': 'inherited', 'search:old': 'inherited' });
+      'packet:earlier:tool': 'saved_read', 'search:old': 'inherited' });
+  });
+});
+
+test('an inherited packet read explicitly later is reported as read after a resume, without a second charge', async () => {
+  const { runtime, runId } = await seed('inherited-then-read', 'running');
+  let packetId = '';
+  await runInDurableObject(runtime, async instance => {
+    const { SessionEvidenceStore } = await import('../src/agents/runtime/session-evidence');
+    const store = (instance as unknown as { sessionStore: InstanceType<typeof SessionEvidenceStore> }).sessionStore;
+    const raw = await store.retrieve(`transcript:${lineageVideo}:default`, 'transcript', lineageVideo, false, async () => ({
+      value: { videoId: lineageVideo, text: 'Saved caption', segments: [{ text: 'Saved caption', startMs: 0, endMs: 1000, durationMs: 1000 }] },
+      cacheStatus: 'miss' }), () => ({ complete: true }));
+    packetId = 'packet:earlier-run:transcript';
+    const packet: EvidencePacket = { packetId, kind: 'youtube_transcript', assetVersions: raw.assetVersions,
+      sources: [lineageSource], excerpts: [{ id: 'saved', sourceId: lineageSource.id, text: 'Saved caption', startMs: 0, endMs: 1000 }],
+      artifacts: [], warnings: [], usage: [] };
+    const runtimeMethods = instance as unknown as {
+      deliverEvidence(runId: string, source: string, packets: EvidencePacket[]): { admitted: EvidencePacket[] };
+      evidenceLedger: { committed(runId: string): number };
+    };
+    expect(runtimeMethods.deliverEvidence(runId, 'inherited_subject', [packet]).admitted).toHaveLength(1);
+    const charged = runtimeMethods.evidenceLedger.committed(runId);
+    expect(runtimeMethods.deliverEvidence(runId, 'read_prior_evidence', [packet]).admitted).toHaveLength(1);
+    // Billing keeps its first-delivery row and charges once; disclosure records both deliveries.
+    expect(runtimeMethods.evidenceLedger.committed(runId)).toBe(charged);
+    expect(instance.sql`SELECT source FROM agent_evidence_delivered_packets WHERE run_id = ${runId} AND packet_id = ${packetId}`)
+      .toEqual([{ source: 'inherited_subject' }]);
+    expect(instance.sql`SELECT source FROM agent_evidence_packet_operations WHERE run_id = ${runId} AND packet_id = ${packetId} ORDER BY source`)
+      .toEqual([{ source: 'inherited_subject' }, { source: 'read_prior_evidence' }]);
+  });
+  // A fresh object access stands in for the resumed run reading only persisted state.
+  await runInDurableObject(runtime, async instance => {
+    const { evidenceDeliveryOperation } = await import('../src/agents/runtime/model-evidence');
+    const records = (instance as unknown as { evidenceRunRecords(runId: string, ids: readonly string[]): Map<string, import('../src/agents/runtime/model-evidence').EvidenceRunRecord> })
+      .evidenceRunRecords(runId, [packetId]);
+    expect(evidenceDeliveryOperation(records.get(packetId))).toBe('saved_read');
   });
 });

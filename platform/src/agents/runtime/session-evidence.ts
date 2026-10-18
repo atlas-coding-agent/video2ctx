@@ -7,6 +7,7 @@ import type { Comment, Transcript } from 'all-things-youtube';
 import { completeTranscriptEvidence } from '../providers/youtube/tools/get-video-transcript';
 import { commentPageSlice, commentPassage, commentSearchText } from '../providers/youtube/tools/get-video-comments';
 import { COMMENT_READ_LIMIT, collectionRetrieval } from './collection-coverage';
+import { withVisualProvenanceWarning } from './model-evidence';
 import { sha256 } from '../../lib/http';
 import type { CachedResult } from '../../lib/youtube';
 import { memoryUpdateSchema, evidencePacketSchema, type EvidencePacket } from '../contracts';
@@ -528,7 +529,8 @@ export class SessionEvidenceStore implements SessionAccess {
         const matching = query
           ? packet.excerpts.filter((e) => e.text.toLowerCase().includes(query.toLowerCase()))
           : packet.excerpts;
-        return matching.length ? [{ ...packet, excerpts: matching.slice(offset, offset + 30) }] : [];
+        // Judge legacy frame ownership on the whole packet, before narrowing hides repeated observations.
+        return matching.length ? [{ ...withVisualProvenanceWarning(packet), excerpts: matching.slice(offset, offset + 30) }] : [];
       })
       .slice(0, 4);
     return { packets: selected, needsInspection: selected.length === 0 };
@@ -914,6 +916,12 @@ export async function versionEvidencePacket(packet: EvidencePacket): Promise<Evi
             : {}),
         };
       });
+    // Shared visual observations name their excerpt; keep that reference resolvable.
+    if (Array.isArray(artifact.data.sharedObservations))
+      artifact.data.sharedObservations = artifact.data.sharedObservations.map((shared) =>
+        shared && typeof shared === 'object' && typeof (shared as { excerptId?: unknown }).excerptId === 'string'
+          ? { ...shared, excerptId: ids.get((shared as { excerptId: string }).excerptId) ?? (shared as { excerptId: string }).excerptId }
+          : shared);
   }
   return result;
 }

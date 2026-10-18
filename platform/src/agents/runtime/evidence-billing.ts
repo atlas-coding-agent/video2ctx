@@ -173,6 +173,11 @@ export class RunEvidenceLedger {
     this.sql.exec(`CREATE TABLE IF NOT EXISTS agent_evidence_delivered_packets (
       run_id TEXT NOT NULL, packet_id TEXT NOT NULL, source TEXT NOT NULL, created_at INTEGER NOT NULL,
       PRIMARY KEY (run_id, packet_id))`);
+    // Every way a packet reached this run, for disclosure. Billing deduplication above keeps
+    // only the first delivery, so it cannot tell a later explicit read from an inherited one.
+    this.sql.exec(`CREATE TABLE IF NOT EXISTS agent_evidence_packet_operations (
+      run_id TEXT NOT NULL, packet_id TEXT NOT NULL, source TEXT NOT NULL, created_at INTEGER NOT NULL,
+      PRIMARY KEY (run_id, packet_id, source))`);
     // Receipts for every nonzero charge. Tool charges are settled through
     // agent_tool_calls.credits; delivery and provisional join rows add to the run total here.
     this.sql.exec(`CREATE TABLE IF NOT EXISTS agent_evidence_charges (
@@ -305,6 +310,22 @@ export class RunEvidenceLedger {
    * Units are grouped per call, so one read of several frames of a video is one frames
    * charge. New units that do not fit the remaining reserve are withheld, never free.
    */
+  /** Records one admitted delivery for disclosure. Never affects pricing. */
+  private recordOperation(runId: string, packetId: string, source: Exclude<EvidenceChargeSource, 'tool'>, now: number) {
+    this.sql.exec('INSERT OR IGNORE INTO agent_evidence_packet_operations VALUES (?, ?, ?, ?)', runId, packetId, source, now);
+  }
+
+  /** Every recorded delivery source per packet for one run. */
+  packetOperations(runId: string, packetIds: readonly string[]): Map<string, string[]> {
+    const operations = new Map<string, string[]>();
+    for (const row of this.sql.exec<{ packet_id: string; source: string }>(
+      `SELECT packet_id, source FROM agent_evidence_packet_operations WHERE run_id=? AND packet_id IN (SELECT value FROM json_each(?))
+       UNION SELECT packet_id, source FROM agent_evidence_delivered_packets WHERE run_id=? AND packet_id IN (SELECT value FROM json_each(?))`,
+      runId, JSON.stringify(packetIds), runId, JSON.stringify(packetIds)).toArray())
+      operations.set(row.packet_id, [...operations.get(row.packet_id) ?? [], row.source]);
+    return operations;
+  }
+
   deliver(
     runId: string,
     source: Exclude<EvidenceChargeSource, 'tool'>,
@@ -319,7 +340,7 @@ export class RunEvidenceLedger {
       const remaining = this.available(runId);
       let cost = 0;
       for (const packet of packets) {
-        if (!packet.excerpts.length) { result.admitted.push(packet); continue; }
+        if (!packet.excerpts.length) { this.recordOperation(runId, packet.packetId, source, now); result.admitted.push(packet); continue; }
         const mapped = packetChargeUnits(packet, lookup);
         if (!mapped) { result.unavailable.push(packet); continue; }
         // Price the full unit across the admitted batch before writing any receipts.
@@ -336,6 +357,7 @@ export class RunEvidenceLedger {
         for (const key of mapped.assetKeys) assetKeys.add(key);
         cost = nextCost;
         this.sql.exec('INSERT OR IGNORE INTO agent_evidence_delivered_packets VALUES (?, ?, ?, ?)', runId, packet.packetId, source, now);
+        this.recordOperation(runId, packet.packetId, source, now);
         result.admitted.push(packet);
       }
       if (!assetKeys.size) return result;

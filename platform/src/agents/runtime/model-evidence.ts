@@ -205,9 +205,7 @@ export function evidencePacketForModel(packet: EvidencePacket): ModelEvidencePac
     continuation: packet.continuation,
     warnings: [
       ...(visual && excerpts.length < packet.excerpts.length ? [visualTruncation(excerpts.length, packet.excerpts.length)] : []),
-      ...(visual && legacyVisualProvenance(packet) ? [{ code: 'LEGACY_VISUAL_PROVENANCE',
-        message: 'This visual analysis was saved before observations were tied to single frames. An observation repeated at several frames may describe them together; do not attribute it to any one frame.' }] : []),
-      ...packet.warnings,
+      ...withVisualProvenanceWarning(packet).warnings,
     ].slice(0, MODEL_WARNINGS),
   });
 }
@@ -215,6 +213,19 @@ export function evidencePacketForModel(packet: EvidencePacket): ModelEvidencePac
 function visualTruncation(shown: number, saved: number) {
   return { code: 'VISUAL_CONTEXT_TRUNCATED',
     message: `Only ${shown} of ${saved} saved visual observations fit this context. The others are saved but not shown; do not describe them or claim complete visual coverage.` };
+}
+
+const LEGACY_VISUAL_PROVENANCE_WARNING = { code: 'LEGACY_VISUAL_PROVENANCE',
+  message: 'This visual analysis was saved before observations were tied to single frames. An observation repeated at several frames may describe them together; do not attribute it to any one frame.' };
+
+/**
+ * The packet with a legacy-ownership warning when it needs one. Apply to the whole saved
+ * packet before selecting excerpts from it, since a subset can no longer show the repetition.
+ */
+export function withVisualProvenanceWarning(packet: EvidencePacket): EvidencePacket {
+  if ((packet.kind !== 'youtube_frames' && packet.kind !== 'youtube_storyboard') || !legacyVisualProvenance(packet)
+    || packet.warnings.some(warning => warning.code === LEGACY_VISUAL_PROVENANCE_WARNING.code)) return packet;
+  return { ...packet, warnings: [LEGACY_VISUAL_PROVENANCE_WARNING, ...packet.warnings] };
 }
 
 /** Saved before single-frame ownership, with the same observation text at different frames. */
@@ -264,15 +275,20 @@ function collectionPacketForModel(
   // get_playlist never accepted a continuation, including for packets saved before retrieval counts existed.
   const accepted = retrieval?.continuationAccepted ?? packet.kind !== 'youtube_playlist';
   const continuationShown = packet.kind !== 'youtube_search' && (options.continuation ?? true) && accepted && !!packet.continuation;
+  const comments = packet.kind === 'youtube_comments';
   const excerpts = packet.excerpts.slice(0, shown).map(excerpt => ({
     ...excerpt,
-    text: boundedText(excerpt.text, textLimit),
+    text: comments ? boundedCommentText(excerpt.text, textLimit) : boundedText(excerpt.text, textLimit),
   }));
   const sourceIds = new Set(excerpts.map(excerpt => excerpt.sourceId));
   const truncated = shown < retained ? [{
     code: 'COLLECTION_CONTEXT_TRUNCATED',
     message: `Only ${shown} of ${retained} retained list entries fit this context. The rest are saved but not shown.`,
   }] : [];
+  if (comments && excerpts.some((excerpt, index) => excerpt.text !== packet.excerpts[index]!.text.trim())) truncated.push({
+    code: 'COMMENT_TEXT_SHORTENED',
+    message: 'Some comment text was shortened to fit this context; each keeps its author. Do not describe the omitted text.',
+  });
   return modelEvidencePacketSchema.parse({
     packetId: packet.packetId,
     kind: packet.kind,
@@ -481,6 +497,21 @@ function reduceModelEvidencePacket(packet: ModelEvidencePacket): ModelEvidencePa
   });
 }
 
+/**
+ * A comment excerpt within `maximum` characters that keeps its attribution. The body is
+ * shortened from its end; search passages already begin just before their match.
+ */
+function boundedCommentText(value: string, maximum: number): string {
+  const text = value.trim();
+  if (text.length <= maximum) return text;
+  const at = text.lastIndexOf('\nAuthor: ');
+  if (at < 0) return boundedText(text, maximum);
+  const attribution = text.slice(at + 1).slice(0, Math.max(40, Math.floor(maximum / 2)));
+  const body = text.slice(0, at);
+  const room = Math.max(0, maximum - attribution.length - 2);
+  return `${body.slice(0, room)}…\n${attribution}`;
+}
+
 function boundedText(value: string, maximum: number): string {
   return value.trim().slice(0, maximum);
 }
@@ -499,12 +530,14 @@ export interface EvidenceRunRecord {
 export type EvidenceDeliveryOperation = NonNullable<ModelEvidencePacket['delivery']>['operation'];
 const IMAGE_ANALYSIS_TOOLS = new Set(['analyze_video_frames', 'analyze_video_storyboard']);
 const TRANSCRIPT_ANALYSIS_TOOLS = new Set(['analyze_video_transcript']);
+/** Deliveries a model of this run asked for. Other sources load earlier evidence automatically. */
+const EXPLICIT_READ_SOURCES = new Set(['search_context', 'read_prior_evidence', 'read_session_evidence']);
 
 /** The operation this turn performed for a packet. Anything without a current record is inherited. */
 export function evidenceDeliveryOperation(record: EvidenceRunRecord | undefined): EvidenceDeliveryOperation {
   if (record?.createdByTool) return IMAGE_ANALYSIS_TOOLS.has(record.createdByTool) ? 'image_analysis'
     : TRANSCRIPT_ANALYSIS_TOOLS.has(record.createdByTool) ? 'transcript_analysis' : 'retrieval';
-  return record?.deliveredSources.includes('search_context') ? 'saved_read' : 'inherited';
+  return record?.deliveredSources.some(source => EXPLICIT_READ_SOURCES.has(source)) ? 'saved_read' : 'inherited';
 }
 
 function deliveryNote(operation: EvidenceDeliveryOperation, kind: string): string {

@@ -15,6 +15,8 @@ import {
 } from './provider-evidence';
 
 const COMMENT_EXCERPT_CHARACTERS = 2_000;
+/** Context kept before a matched term, small enough that the match survives the smallest model text budget. */
+const PASSAGE_LEAD_CHARACTERS = 40;
 
 export const getVideoCommentsInputSchema = z.object({
   videoId: videoIdSchema,
@@ -176,7 +178,8 @@ export function commentPassage(comment: Comment, terms: readonly string[] = []):
     .filter(item => item.term && item.at >= 0).sort((a, b) => a.at - b.at)[0];
   if (!match || match.at + match.term.length <= budget - 1)
     return { text: `${body.slice(0, budget - 1)}…\n${attribution}` };
-  const start = Math.max(0, Math.min(match.at - Math.floor(budget / 3), body.length - (budget - 2)));
+  // Start just before the match, so a later shortening of the passage keeps the match.
+  const start = Math.max(0, match.at - PASSAGE_LEAD_CHARACTERS);
   const end = Math.min(body.length, start + budget - 2);
   return { text: `…${body.slice(start, end)}${end < body.length ? '…' : ''}\n${attribution}`, start };
 }

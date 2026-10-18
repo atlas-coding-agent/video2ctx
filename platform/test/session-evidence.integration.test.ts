@@ -1089,6 +1089,12 @@ test('searches every saved comment by full body and author, and pins later reads
     expect(tail.packets[0]!.excerpts[0]).toMatchObject({ id: expect.stringMatching(new RegExp(`^evidence:${version}:11:\\d+$`)),
       text: expect.stringContaining('final objection concerns the tilted board') });
     expect(tail.packets[0]!.excerpts[0]!.text).toContain('Author: Janine');
+    // The whole path to the answer model: the match and author survive its 800-character text budget.
+    const { finalizationEvidenceForModel } = await import('../src/agents/runtime/model-evidence');
+    const handed = finalizationEvidenceForModel(tail.packets, 100_000).evidence[0]!.excerpts![0]!.text;
+    expect(handed.length).toBeLessThanOrEqual(800);
+    expect(handed).toContain('objection concerns the tilted board');
+    expect(handed).toContain('Author: Janine');
     const first = await reopen().readEvidence(version);
     expect(first.packets[0]!.excerpts).toHaveLength(8);
     expect(first.nextOffset).toBe(8);
@@ -1109,4 +1115,37 @@ test('searches every saved comment by full body and author, and pins later reads
     await reopen().delete(version);
     await expect(sessionProvider(p, reopen()).comments(id, { pageVersion: version })).rejects.toThrow(/no longer available/);
     expect((await reopen().search.searchEvidence(reopen(), 'Gale')).packets.every(packet => !packet.assetVersions?.includes(version))).toBe(true);
+  }));
+
+test('versioned shared observations keep resolvable references, and search keeps legacy ownership warnings', async () =>
+  within('visual-provenance-versions', async (store) => {
+    const { visualAnalysisExcerpts } = await import('../src/agents/providers/youtube/visual-provenance');
+    const visual = visualAnalysisExcerpts({ kind: 'requested', idPrefix: `frames:${id}:tool`, sourceId: 'f',
+      findings: [{ observation: 'White is ahead.', frames: [1000] }],
+      sharedFindings: [{ observation: 'The scoreboard reads 2-1.', frames: [1000, 5000] }],
+      timeOf: time => time, assertAvailable: () => {} });
+    const versioned = await versionEvidencePacket({ packetId: 'packet:run:frames', kind: 'youtube_frames',
+      sources: [{ id: 'f', provider: 'youtube', kind: 'frames', videoId: id }], excerpts: visual.excerpts,
+      artifacts: [{ type: 'youtube_frame_analysis', data: { provenanceVersion: 2, sharedObservations: visual.sharedObservations } }],
+      warnings: [], usage: [] });
+    const ids = new Set(versioned.excerpts.map(excerpt => excerpt.id));
+    const shared = versioned.artifacts[0]!.data.sharedObservations as Array<{ excerptId: string }>;
+    expect(shared).toHaveLength(1);
+    for (const reference of shared) expect(ids.has(reference.excerptId)).toBe(true);
+
+    // A legacy packet repeated one observation at two frames; a single search hit must still say so.
+    const raw = await store.retrieve('frame:abcdefghijk:640:1000', 'frame', id, false,
+      async () => ({ value: oneFrame(id), cacheStatus: 'miss' as const }), () => ({ timestampMs: 1000 }));
+    const legacy = await versionEvidencePacket({ packetId: 'packet:old:frames', kind: 'youtube_frames', assetVersions: raw.assetVersions,
+      sources: [{ id: 'f', provider: 'youtube', kind: 'frames', videoId: id }],
+      excerpts: [1000, 5000].map(time => ({ id: `old:${time}`, sourceId: 'f', startMs: time, endMs: time,
+        text: 'Visual observation at requested frame: Earlier the bishop pins; later the knight forks.' })),
+      artifacts: [{ type: 'youtube_frame_analysis', data: {} }], warnings: [], usage: [] });
+    store.savePacket(legacy);
+    const hits = await store.search.searchEvidence(store, 'knight forks');
+    expect(hits.packets.length).toBeGreaterThan(0);
+    for (const hit of hits.packets) {
+      expect(hit.excerpts).toHaveLength(1);
+      expect(hit.warnings.map(warning => warning.code)).toContain('LEGACY_VISUAL_PROVENANCE');
+    }
   }));

@@ -1354,7 +1354,7 @@ export class AgentRuntimeDO extends Agent<Env, AgentRuntimeState> {
     await this.sessionStore.delete();
     this.sessionStore.search.clearHistory();
     for (const table of ['agent_trace_payload_chunks', 'agent_call_traces', 'agent_evidence_packets', 'agent_tool_calls', 'agent_routes',
-      'agent_events', 'agent_model_usage', 'agent_memory_jobs', 'agent_evidence_deliveries', 'agent_evidence_delivered_packets', 'agent_evidence_charges', 'agent_evidence_claims', 'agent_evidence_asset_claims', 'agent_memory_cost_reports', 'agent_runs', 'session_run_generations', 'session_memory_writes',
+      'agent_events', 'agent_model_usage', 'agent_memory_jobs', 'agent_evidence_deliveries', 'agent_evidence_delivered_packets', 'agent_evidence_packet_operations', 'agent_evidence_charges', 'agent_evidence_claims', 'agent_evidence_asset_claims', 'agent_memory_cost_reports', 'agent_runs', 'session_run_generations', 'session_memory_writes',
       'agent_trace_run_index', 'agent_trace_publish_order', 'agent_model_attempt_outbox']) {
       this.ctx.storage.sql.exec(`DELETE FROM ${table}`);
     }
@@ -1565,10 +1565,9 @@ export class AgentRuntimeDO extends Agent<Env, AgentRuntimeState> {
       LEFT JOIN agent_tool_calls c ON c.run_id = p.run_id AND c.tool_call_id = p.tool_call_id
       WHERE p.run_id = ${runId} AND p.packet_id IN (SELECT value FROM json_each(${ids}))
     `) entry(row.packet_id).createdByTool = row.tool_name ?? 'unknown_tool';
-    for (const row of this.sql<{ packet_id: string; source: string }>`
-      SELECT packet_id, source FROM agent_evidence_delivered_packets
-      WHERE run_id = ${runId} AND packet_id IN (SELECT value FROM json_each(${ids}))
-    `) entry(row.packet_id).deliveredSources.push(row.source);
+    // The operations table records every delivery; the billing ledger only the first one.
+    for (const [packetId, sources] of this.evidenceLedger.packetOperations(runId, JSON.parse(ids)))
+      entry(packetId).deliveredSources.push(...sources);
     return records;
   }
 

@@ -7,7 +7,7 @@ import { commentPageSlice, commentPassage, commentSearchText, executeGetVideoCom
 import { resolveTranscriptAnalystOutput } from '../src/agents/providers/youtube/transcript-analyst';
 import { visualAnalysisExcerpts, visualObservationText } from '../src/agents/providers/youtube/visual-provenance';
 import { createCapabilityProvider } from '../src/agents/research/capability-provider';
-import { evidenceDeliveryOperation, evidencePacketForModel, finalizationEvidenceForModel } from '../src/agents/runtime/model-evidence';
+import { evidenceDeliveryOperation, evidencePacketForModel, finalizationEvidenceForModel, withVisualProvenanceWarning } from '../src/agents/runtime/model-evidence';
 
 const VIDEO = 'abcdefghijk';
 const PAGE = 'a'.repeat(64);
@@ -19,7 +19,8 @@ function comments(count: number): Comment[] {
   }) as unknown as Comment);
 }
 
-function commentContext(page: Comment[], version: string | undefined = PAGE) {
+/** `null` simulates a provider without a session store, so the page is not saved. */
+function commentContext(page: Comment[], version: string | null = PAGE) {
   const provider = {
     comments: vi.fn(async (_id: string, options?: { pageVersion?: string }) => ({ cacheStatus: 'hit' as const, sessionReused: true,
       ...(version ? { assetVersions: [options?.pageVersion ?? version] } : {}),
@@ -63,7 +64,7 @@ describe('saved comment pages', () => {
   });
 
   it('offers no unpinned later reads when the page was not saved', async () => {
-    const { context } = commentContext(comments(14), undefined);
+    const { context } = commentContext(comments(14), null);
     const packet = await executeGetVideoComments({ videoId: VIDEO }, context, 'unsaved');
     expect(packet.artifacts[0]!.data).not.toHaveProperty('nextOffset');
     expect(packet.warnings.find(warning => warning.code === 'COMMENT_PAGE_REMAINING')!.message).toContain('was not saved');
@@ -100,6 +101,35 @@ describe('saved comment pages', () => {
     expect(passage.text.length).toBeLessThanOrEqual(2_000);
     expect(commentSearchText(long)).toContain('final objection');
     expect(commentSearchText(long)).toContain('Janine');
+  });
+
+  it('keeps a matched tail passage and its author through every model text budget', () => {
+    const long = { ...comments(12)[11]!, text: `${'Setup detail. '.repeat(150)}But the final objection is about tilting the brush.` } as Comment;
+    const passage = commentPassage(long, ['objection']);
+    // The packet a search hit produces: one passage excerpt, no artifacts.
+    const hit: EvidencePacket = { packetId: 'search:evidence:v:11:1', kind: 'youtube_comments', assetVersions: ['v'],
+      sources: [{ id: 'c', provider: 'youtube', kind: 'comments', videoId: VIDEO }],
+      excerpts: [{ id: 'evidence:v:11:1', sourceId: 'c', text: passage.text }], artifacts: [], warnings: [], usage: [] };
+    const projected = evidencePacketForModel(hit);
+    expect(projected.excerpts![0]!.text.length).toBeLessThanOrEqual(800);
+    expect(projected.excerpts![0]!.text).toContain('final objection');
+    expect(projected.excerpts![0]!.text).toContain('Author: Janine');
+    expect(projected.warnings.map(warning => warning.code)).toContain('COMMENT_TEXT_SHORTENED');
+    // Walk every budget down to the point where the entry no longer fits at all. Each shown
+    // variant, including the 300- and 120-character reductions, keeps the match and author.
+    const full = JSON.stringify(finalizationEvidenceForModel([hit], 1_000_000).evidence).length;
+    const lengths = new Set<number>();
+    for (let budget = full; budget > 0; budget -= 10) {
+      const shown = finalizationEvidenceForModel([hit], budget).evidence[0]?.excerpts?.[0]?.text;
+      if (shown === undefined) continue;
+      lengths.add(shown.length);
+      expect(shown).toContain('objection');
+      expect(shown).toContain('Author: Janine');
+    }
+    expect(Math.min(...lengths)).toBeLessThanOrEqual(120);
+    // The default excerpt of a long comment keeps its author too.
+    expect(evidencePacketForModel({ ...hit, excerpts: [{ ...hit.excerpts[0]!, text: summarizeComment(long) }] }).excerpts![0]!.text)
+      .toContain('Author: Janine');
   });
 
   it('states unknown page size for legacy comment packets', () => {
@@ -205,6 +235,17 @@ describe('frame-specific visual provenance', () => {
     expect(evidencePacketForModel(current).warnings.map(warning => warning.code)).not.toContain('LEGACY_VISUAL_PROVENANCE');
   });
 
+  it('keeps the legacy warning when a subset of a legacy packet is selected', () => {
+    const legacy: EvidencePacket = { packetId: 'packet:legacy-frames', kind: 'youtube_frames',
+      sources: [{ id: 'f', provider: 'youtube', kind: 'frames', videoId: VIDEO }],
+      excerpts: [10_000, 70_000].map((time, index) => ({ id: `old:${index}`, sourceId: 'f',
+        text: 'Visual observation at requested frame: Earlier white leads; later black leads.', startMs: time, endMs: time })),
+      artifacts: [{ type: 'youtube_frame_analysis', data: {} }], warnings: [], usage: [] };
+    const narrowed = { ...withVisualProvenanceWarning(legacy), excerpts: [legacy.excerpts[1]!], artifacts: [] };
+    expect(evidencePacketForModel(narrowed).warnings.filter(warning => warning.code === 'LEGACY_VISUAL_PROVENANCE')).toHaveLength(1);
+    expect(withVisualProvenanceWarning(withVisualProvenanceWarning(legacy)).warnings).toHaveLength(1);
+  });
+
   it('discloses shown and saved observations in projection and budget reduction', () => {
     const { excerpts } = build(Array.from({ length: 11 }, (_, index) => ({ observation: `Observation ${index}.`, frames: [index * 1000] })));
     const packet: EvidencePacket = { packetId: 'packet:frames', kind: 'youtube_frames',
@@ -213,7 +254,9 @@ describe('frame-specific visual provenance', () => {
     const projected = evidencePacketForModel(packet);
     expect(projected.visualDelivery).toEqual({ observationsShown: 8, observationsSaved: 11 });
     expect(projected.warnings.filter(warning => warning.code === 'VISUAL_CONTEXT_TRUNCATED')).toHaveLength(1);
-    const reduced = finalizationEvidenceForModel([packet], JSON.stringify([projected]).length - 1).evidence[0]!;
+    // Measure after reference shortening, so the budget demonstrably forces the reduced form.
+    const full = finalizationEvidenceForModel([packet], 1_000_000).evidence;
+    const reduced = finalizationEvidenceForModel([packet], JSON.stringify(full).length - 1).evidence[0]!;
     expect(reduced.visualDelivery).toEqual({ observationsShown: 5, observationsSaved: 11 });
     expect(reduced.warnings.find(warning => warning.code === 'VISUAL_CONTEXT_TRUNCATED')!.message).toContain('Only 5 of 11');
   });
@@ -244,7 +287,10 @@ describe('delivered context disclosure', () => {
     expect(evidenceDeliveryOperation({ createdByTool: 'analyze_video_transcript', deliveredSources: [] })).toBe('transcript_analysis');
     expect(evidenceDeliveryOperation({ createdByTool: 'get_video_frames', deliveredSources: [] })).toBe('retrieval');
     expect(evidenceDeliveryOperation({ deliveredSources: ['search_context'] })).toBe('saved_read');
-    expect(evidenceDeliveryOperation({ deliveredSources: ['read_prior_evidence'] })).toBe('inherited');
+    expect(evidenceDeliveryOperation({ deliveredSources: ['read_prior_evidence'] })).toBe('saved_read');
+    expect(evidenceDeliveryOperation({ deliveredSources: ['inherited_subject', 'read_prior_evidence'] })).toBe('saved_read');
+    expect(evidenceDeliveryOperation({ deliveredSources: ['inherited_subject'] })).toBe('inherited');
+    expect(evidenceDeliveryOperation({ deliveredSources: ['recovery_restore'] })).toBe('inherited');
     expect(evidenceDeliveryOperation(undefined)).toBe('inherited');
   });
 

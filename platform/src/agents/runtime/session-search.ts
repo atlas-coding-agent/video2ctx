@@ -3,6 +3,7 @@ import { tool, type ToolSet } from 'ai';
 import { z } from 'zod';
 import type { EvidencePacket } from '../contracts';
 import type { SessionEvidenceStore } from './session-evidence';
+import { withVisualProvenanceWarning } from './model-evidence';
 
 export interface HistoryEntry {
   id: string;
@@ -208,7 +209,8 @@ export class SessionSearch {
         if (packet.assetVersions?.some((version) => !store.has(version))) continue;
         const excerpts = packet.excerpts.filter((excerpt) => excerpt.id === row.id);
         if (!excerpts.length) continue;
-        packets.push({ ...packet, packetId: `search:${row.id}`, excerpts, artifacts: [] });
+        // A single hit cannot show that its packet repeated one observation across frames, so warn first.
+        packets.push({ ...withVisualProvenanceWarning(packet), packetId: `search:${row.id}`, excerpts, artifacts: [] });
         seen.add(row.id);
         break;
       }
