@@ -5,7 +5,7 @@ import { executeAnalyzeVideoStoryboard } from '../src/agents/providers/youtube/t
 import { env, runInDurableObject } from 'cloudflare:test';
 import { expect, test, vi } from 'vitest';
 import type { EvidencePacket } from '../src/agents/contracts';
-import type { Transcript } from 'all-things-youtube';
+import type { Comment, Transcript } from 'all-things-youtube';
 import { SessionEvidenceStore, versionEvidencePacket } from '../src/agents/runtime/session-evidence';
 import { remember } from './fixtures/memory';
 import { createCapabilityProvider } from '../src/agents/research/capability-provider';
@@ -14,6 +14,7 @@ import type { YouTubeAgentProvider } from '../src/agents/providers/youtube/provi
 import { executeGetVideoTranscript } from '../src/agents/providers/youtube/tools/get-video-transcript';
 import type { AgentToolContext } from '../src/agents/providers/youtube/tool-context';
 import { buildAgentTurnResult } from '../src/agents/finalizer';
+import { summarizeComment } from '../src/agents/providers/youtube/tools/get-video-comments';
 
 function visualGate() {
   let release!: () => void;
@@ -1156,13 +1157,16 @@ function commentPage(count: number, text: (index: number) => string) {
       text: text(index), isPinned: false, isHearted: false, replies: [] })) };
 }
 
-/** The first eight-comment packet a get_video_comments read saves for this page. */
+/**
+ * The first eight-comment packet a get_video_comments read saves for this page. Excerpts are
+ * bounded by the production summary, as the tool does; the saved page keeps the full text.
+ */
 function firstCommentPacket(version: string, page: ReturnType<typeof commentPage>): EvidencePacket {
   const sourceId = `youtube:${id}:comments`;
   return { packetId: 'packet:run:comments', kind: 'youtube_comments', assetVersions: [version],
     sources: [{ id: sourceId, provider: 'youtube', kind: 'comments', videoId: id }],
     excerpts: page.comments.slice(0, 8).map((comment, index) => ({ id: `comment:${comment.id}:${index}`, sourceId,
-      text: `${comment.text}\nAuthor: ${comment.author.name}` })),
+      text: summarizeComment(comment as unknown as Comment) })),
     artifacts: [{ type: 'youtube_comments', data: {} }], warnings: [], usage: [] };
 }
 
