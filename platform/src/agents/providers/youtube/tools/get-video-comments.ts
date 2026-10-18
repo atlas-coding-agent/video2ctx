@@ -165,16 +165,18 @@ export function summarizeComment(comment: Comment): string {
 }
 
 /**
- * A bounded passage of one comment. With search terms, a body longer than one excerpt is
- * shown around the earliest matching term, so a match in its tail stays visible.
+ * A bounded passage of one comment. A body longer than one excerpt is shown around a match,
+ * so a match in its tail stays visible. `rawMatchAt` is a match offset in the unmodified
+ * comment text, as reported by session search; without it the earliest literal occurrence
+ * of a term is used, the same substring rule a filtered saved read applies.
  * `start` is set only when the passage does not begin at the start of the body.
  */
-export function commentPassage(comment: Comment, terms: readonly string[] = []): { text: string; start?: number } {
+export function commentPassage(comment: Comment, terms: readonly string[] = [], rawMatchAt?: number): { text: string; start?: number } {
   const attribution = commentAttribution(comment);
   const body = normalizeCommentText(comment.text ?? '');
   const budget = COMMENT_EXCERPT_CHARACTERS - attribution.length - 1;
   if (body.length <= budget) return { text: body ? `${body}\n${attribution}` : attribution };
-  const match = earliestTokenMatch(body, terms);
+  const match = rawMatchAt !== undefined ? normalizedMatch(comment.text ?? '', rawMatchAt) : literalMatch(body, terms);
   if (!match || match.end <= budget - 1)
     return { text: `${body.slice(0, budget - 1)}…\n${attribution}` };
   // Start just before the match, so a later shortening of the passage keeps the match.
@@ -183,52 +185,21 @@ export function commentPassage(comment: Comment, terms: readonly string[] = []):
   return { text: `…${body.slice(start, end)}${end < body.length ? '…' : ''}\n${attribution}`, start };
 }
 
-/** Characters the search tokenizer keeps inside a token: letters and numbers, with their marks. */
-const TOKEN_CHARACTER = /[\p{L}\p{N}\p{M}]/u;
-
-/**
- * Lowercased text without diacritics, with each folded character mapped to its original
- * index. This mirrors the session search tokenizer (SQLite FTS5 unicode61, which removes
- * diacritics by default), so "cafe" finds "café".
- */
-function foldedText(text: string): { folded: string; origin: number[] } {
-  let folded = '';
-  const origin: number[] = [];
-  for (let index = 0; index < text.length;) {
-    const point = text.codePointAt(index)!;
-    const character = String.fromCodePoint(point);
-    for (const part of character.normalize('NFKD').replace(/\p{M}/gu, '').toLowerCase()) {
-      folded += part;
-      for (let unit = 0; unit < part.length; unit += 1) origin.push(index);
-    }
-    index += character.length;
-  }
-  return { folded, origin };
+function literalMatch(body: string, terms: readonly string[]): { at: number; end: number } | undefined {
+  const lower = body.toLowerCase();
+  return terms.map(term => ({ at: lower.indexOf(term.toLowerCase()), end: lower.indexOf(term.toLowerCase()) + term.length }))
+    .filter((item, index) => terms[index] && item.at >= 0).sort((a, b) => a.at - b.at)[0];
 }
 
 /**
- * The earliest whole-token occurrence of any search term, in original-text offsets. A term
- * inside a longer word, such as "art" in "start", is not a match, as in session search.
+ * A raw-text offset translated into the whitespace-normalized body. Normalizing only the
+ * prefix can differ from the full body by one trimmed space, well inside the passage lead.
+ * An offset past the body, such as an author-only match, has no body position.
  */
-export function earliestTokenMatch(text: string, terms: readonly string[]): { at: number; end: number } | undefined {
-  const { folded, origin } = foldedText(text);
-  let best: { at: number; end: number } | undefined;
-  for (const term of terms) {
-    const needle = foldedText(term).folded.trim();
-    if (!needle) continue;
-    for (let offset = folded.indexOf(needle); offset >= 0; offset = folded.indexOf(needle, offset + 1)) {
-      const before = folded[offset - 1];
-      const after = folded[offset + needle.length];
-      if ((before && TOKEN_CHARACTER.test(before)) || (after && TOKEN_CHARACTER.test(after))) continue;
-      const at = origin[offset]!;
-      // The end is the original index just after the last folded character of the match.
-      const last = origin[offset + needle.length - 1]!;
-      const end = last + String.fromCodePoint(text.codePointAt(last)!).length;
-      if (!best || at < best.at) best = { at, end };
-      break;
-    }
-  }
-  return best;
+function normalizedMatch(raw: string, rawAt: number): { at: number; end: number } | undefined {
+  if (rawAt < 0 || rawAt >= raw.length) return undefined;
+  const at = normalizeCommentText(raw.slice(0, rawAt)).length;
+  return { at, end: at + 1 };
 }
 
 /** Full searchable comment content: the whole body and the author, never a shortened excerpt. */

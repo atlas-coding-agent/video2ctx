@@ -1228,3 +1228,35 @@ test('an unfiltered saved comment read names its page version for continuation',
     expect(filtered.packets[0]!.artifacts[0]!.data.collection).toMatchObject({ matchesOnly: true });
     expect(filtered.packets[0]!.artifacts[0]!.data.collection).not.toHaveProperty('pageVersion');
   }));
+
+// Durable Object storage is real SQLite, so these cases check the actual unicode61 tokenizer.
+test.each([
+  ['a circled digit is not the digit', '① ', ' 1 marks the late match.', '1'],
+  ['a ligature is not its letters', 'ﬃ ', ' ffi marks the late match.', 'ffi'],
+  ['an accented Greek letter is not folded', 'ό ', ' ο marks the late match.', 'ο'],
+  ['a letter with two diacritics is not folded', 'ộ ', ' o marks the late match.', 'o'],
+  ['a term inside a longer word is not a match', 'start ', ' art marks the late match.', 'art'],
+  ['a single diacritic is folded', 'cafeteria ', ' café marks the late match.', 'cafe'],
+])('search passages follow the real tokenizer: %s', async (_name, early, late, query) =>
+  within(`comment-search-tokenizer-${query}`, async (store) => {
+    const page = commentPage(1, () => `${early}${'Padding words here. '.repeat(160)}${late}`);
+    const p = provider();
+    p.comments = vi.fn(async () => ({ cacheStatus: 'miss' as const, value: page }));
+    await sessionProvider(p, store).comments(id);
+    const found = await store.search.searchEvidence(store, query);
+    expect(found.packets).toHaveLength(1);
+    expect(found.packets[0]!.excerpts[0]!.text).toContain(late.trim());
+    expect(found.packets[0]!.excerpts[0]!.text).toContain('Author: Viewer 1');
+  }));
+
+test('an author-only comment match shows the comment start with its author', async () =>
+  within('comment-search-author-only', async (store) => {
+    const page = commentPage(1, () => `Opening line. ${'Padding words here. '.repeat(160)}`);
+    page.comments[0]!.author.name = 'Janine';
+    const p = provider();
+    p.comments = vi.fn(async () => ({ cacheStatus: 'miss' as const, value: page }));
+    await sessionProvider(p, store).comments(id);
+    const excerpt = (await store.search.searchEvidence(store, 'Janine')).packets[0]!.excerpts[0]!;
+    expect(excerpt.text.startsWith('Opening line.')).toBe(true);
+    expect(excerpt.text).toContain('Author: Janine');
+  }));

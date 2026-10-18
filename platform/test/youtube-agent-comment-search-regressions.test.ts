@@ -1,6 +1,6 @@
 import { describe, expect, it } from 'vitest';
 import type { Comment } from 'all-things-youtube';
-import { commentPassage, earliestTokenMatch } from '../src/agents/providers/youtube/tools/get-video-comments';
+import { commentPassage } from '../src/agents/providers/youtube/tools/get-video-comments';
 import { collectionRetrieval, modelCollection } from '../src/agents/runtime/collection-coverage';
 
 // Regressions for comment-search issues found in the independent PR211 review.
@@ -10,35 +10,32 @@ const longComment = (text: string) => ({
 }) as unknown as Comment;
 const filler = 'Some unrelated setup words here. '.repeat(70);
 
-describe('search passages use the same whole-token, accent-folded matching as session search', () => {
-  it('skips a term that only occurs inside a longer word', () => {
+describe('search passages are placed at the match offset session search reports', () => {
+  // Matching itself is decided by SQLite FTS5; session-evidence.integration.test.ts checks real tokenizer cases.
+  it('shows the passage at a late reported offset even when an earlier substring exists', () => {
     const text = `Before we start, ${filler} the real art of it is patience.`;
-    const match = earliestTokenMatch(text, ['art']);
-    expect(match).toBeDefined();
-    expect(text.slice(match!.at, match!.end)).toBe('art');
-    expect(match!.at).toBeGreaterThan(text.indexOf('the real'));
-    const passage = commentPassage(longComment(text), ['art']);
+    const passage = commentPassage(longComment(text), [], text.lastIndexOf('art'));
     expect(passage.start).toBeGreaterThan(0);
     expect(passage.text).toContain('the real art of it is patience');
     expect(passage.text).toContain('Author: Janine');
   });
 
-  it('finds an accented word from an unaccented term, at its original offsets', () => {
-    const text = `${filler}We finally met at the café near the station.`;
-    const match = earliestTokenMatch(text, ['cafe']);
-    expect(text.slice(match!.at, match!.end)).toBe('café');
-    const passage = commentPassage(longComment(text), ['cafe']);
-    expect(passage.text).toContain('the café near the station');
+  it('maps a raw offset through whitespace normalization', () => {
+    const text = `${'Padding   with \t extra   spaces. '.repeat(90)}The objection is here.`;
+    const passage = commentPassage(longComment(text), [], text.indexOf('The objection'));
+    expect(passage.text).toContain('The objection is here.');
   });
 
-  it('maps decomposed accents and case back to the original text', () => {
-    const text = 'A CAFE\u0301 sign';
-    const match = earliestTokenMatch(text, ['café']);
-    expect(text.slice(match!.at, match!.end)).toBe('CAFE');
+  it('starts at the beginning for an author-only match, keeping the attribution', () => {
+    const text = filler;
+    const passage = commentPassage(longComment(text), [], text.length + 1);
+    expect(passage.start).toBeUndefined();
+    expect(passage.text).toContain('Author: Janine');
   });
 
-  it('returns no match when the term is only a fragment', () => {
-    expect(earliestTokenMatch('Restart the article', ['art'])).toBeUndefined();
+  it('keeps literal matching for filtered saved reads without a reported offset', () => {
+    const text = `${filler}The final objection.`;
+    expect(commentPassage(longComment(text), ['objection']).text).toContain('The final objection.');
   });
 });
 

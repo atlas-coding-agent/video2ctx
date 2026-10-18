@@ -567,8 +567,8 @@ export class SessionEvidenceStore implements SessionAccess {
   commentPageCache(): CommentPageCache {
     return { generation: this.generation(), pages: new Map() };
   }
-  /** One saved comment for a search hit, shown around the earliest matching term. */
-  async readSavedComment(version: string, position: number, terms: readonly string[], cache?: CommentPageCache) {
+  /** One saved comment for a search hit, shown around the match search reported at `rawMatchAt`. */
+  async readSavedComment(version: string, position: number, rawMatchAt: number | undefined, cache?: CommentPageCache) {
     const cached = cache && cache.generation === this.generation() ? cache.pages.get(version) : undefined;
     const loaded = cached ?? (async () => {
       const asset = this.brief().assets.find((item) => item.version === version);
@@ -581,8 +581,8 @@ export class SessionEvidenceStore implements SessionAccess {
     if (!this.has(version) || (cache && cache.generation !== this.generation())) throw new Error('Session asset is unavailable or deleted.');
     const comment = page.comments[position];
     if (!comment) return { packets: [] };
-    const packet = await this.commentPacket(page.asset, [{ comment, position }], terms,
-      `session:${version}:comment:${position}:${await sha256(terms.join(' '))}`, { savedPageCount: 1 }, page.current);
+    const packet = await this.commentPacket(page.asset, [{ comment, position, rawMatchAt }], [],
+      `session:${version}:comment:${position}:${rawMatchAt ?? 'start'}`, { savedPageCount: 1 }, page.current);
     this.savePacket(packet);
     return { packets: [packet] };
   }
@@ -592,7 +592,7 @@ export class SessionEvidenceStore implements SessionAccess {
     if (!comments) throw new Error('Session asset is unavailable or deleted.');
     return comments;
   }
-  private async commentPacket(asset: SessionAsset, entries: Array<{ comment: Comment; position: number }>, terms: readonly string[],
+  private async commentPacket(asset: SessionAsset, entries: Array<{ comment: Comment; position: number; rawMatchAt?: number }>, terms: readonly string[],
     packetId: string, data: Record<string, unknown>, current = this.currentVersions().has(asset.version)) {
     const sourceId = `youtube:${asset.videoId}:comments`;
     return evidencePacketSchema.parse({
@@ -603,8 +603,8 @@ export class SessionEvidenceStore implements SessionAccess {
         url: `https://www.youtube.com/watch?v=${asset.videoId}` }],
       // Version-specific IDs: a refreshed page can reuse comment IDs with different text.
       // A passage that does not start at the body start has its own ID, so one ID never names two texts.
-      excerpts: entries.map(({ comment, position }) => {
-        const passage = commentPassage(comment, terms);
+      excerpts: entries.map(({ comment, position, rawMatchAt }) => {
+        const passage = commentPassage(comment, terms, rawMatchAt);
         return { id: `evidence:${asset.version}:${position}${passage.start === undefined ? '' : `:${passage.start}`}`, sourceId, text: passage.text };
       }),
       artifacts: [{ type: 'youtube_comments', title: `Saved comments for ${asset.videoId}`, data: { returnedCount: entries.length, ...data } }],
