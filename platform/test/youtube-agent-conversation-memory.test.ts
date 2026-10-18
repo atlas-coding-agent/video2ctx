@@ -1,8 +1,9 @@
 import { describe, expect, it } from 'vitest';
-import { metadataForConversation } from '../src/agents/runtime/conversation-metadata';
-import type { EvidencePacket } from '../src/agents/contracts';
+import { metadataForConversation, unambiguousMetadataRecords } from '../src/agents/runtime/conversation-metadata';
+import type { AgentCitation, EvidencePacket } from '../src/agents/contracts';
 import {
   boundConversationHistory,
+  citedEvidenceForConversation,
   conversationModelMessages,
   resolveConversationHistory,
   type LinkedConversationTurn,
@@ -117,6 +118,66 @@ describe('YouTube agent conversation memory', () => {
     expect(messages[1]).toEqual({ role: 'assistant', content: 'prior-assistant' });
     expect(JSON.stringify(messages[2])).toContain('current-user');
     expect(JSON.stringify(messages[2])).toContain('packet-1');
+  });
+});
+
+describe('cited evidence lineage', () => {
+  const source = { id: 'youtube:abcdefghijk:transcript', provider: 'youtube' as const, kind: 'transcript' as const,
+    videoId: 'abcdefghijk', url: 'https://www.youtube.com/watch?v=abcdefghijk' };
+  const packet = (packetId: string, excerpts: Array<{ id: string; text: string; startMs?: number }>, assetVersions?: string[]): EvidencePacket => ({
+    packetId, kind: 'youtube_transcript', sources: [source], assetVersions,
+    excerpts: excerpts.map(excerpt => ({ ...excerpt, sourceId: source.id })), artifacts: [{ type: 'note', data: { private: 'uncited' } }], warnings: [], usage: [],
+  });
+  const cite = (excerpt: { id: string; text: string; startMs?: number; endMs?: number }): AgentCitation => ({ id: excerpt.id, sourceId: source.id,
+    provider: 'youtube', videoId: source.videoId, url: source.url, excerpt: excerpt.text, startMs: excerpt.startMs,
+    endMs: excerpt.endMs, sourceKind: 'transcript' });
+
+  it('keeps delivered packet scope but restores only cited excerpts from a saved fallback', () => {
+    const delivered = packet('packet:run-1:tool', [{ id: 'a', text: 'Cited line', startMs: 1000 }, { id: 'b', text: 'Uncited line' }], ['v1']);
+    const saved = packet('session:v2:0:30:hash', [{ id: 'c', text: 'Search hit', startMs: 2000 }, { id: 'd', text: 'Neighbour' }], ['v2']);
+    const restored = citedEvidenceForConversation([cite(delivered.excerpts[0]!), cite(saved.excerpts[0]!)], [delivered], [saved]);
+    expect(restored.map(item => item.packetId)).toEqual(['packet:run-1:tool', 'session:v2:0:30:hash']);
+    expect(restored[0]!.excerpts.map(item => item.id)).toEqual(['a', 'b']);
+    expect(restored[1]).toMatchObject({ excerpts: [{ id: 'c' }], artifacts: [] });
+    // An admitted packet that the turn never cited is not lineage.
+    expect(citedEvidenceForConversation([cite(saved.excerpts[0]!)], [delivered], [saved]).map(item => item.packetId))
+      .toEqual(['session:v2:0:30:hash']);
+  });
+
+  it('rejects legacy ID collisions across saved versions', () => {
+    const excerpt = { id: 'transcript:abcdefghijk:0:0:0', text: 'Same caption', startMs: 0 };
+    const first = packet('session:v1:0:30:hash', [excerpt], ['v1']);
+    const second = packet('session:v2:0:30:hash', [excerpt], ['v2']);
+    expect(citedEvidenceForConversation([cite(excerpt)], [], [first, second])).toEqual([]);
+    expect(citedEvidenceForConversation([cite(excerpt)], [], [first]).map(item => item.packetId)).toEqual(['session:v1:0:30:hash']);
+  });
+
+  it('requires exact source, text and timestamps rather than an excerpt ID alone', () => {
+    const saved = packet('session:v1:0:30:hash', [{ id: 'a', text: 'Original caption', startMs: 1000 }], ['v1']);
+    const citation = cite(saved.excerpts[0]!);
+    expect(citedEvidenceForConversation([{ ...citation, excerpt: 'Edited caption' }], [], [saved])).toEqual([]);
+    expect(citedEvidenceForConversation([{ ...citation, startMs: 2000 }], [], [saved])).toEqual([]);
+    expect(citedEvidenceForConversation([{ ...citation, videoId: 'zyxwvutsrqp' }], [], [saved])).toEqual([]);
+    expect(citedEvidenceForConversation([citation], [], [saved])).toHaveLength(1);
+  });
+
+  it('copies superseded warnings without mutating stored packets', () => {
+    const delivered = packet('packet:run-1:tool', [{ id: 'a', text: 'Old caption', startMs: 0 }], ['v1']);
+    const saved = { ...delivered, warnings: [{ code: 'SUPERSEDED_SESSION_EVIDENCE', message: 'Older version.' }] };
+    const restored = citedEvidenceForConversation([cite(delivered.excerpts[0]!)], [delivered], [saved]);
+    expect(restored[0]!.warnings.map(item => item.code)).toEqual(['SUPERSEDED_SESSION_EVIDENCE']);
+    expect(delivered.warnings).toEqual([]);
+  });
+
+  it('reconstructs only delivered metadata snapshots and rejects conflicting observations', () => {
+    const video = (viewCount: number, packetId: string): EvidencePacket => ({ packetId, kind: 'youtube_video',
+      sources: [{ id: 'video', provider: 'youtube', kind: 'video', videoId: 'abcdefghijk', title: 'Video' }], excerpts: [],
+      artifacts: [{ type: 'youtube_video_metadata', data: { id: 'abcdefghijk', viewCount } }], warnings: [], usage: [] });
+    const one = { packet: video(10, 'packet:a'), recordedAt: 2000 };
+    const conflicting = { packet: video(20, 'packet:b'), recordedAt: 2000 };
+    const other = { packet: video(30, 'packet:c'), recordedAt: 3000 };
+    expect(unambiguousMetadataRecords([one, other], new Set(['memory:abcdefghijk:2000']))).toEqual([one]);
+    expect(unambiguousMetadataRecords([one, conflicting], new Set(['memory:abcdefghijk:2000']))).toEqual([]);
   });
 });
 
