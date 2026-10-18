@@ -103,33 +103,64 @@ describe('saved comment pages', () => {
     expect(commentSearchText(long)).toContain('Janine');
   });
 
-  it('keeps a matched tail passage and its author through every model text budget', () => {
-    const long = { ...comments(12)[11]!, text: `${'Setup detail. '.repeat(150)}But the final objection is about tilting the brush.` } as Comment;
-    const passage = commentPassage(long, ['objection']);
-    // The packet a search hit produces: one passage excerpt, no artifacts.
-    const hit: EvidencePacket = { packetId: 'search:evidence:v:11:1', kind: 'youtube_comments', assetVersions: ['v'],
-      sources: [{ id: 'c', provider: 'youtube', kind: 'comments', videoId: VIDEO }],
-      excerpts: [{ id: 'evidence:v:11:1', sourceId: 'c', text: passage.text }], artifacts: [], warnings: [], usage: [] };
-    const projected = evidencePacketForModel(hit);
-    expect(projected.excerpts![0]!.text.length).toBeLessThanOrEqual(800);
-    expect(projected.excerpts![0]!.text).toContain('final objection');
-    expect(projected.excerpts![0]!.text).toContain('Author: Janine');
-    expect(projected.warnings.map(warning => warning.code)).toContain('COMMENT_TEXT_SHORTENED');
-    // Walk every budget down to the point where the entry no longer fits at all. Each shown
-    // variant, including the 300- and 120-character reductions, keeps the match and author.
+  // The packet a search hit produces: one passage excerpt, no artifacts.
+  const commentHit = (text: string): EvidencePacket => ({ packetId: 'search:evidence:v:11:1', kind: 'youtube_comments', assetVersions: ['v'],
+    sources: [{ id: 'c', provider: 'youtube', kind: 'comments', videoId: VIDEO }],
+    excerpts: [{ id: 'evidence:v:11:1', sourceId: 'c', text }], artifacts: [], warnings: [], usage: [] });
+  /** Every finalization budget down to the point where the entry no longer fits; returns the shown text lengths. */
+  const shownAcrossBudgets = (hit: EvidencePacket, check: (text: string) => void) => {
     const full = JSON.stringify(finalizationEvidenceForModel([hit], 1_000_000).evidence).length;
     const lengths = new Set<number>();
     for (let budget = full; budget > 0; budget -= 10) {
       const shown = finalizationEvidenceForModel([hit], budget).evidence[0]?.excerpts?.[0]?.text;
       if (shown === undefined) continue;
       lengths.add(shown.length);
+      check(shown);
+    }
+    return lengths;
+  };
+
+  it('delivers a matched tail passage that fits unshortened, with its author, through every budget', () => {
+    const long = { ...comments(12)[11]!, text: `${'Setup detail. '.repeat(150)}But the final objection is about tilting the brush.` } as Comment;
+    const passage = commentPassage(long, ['objection']);
+    // Starting just before the match makes this tail passage shorter than the 800-character model budget.
+    expect(passage.text.length).toBeLessThanOrEqual(800);
+    const projected = evidencePacketForModel(commentHit(passage.text));
+    expect(projected.excerpts![0]!.text).toBe(passage.text);
+    expect(projected.excerpts![0]!.text).toContain('final objection');
+    expect(projected.excerpts![0]!.text).toContain('Author: Janine');
+    expect(projected.warnings.map(warning => warning.code)).not.toContain('COMMENT_TEXT_SHORTENED');
+    // Smaller reductions, down to 120 characters, still keep the match and the author.
+    const lengths = shownAcrossBudgets(commentHit(passage.text), shown => {
       expect(shown).toContain('objection');
       expect(shown).toContain('Author: Janine');
-    }
+    });
     expect(Math.min(...lengths)).toBeLessThanOrEqual(120);
-    // The default excerpt of a long comment keeps its author too.
-    expect(evidencePacketForModel({ ...hit, excerpts: [{ ...hit.excerpts[0]!, text: summarizeComment(long) }] }).excerpts![0]!.text)
-      .toContain('Author: Janine');
+  });
+
+  it('shortens an oversized matched passage to the model budget, keeps match and author, and warns', () => {
+    // The match sits mid-comment with far more text after it, so its passage exceeds 800 characters.
+    const long = { ...comments(12)[11]!, text: `${'Setup detail. '.repeat(150)}But the final objection is about tilting the brush. ${'Further detail. '.repeat(120)}` } as Comment;
+    const passage = commentPassage(long, ['objection']);
+    expect(passage.start).toBeGreaterThan(0);
+    expect(passage.text.length).toBeGreaterThan(800);
+    const projected = evidencePacketForModel(commentHit(passage.text));
+    const shown = projected.excerpts![0]!.text;
+    expect(shown.length).toBeLessThanOrEqual(800);
+    expect(shown.length).toBeLessThan(passage.text.length);
+    expect(shown).toContain('final objection is about tilting the brush');
+    expect(shown.endsWith('Author: Janine\nLikes: 0\nReplies: 0')).toBe(true);
+    expect(projected.warnings.map(warning => warning.code)).toContain('COMMENT_TEXT_SHORTENED');
+    const lengths = shownAcrossBudgets(commentHit(passage.text), text => {
+      expect(text).toContain('objection');
+      expect(text).toContain('Author: Janine');
+    });
+    expect(Math.min(...lengths)).toBeLessThanOrEqual(120);
+    // The default excerpt of a long comment is oversized too, and keeps its author when shortened.
+    const summary = evidencePacketForModel(commentHit(summarizeComment(long)));
+    expect(summary.excerpts![0]!.text.length).toBeLessThanOrEqual(800);
+    expect(summary.excerpts![0]!.text).toContain('Author: Janine');
+    expect(summary.warnings.map(warning => warning.code)).toContain('COMMENT_TEXT_SHORTENED');
   });
 
   it('states unknown page size for legacy comment packets', () => {
