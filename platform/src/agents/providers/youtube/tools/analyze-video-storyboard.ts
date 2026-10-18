@@ -7,7 +7,7 @@ import { analyzeStoryboardBatches } from '../storyboard-analysis-batches';
 import type { AgentToolContext } from '../tool-context';
 import { readAnalysisAssets, storedVisualInputSchema } from './stored-analysis';
 import { safeIdPart, youtubeVideoUrl } from './provider-evidence';
-import { visualObservationText } from '../visual-provenance';
+import { VISUAL_PROVENANCE_VERSION, visualAnalysisExcerpts } from '../visual-provenance';
 
 export function createAnalyzeVideoStoryboardTool(context: AgentToolContext) {
   return tool({
@@ -81,30 +81,23 @@ export function executeAnalyzeVideoStoryboard(
       await readAnalysisAssets(context, versions, 'storyboard_sheet');
       const videoId = storyboard.videoId;
       const sourceId = `youtube:${videoId}:storyboard`;
+      const available = (frame: number) => {
+        if (!storyboard.sheets.some((sheet) => frame >= sheet.firstFrameIndex && frame < sheet.firstFrameIndex + sheet.frameCount))
+          throw new Error(`Visual analyst referenced unavailable frame ${frame}.`);
+      };
+      const visual = visualAnalysisExcerpts({
+        kind: 'sampled', idPrefix: `storyboard:${videoId}:${safeIdPart(toolCallId)}`, sourceId,
+        findings: analysis.findings.map(finding => ({ observation: finding.observation, frames: finding.frameIndexes })),
+        sharedFindings: analysis.sharedFindings.map(finding => ({ observation: finding.observation, frames: finding.frameIndexes })),
+        timeOf: frame => frame * storyboard.intervalMs, idOf: frame => frame, assertAvailable: available,
+      });
       return evidencePacketSchema.parse({
         packetId: `packet:${context.runId}:${safeIdPart(toolCallId)}`,
         kind: 'youtube_storyboard',
         sources: [
           { id: sourceId, provider: 'youtube', kind: 'storyboard', videoId, url: youtubeVideoUrl(videoId) },
         ],
-        excerpts: analysis.findings.flatMap((finding, index) =>
-          [...new Set(finding.frameIndexes)].map((frame) => {
-            if (
-              !storyboard.sheets.some(
-                (sheet) => frame >= sheet.firstFrameIndex && frame < sheet.firstFrameIndex + sheet.frameCount,
-              )
-            )
-              throw new Error(`Visual analyst referenced unavailable frame ${frame}.`);
-            const time = frame * storyboard.intervalMs;
-            return {
-              id: `storyboard:${videoId}:${safeIdPart(toolCallId)}:${index}:${frame}`,
-              sourceId,
-              text: visualObservationText('sampled', finding.observation, finding.frameIndexes.map(index => index * storyboard.intervalMs)),
-              startMs: time,
-              endMs: time,
-            };
-          }),
-        ),
+        excerpts: visual.excerpts,
         artifacts: [
           {
             type: 'youtube_storyboard_analysis',
@@ -123,6 +116,8 @@ export function executeAnalyzeVideoStoryboard(
                 endMs: (sheet.firstFrameIndex + sheet.frameCount - 1) * sheet.intervalMs,
               })),
               totalFrames: storyboard.frameCount,
+              provenanceVersion: VISUAL_PROVENANCE_VERSION,
+              sharedObservations: visual.sharedObservations,
               sampledFrames: analysis.analyzedSheets.reduce((sum, sheet) => sum + sheet.frameCount, 0),
               intervalMs: storyboard.intervalMs,
             },

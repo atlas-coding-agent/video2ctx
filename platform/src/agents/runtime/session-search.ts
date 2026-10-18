@@ -136,11 +136,11 @@ export class SessionSearch {
     this.indexAsset(version, excerpts.map(excerpt => excerpt.text));
   }
   /** Index one saved asset by entry position. Row IDs equal the saved-read citation IDs. */
-  indexAsset(version: string, texts: readonly string[]) {
+  indexAsset(version: string, texts: readonly string[], extra: { kind?: 'comments' } = {}) {
     const owner = `asset:${version}`;
     this.sql.exec('DELETE FROM session_context_fts WHERE owner=?', owner);
     texts.forEach((text, index) =>
-      this.insert(`evidence:${version}:${index}`, owner, 'evidence', text, { version, offset: index }),
+      this.insert(`evidence:${version}:${index}`, owner, 'evidence', text, { version, offset: index, ...extra }),
     );
     this.sql.exec('INSERT OR IGNORE INTO session_search_assets VALUES (?)', version);
   }
@@ -156,11 +156,8 @@ export class SessionSearch {
   }
   private matches(scope: 'memory' | 'evidence', query: string, excludedOwners: readonly string[] = []): SearchRow[] {
     // Literal tokens joined with AND support nonadjacent terms without exposing FTS operators.
-    const tokens = query
-      .slice(0, 200)
-      .match(/[\p{L}\p{N}_]+/gu)
-      ?.slice(0, 20);
-    if (!tokens?.length) return [];
+    const tokens = queryTokens(query);
+    if (!tokens.length) return [];
     // Exclusions apply before the limit, so excluded rows can never fill the top 20.
     const excluded = excludedOwners.length ? ` AND owner NOT IN (${excludedOwners.map(() => '?').join(',')})` : '';
     return this.sql
@@ -190,7 +187,17 @@ export class SessionSearch {
     const excluded = store.overLimitTranscriptVersions().map((version) => `asset:${version}`);
     for (const row of this.matches('evidence', query, excluded)) {
       if (seen.has(row.id)) continue;
-      const metadata = JSON.parse(row.metadata) as { version?: string; offset?: number; packetId?: string };
+      const metadata = JSON.parse(row.metadata) as { version?: string; offset?: number; packetId?: string; kind?: string };
+      if (metadata.kind === 'comments' && metadata.version) {
+        // A comment hit is shown around the matched terms, which may lie past one excerpt's length.
+        const found = store.has(metadata.version) ? (await store.readSavedComment(metadata.version, metadata.offset ?? 0, queryTokens(query))).packets : [];
+        const excerpt = found[0]?.excerpts[0];
+        if (found[0] && excerpt) {
+          packets.push({ ...found[0], packetId: `search:${excerpt.id}`, excerpts: [excerpt], artifacts: [] });
+          seen.add(row.id);
+        }
+        continue;
+      }
       const found = metadata.version
         // Backstop for a version that crossed the limit between the query and this read.
         ? store.has(metadata.version) && !store.transcriptOverLimit(metadata.version)
@@ -271,4 +278,8 @@ export class SessionSearch {
       }),
     };
   }
+}
+
+function queryTokens(query: string): string[] {
+  return query.slice(0, 200).match(/[\p{L}\p{N}_]+/gu)?.slice(0, 20) ?? [];
 }

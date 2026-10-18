@@ -5,8 +5,8 @@ import { VideoTooLongError } from './video-duration-limit';
 import type { ToolSet } from 'ai';
 import type { Comment, Transcript } from 'all-things-youtube';
 import { completeTranscriptEvidence } from '../providers/youtube/tools/get-video-transcript';
-import { commentPageSlice, summarizeComment } from '../providers/youtube/tools/get-video-comments';
-import { COLLECTION_ITEM_LIMIT, collectionRetrieval } from './collection-coverage';
+import { commentPageSlice, commentPassage, commentSearchText } from '../providers/youtube/tools/get-video-comments';
+import { COMMENT_READ_LIMIT, collectionRetrieval } from './collection-coverage';
 import { sha256 } from '../../lib/http';
 import type { CachedResult } from '../../lib/youtube';
 import { memoryUpdateSchema, evidencePacketSchema, type EvidencePacket } from '../contracts';
@@ -177,9 +177,9 @@ export class SessionEvidenceStore implements SessionAccess {
       if (!value) continue;
       if (kind === 'transcript') this.indexTranscript(version, value as Transcript);
       else {
-        // Index every saved comment, including those past one read's limit, so search can reach them.
+        // Index every saved comment by its whole body and author, never a shortened excerpt.
         const comments = savedComments(value);
-        if (comments) this.search.indexAsset(version, comments.map(summarizeComment));
+        if (comments) this.search.indexAsset(version, comments.map(commentSearchText), { kind: 'comments' });
       }
     }
   }
@@ -533,43 +533,66 @@ export class SessionEvidenceStore implements SessionAccess {
       .slice(0, 4);
     return { packets: selected, needsInspection: selected.length === 0 };
   }
-  /** A bounded read of one saved comment page, by offset and optional literal text. */
+  /**
+   * A bounded read of one saved comment page, by offset and optional literal text. A query
+   * matches the whole body and the author; matching long comments return the passage
+   * around the match with their attribution.
+   */
   private async readCommentEvidence(asset: SessionAsset, offset: number, query?: string) {
-    const value = await this.read(asset.version);
-    const comments = value === null ? undefined : savedComments(value);
-    if (!comments) throw new Error('Session asset is unavailable or deleted.');
-    const needle = query?.toLowerCase();
+    const comments = await this.savedCommentPage(asset);
+    const needle = query?.trim().toLowerCase();
     const positions = comments.map((comment, position) => ({ comment, position }))
-      .filter(({ comment }) => !needle || summarizeComment(comment).toLowerCase().includes(needle));
-    const slice = commentPageSlice(positions.map(({ comment }) => comment), offset, COLLECTION_ITEM_LIMIT);
-    const sourceId = `youtube:${asset.videoId}:comments`;
-    const current = this.currentVersions().has(asset.version);
-    const packet = evidencePacketSchema.parse({
-      packetId: `session:${asset.version}:${slice.start}:${COLLECTION_ITEM_LIMIT}:${await sha256(query ?? '')}`,
-      kind: 'youtube_comments',
-      assetVersions: [asset.version],
-      sources: [{ id: sourceId, provider: 'youtube', kind: 'comments', videoId: asset.videoId,
-        url: `https://www.youtube.com/watch?v=${asset.videoId}` }],
-      // Version-specific IDs: a refreshed page can reuse comment IDs with different text.
-      excerpts: slice.page.map(({ position }) => {
-        const entry = positions[position]!;
-        return { id: `evidence:${asset.version}:${entry.position}`, sourceId, text: summarizeComment(entry.comment) };
-      }),
-      artifacts: [{ type: 'youtube_comments', title: `Saved comments for ${asset.videoId}`, data: {
-        returnedCount: slice.page.length,
+      .filter(({ comment }) => !needle || commentSearchText(comment).toLowerCase().includes(needle));
+    const slice = commentPageSlice(positions, offset, COMMENT_READ_LIMIT);
+    const packet = await this.commentPacket(asset, slice.page.map(({ comment: entry }) => entry), needle ? [needle] : [],
+      `session:${asset.version}:${slice.start}:${COMMENT_READ_LIMIT}:${await sha256(query ?? '')}`, {
         savedPageCount: comments.length,
         ...(query ? { matchingCount: positions.length } : {}),
         ...(slice.nextOffset !== undefined ? { nextOffset: slice.nextOffset } : {}),
         // Counts describe the matching entries when a query filters the saved page.
         collection: collectionRetrieval({ fetchedCount: positions.length, retainedCount: slice.page.length,
           continuationAccepted: true, pageOffset: slice.start, nextPageOffset: slice.nextOffset }),
-      } }],
-      warnings: current ? [] : [{ code: 'SUPERSEDED_SESSION_EVIDENCE',
+      });
+    this.savePacket(packet);
+    return { packets: [packet], nextOffset: slice.nextOffset };
+  }
+  /** One saved comment for a search hit, shown around the earliest matching term. */
+  async readSavedComment(version: string, position: number, terms: readonly string[]) {
+    const asset = this.brief().assets.find((item) => item.version === version);
+    if (asset?.kind !== 'comments') throw new Error('Session asset is unavailable or deleted.');
+    const comment = (await this.savedCommentPage(asset))[position];
+    if (!comment) return { packets: [] };
+    const packet = await this.commentPacket(asset, [{ comment, position }], terms,
+      `session:${version}:comment:${position}:${await sha256(terms.join(' '))}`, { savedPageCount: 1 });
+    this.savePacket(packet);
+    return { packets: [packet] };
+  }
+  private async savedCommentPage(asset: SessionAsset): Promise<Comment[]> {
+    const value = await this.read(asset.version);
+    const comments = value === null ? undefined : savedComments(value);
+    if (!comments) throw new Error('Session asset is unavailable or deleted.');
+    return comments;
+  }
+  private async commentPacket(asset: SessionAsset, entries: Array<{ comment: Comment; position: number }>, terms: readonly string[],
+    packetId: string, data: Record<string, unknown>) {
+    const sourceId = `youtube:${asset.videoId}:comments`;
+    return evidencePacketSchema.parse({
+      packetId,
+      kind: 'youtube_comments',
+      assetVersions: [asset.version],
+      sources: [{ id: sourceId, provider: 'youtube', kind: 'comments', videoId: asset.videoId,
+        url: `https://www.youtube.com/watch?v=${asset.videoId}` }],
+      // Version-specific IDs: a refreshed page can reuse comment IDs with different text.
+      // A passage that does not start at the body start has its own ID, so one ID never names two texts.
+      excerpts: entries.map(({ comment, position }) => {
+        const passage = commentPassage(comment, terms);
+        return { id: `evidence:${asset.version}:${position}${passage.start === undefined ? '' : `:${passage.start}`}`, sourceId, text: passage.text };
+      }),
+      artifacts: [{ type: 'youtube_comments', title: `Saved comments for ${asset.videoId}`, data: { returnedCount: entries.length, ...data } }],
+      warnings: this.currentVersions().has(asset.version) ? [] : [{ code: 'SUPERSEDED_SESSION_EVIDENCE',
         message: 'This evidence refers to an older stored comment page. Use the current version for current facts.' }],
       usage: [],
     });
-    this.savePacket(packet);
-    return { packets: [packet], nextOffset: slice.nextOffset };
   }
   alias(key: string, version: string) {
     if (this.has(version)) this.sql.exec('INSERT OR REPLACE INTO session_asset_keys VALUES (?, ?)', key, version);
@@ -586,6 +609,17 @@ export class SessionEvidenceStore implements SessionAccess {
       )
       .toArray())
       this.alias(row.resource_key, version);
+  }
+  /** One exact saved version of the given kind and video, as a session reuse. */
+  async lookupVersion<T>(version: string, kind: SessionAssetKind, videoId: string): Promise<CachedResult<T> | undefined> {
+    const asset = this.assetInfo(version);
+    if (!asset || asset.kind !== kind || asset.videoId !== videoId) return undefined;
+    const value = await this.read(version);
+    return value === null ? undefined : { value: value as T, cacheStatus: 'hit', sessionReused: true, assetVersions: [version] };
+  }
+  /** The saved version a reuse key currently points to. */
+  versionForKey(key: string): string | undefined {
+    return this.sql.exec<{ version: string }>('SELECT version FROM session_asset_keys WHERE resource_key=?', key).toArray()[0]?.version;
   }
   async lookup<T>(key: string): Promise<CachedResult<T> | undefined> {
     return visualSpan('session_asset_lookup', () => this.lookupValue<T>(key));

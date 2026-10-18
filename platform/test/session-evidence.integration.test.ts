@@ -1066,13 +1066,15 @@ test('single-sheet storyboard reuses the processor middle sheet across restored 
     }
   }));
 
-test('searches and pages every saved comment on a provider page with version-specific citations', async () =>
+test('searches every saved comment by full body and author, and pins later reads to the saved page', async () =>
   within('saved-comment-search', async (store, reopen) => {
     const authors = Array.from({ length: 14 }, (_, index) => index === 11 ? 'Janine' : index === 13 ? 'Gale' : `Viewer ${index + 1}`);
+    const page = (order: number[]) => ({ videoId: id, totalCount: 14, replyContinuations: [],
+      comments: order.map(index => ({ id: `c${index + 1}`, author: { name: authors[index]!, thumbnails: [] },
+        text: index === 11 ? `${'Setup detail. '.repeat(150)}My final objection concerns the tilted board.` : `Opinion ${index + 1}`,
+        isPinned: false, isHearted: false, replies: [] })), meta: transcript().meta });
     const p = provider();
-    p.comments = vi.fn(async () => ({ cacheStatus: 'miss' as const, value: { videoId: id, totalCount: 14, replyContinuations: [],
-      comments: authors.map((name, index) => ({ id: `c${index + 1}`, text: `Opinion ${index + 1}`, author: { name, thumbnails: [] },
-        isPinned: false, isHearted: false, replies: [] })), meta: transcript().meta } }));
+    p.comments = vi.fn(async () => ({ cacheStatus: 'miss' as const, value: page([...authors.keys()]) }));
     const saved = await sessionProvider(p, store).comments(id);
     const version = saved.assetVersions![0]!;
     // Comment 14 sits past one read's limit; search still reaches it without a provider call.
@@ -1080,15 +1082,31 @@ test('searches and pages every saved comment on a provider page with version-spe
     expect(gale.packets).toHaveLength(1);
     expect(gale.packets[0]).toMatchObject({ kind: 'youtube_comments', assetVersions: [version],
       excerpts: [{ id: `evidence:${version}:13`, text: expect.stringContaining('Author: Gale') }] });
-    const page = await reopen().readEvidence(version, 12);
-    expect(page.packets[0]!.excerpts.map(excerpt => excerpt.id)).toEqual([`evidence:${version}:12`, `evidence:${version}:13`]);
-    expect(page.nextOffset).toBeUndefined();
+    // The author and the tail of a comment longer than one excerpt are both searchable.
+    const janine = await reopen().search.searchEvidence(reopen(), 'Janine');
+    expect(janine.packets[0]!.excerpts[0]!.text).toContain('Author: Janine');
+    const tail = await reopen().search.searchEvidence(reopen(), 'objection tilted');
+    expect(tail.packets[0]!.excerpts[0]).toMatchObject({ id: expect.stringMatching(new RegExp(`^evidence:${version}:11:\\d+$`)),
+      text: expect.stringContaining('final objection concerns the tilted board') });
+    expect(tail.packets[0]!.excerpts[0]!.text).toContain('Author: Janine');
     const first = await reopen().readEvidence(version);
-    expect(first.packets[0]!.excerpts).toHaveLength(12);
-    expect(first.nextOffset).toBe(12);
-    const janine = await reopen().readEvidence(version, 0, 'Janine');
-    expect(janine.packets[0]!.excerpts.map(excerpt => excerpt.id)).toEqual([`evidence:${version}:11`]);
-    expect(p.comments).toHaveBeenCalledOnce();
+    expect(first.packets[0]!.excerpts).toHaveLength(8);
+    expect(first.nextOffset).toBe(8);
+    const rest = await reopen().readEvidence(version, 8);
+    expect(rest.packets[0]!.excerpts.map(excerpt => excerpt.id)).toEqual([8, 9, 10, 11, 12, 13].map(n => `evidence:${version}:${n}`));
+    const filtered = await reopen().readEvidence(version, 0, 'objection');
+    expect(filtered.packets[0]!.excerpts[0]!.text).toContain('Author: Janine');
+    // A refresh that reorders the page creates a new version; a pinned read still returns the saved one.
+    vi.mocked(p.comments).mockResolvedValueOnce({ cacheStatus: 'miss', value: page([...authors.keys()].reverse()) });
+    const refreshed = createCapabilityProvider(sessionProvider(p, reopen()), { route: 'topic_research', refreshDynamicData: true } as never);
+    const current = await refreshed.comments(id);
+    expect(current.assetVersions![0]).not.toBe(version);
+    const pinned = await refreshed.comments(id, { pageVersion: version });
+    expect(pinned.assetVersions).toEqual([version]);
+    expect(pinned.value.comments[13]?.author.name).toBe('Gale');
+    expect(pinned.sessionReused).toBe(true);
+    expect(p.comments).toHaveBeenCalledTimes(2);
     await reopen().delete(version);
-    expect((await reopen().search.searchEvidence(reopen(), 'Gale')).packets).toEqual([]);
+    await expect(sessionProvider(p, reopen()).comments(id, { pageVersion: version })).rejects.toThrow(/no longer available/);
+    expect((await reopen().search.searchEvidence(reopen(), 'Gale')).packets.every(packet => !packet.assetVersions?.includes(version))).toBe(true);
   }));

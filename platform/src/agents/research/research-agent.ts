@@ -132,6 +132,7 @@ export async function executeResearchRun(options: {
   /** Admits saved and inherited content before delivery, billing it once per run. */
   deliverEvidence?: DeliverEvidence;
   deliverSavedAssets?: AgentToolContext['deliverSavedAssets'];
+  evidenceRunRecords?: AgentToolContext['evidenceRunRecords'];
   registerRetrievedAsset?: (claim: string, version: string) => void;
   /** Packets this run already received, restored without another charge after a restart. */
   deliveredPacketIds?: ReadonlySet<string>;
@@ -230,7 +231,7 @@ export async function executeResearchRun(options: {
         onFailure: code => finalizationFailures.push(code),
         deadlineAt, message: options.message, conversationHistory: options.conversationHistory, decision, historyPage, sessionBrief,
         context: { traceToolCall: options.traceToolCall, runId: options.runId, currentDate: options.currentDate, signal,
-          finalize: (id, input) => persist(() => options.finalize(id, input)) },
+          evidenceRunRecords: options.evidenceRunRecords, finalize: (id, input) => persist(() => options.finalize(id, input)) },
         evidence: handoffEvidence, handoffGaps, researchContext: options.recoveredResearchContext
           ? options.prepareResearchContext?.(options.recoveredResearchContext) ?? options.recoveredResearchContext : undefined, toolFailures: options.recoveredToolFailures,
         modelBudget: options.modelBudget, modelCallPrefix: options.modelCallPrefix, onDraft: options.onDraft,
@@ -270,6 +271,7 @@ export async function executeResearchRun(options: {
     session: options.session,
     deliverEvidence: options.deliverEvidence,
     deliverSavedAssets: options.deliverSavedAssets,
+    evidenceRunRecords: options.evidenceRunRecords,
     runId: options.runId,
     userMessageId: options.userMessageId,
     currentDate: options.currentDate,
@@ -805,17 +807,7 @@ async function runResearchAgentWithModelWithinDeadline(options: {
 }
 
 /** Describing what was read must match what this turn's context actually holds. */
-export const EVIDENCE_DELIVERY_GUIDANCE = 'Each evidence packet\'s delivery.origin states whether a tool produced or read it during this turn (this_turn) or it was saved from an earlier turn (earlier_turn). Describe reading, rereading, checking or rewatching only for this_turn evidence; attribute earlier_turn evidence to the earlier conversation. transcriptAnalysis.delivery states how many saved findings are shown and that caption text is not included: never claim you read or reread a full transcript. Describe only the comments, frames or entries actually supplied, using collection counts and truncation warnings.';
-
-/**
- * Packets the finalizer receives from earlier turns. Tool packets of this run and
- * this run's session search hits are never earlier, even when history holds the same saved read.
- */
-export function earlierTurnPacketIds(evidence: readonly EvidencePacket[], history: readonly ConversationTurn[], runId: string): Set<string> {
-  const historical = new Set(history.flatMap(turn => [...turn.evidence ?? [], ...turn.metadata ?? []]).map(packet => packet.packetId));
-  return new Set(evidence.map(packet => packet.packetId).filter(id => !id.startsWith(`packet:${runId}:`)
-    && !id.startsWith('search:') && (historical.has(id) || id.startsWith('memory:'))));
-}
+export const EVIDENCE_DELIVERY_GUIDANCE = 'Each evidence packet\'s delivery.operation is recorded by the application for this turn. Say you inspected, looked at or watched images only for image_analysis evidence. transcript_analysis evidence is an analyst\'s findings, not caption text: never claim you read or reread a full transcript. retrieval evidence was fetched or reused by a tool this turn. saved_read evidence is saved text read this turn; for visual packets it is an earlier analysis, so do not describe it as viewing images now. inherited evidence comes from earlier in the conversation; attribute it there and do not claim to have checked it again. Describe only the comments, frames or entries actually supplied, using collection counts, visualDelivery counts and truncation warnings.';
 
 function transcriptAnalysisKeys(recoveredEvidence: readonly EvidencePacket[]): string[] {
   return recoveredEvidence.flatMap((packet) => {
@@ -853,7 +845,7 @@ async function runUnifiedFinalizer(options: {
   model: LanguageModel;
   message: string;
   decision: CapabilityRouteDecision;
-  context: Pick<AgentToolContext, 'runId' | 'signal' | 'finalize' | 'traceToolCall' | 'currentDate'>;
+  context: Pick<AgentToolContext, 'runId' | 'signal' | 'finalize' | 'traceToolCall' | 'currentDate' | 'evidenceRunRecords'>;
   sessionBrief?: ReturnType<typeof sessionBriefForModel>;
   historyPage?: ReturnType<NonNullable<NonNullable<AgentToolContext['session']>['readHistory']>>;
   evidence: EvidencePacket[];
@@ -877,7 +869,7 @@ async function runUnifiedFinalizer(options: {
   const evidenceBudget = comparisonVideoIds.length ? 160_000
     : options.decision.route === 'inspect_video' ? INSPECTION_FINALIZER_EVIDENCE_CHARACTERS : TIMEOUT_FINALIZER_EVIDENCE_CHARACTERS;
   const prepared = finalizationEvidenceForModel(options.evidence, evidenceBudget, comparisonVideoIds,
-    earlierTurnPacketIds(options.evidence, options.conversationHistory ?? [], options.context.runId));
+    options.context.evidenceRunRecords?.(options.evidence.map(packet => packet.packetId)));
   const intent = options.decision.route === 'finalize' ? options.decision.responseIntent : options.decision.route;
   const conversational = intent === 'clarification' || intent === 'rejected';
   const baseOutputSchema = conversational ? conversationalFinalizationOutputSchema

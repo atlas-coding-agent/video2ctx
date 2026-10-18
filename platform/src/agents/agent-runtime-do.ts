@@ -72,6 +72,7 @@ import {
   type AgentRequest,
 } from './contracts';
 import { buildAgentTurnResult } from './finalizer';
+import type { EvidenceRunRecord } from './runtime/model-evidence';
 import { metadataForConversation, unambiguousMetadataRecords, evidenceWithConversationMetadata } from './runtime/conversation-metadata';
 import { AGENT_MODEL_ID, createAgentModel, estimateAgentModelCostMicros } from './model';
 import { normalizeAgentExecutionError } from './runtime/agent-errors';
@@ -677,6 +678,7 @@ export class AgentRuntimeDO extends Agent<Env, AgentRuntimeState> {
         recoveredToolFailures: this.readEvidenceToolFailures(runId),
         deliverEvidence: (packets, source) => this.deliverEvidence(runId, source, packets),
         deliverSavedAssets: versions => this.deliverSavedAssets(runId, versions),
+        evidenceRunRecords: packetIds => this.evidenceRunRecords(runId, packetIds),
         registerRetrievedAsset: (claim, version) => {
           this.assertRunActive(runId);
           this.evidenceLedger.registerAssetClaim(runId, claim, version);
@@ -1548,6 +1550,26 @@ export class AgentRuntimeDO extends Agent<Env, AgentRuntimeState> {
       );
     }
     return resolution.history;
+  }
+
+  /**
+   * Operations this run recorded for each packet: the tool call that produced it and its
+   * delivery ledger sources. Both are SQLite records, so they survive a resume.
+   */
+  private evidenceRunRecords(runId: string, packetIds: readonly string[]): Map<string, EvidenceRunRecord> {
+    const ids = JSON.stringify([...new Set(packetIds)]);
+    const records = new Map<string, { createdByTool?: string; deliveredSources: string[] }>();
+    const entry = (id: string) => records.get(id) ?? (records.set(id, { deliveredSources: [] }), records.get(id)!);
+    for (const row of this.sql<{ packet_id: string; tool_name: string | null }>`
+      SELECT p.packet_id, c.tool_name FROM agent_evidence_packets p
+      LEFT JOIN agent_tool_calls c ON c.run_id = p.run_id AND c.tool_call_id = p.tool_call_id
+      WHERE p.run_id = ${runId} AND p.packet_id IN (SELECT value FROM json_each(${ids}))
+    `) entry(row.packet_id).createdByTool = row.tool_name ?? 'unknown_tool';
+    for (const row of this.sql<{ packet_id: string; source: string }>`
+      SELECT packet_id, source FROM agent_evidence_delivered_packets
+      WHERE run_id = ${runId} AND packet_id IN (SELECT value FROM json_each(${ids}))
+    `) entry(row.packet_id).deliveredSources.push(row.source);
+    return records;
   }
 
   private readRun(runId: string): RunRow | undefined {

@@ -52,6 +52,11 @@ export interface AgentToolContext {
   deliverEvidence?: import('../../runtime/prior-evidence').DeliverEvidence;
   /** Admit saved assets handed to an analyst. Throws when the run reserve cannot cover them. */
   deliverSavedAssets?(versions: readonly string[]): void;
+  /**
+   * This run's persisted operations for the given packets: the producing tool call and
+   * delivery ledger sources. Durable, so a resumed run reports what it did before the restart.
+   */
+  evidenceRunRecords?(packetIds: readonly string[]): ReadonlyMap<string, import('../../runtime/model-evidence').EvidenceRunRecord>;
   analyzeStoryboard?: VisualAnalyst;
   analyzeFrames?: FrameAnalyst;
   saveFramePreviews?: SaveFramePreviews;

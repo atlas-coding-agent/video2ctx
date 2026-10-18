@@ -47,7 +47,8 @@ export interface YouTubeAgentProvider {
   transcript(videoId: string, language?: string, options?: { refresh?: boolean }, onDiagnostic?: ExtractionDiagnosticSink): Promise<CachedResult<Transcript>>;
   comments(
     videoId: string,
-    options?: { continuation?: string; all?: boolean; refresh?: boolean },
+    /** pageVersion reads that exact saved page from the session store and never refreshes. */
+    options?: { continuation?: string; all?: boolean; refresh?: boolean; pageVersion?: string },
   ): Promise<CachedResult<CommentsPage | CommentsCollection>>;
   endscreen(videoId: string): Promise<CachedResult<EndscreenElement[]>>;
   channel(channelId: string): Promise<CachedResult<Channel>>;

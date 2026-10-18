@@ -5,6 +5,12 @@ import type { EvidencePacket } from '../contracts';
 export const COLLECTION_ITEM_LIMIT = 12;
 
 /**
+ * Comments one read returns. Equal to the comment entries a model context shows per
+ * packet, so following nextOffset delivers every comment of a page and none is skipped.
+ */
+export const COMMENT_READ_LIMIT = 8;
+
+/**
  * Entry-list packets: one excerpt per listed entry. Comments share one source and
  * are paged within a saved provider page. Transcripts and visual packets have their
  * own projections and are excluded.
@@ -47,6 +53,8 @@ export const collectionRetrievalSchema = z.object({
   pageOffset: z.number().int().nonnegative().optional(),
   /** Offset of the first page entry after this packet, readable from the saved page. */
   nextPageOffset: z.number().int().nonnegative().optional(),
+  /** Saved page version that later offsets must read. */
+  pageVersion: z.string().regex(/^[a-f0-9]{64}$/).optional(),
 });
 
 export type CollectionRetrieval = z.infer<typeof collectionRetrievalSchema>;
@@ -61,6 +69,7 @@ export function collectionRetrieval(options: {
   continuationAccepted: boolean;
   pageOffset?: number;
   nextPageOffset?: number;
+  pageVersion?: string;
 }): CollectionRetrieval {
   return {
     version: 1,
@@ -73,6 +82,7 @@ export function collectionRetrieval(options: {
     continuationAccepted: options.continuationAccepted,
     ...(options.pageOffset ? { pageOffset: options.pageOffset } : {}),
     ...(options.nextPageOffset !== undefined ? { nextPageOffset: options.nextPageOffset } : {}),
+    ...(options.pageVersion ? { pageVersion: options.pageVersion } : {}),
   };
 }
 
@@ -138,7 +148,7 @@ export function modelCollection(options: {
     if (excluded) parts.push(`${excluded} ${plural(excluded, 'was', 'were')} excluded by agent policy.`);
     if (before) parts.push(`This packet starts at page entry ${before + 1}; ${before} earlier ${plural(before, 'entry is', 'entries are')} in a read with a smaller offset.`);
     if (notRetained) parts.push(pageable
-      ? `${notRetained} later ${plural(notRetained, 'entry', 'entries')} on this saved page ${plural(notRetained, 'is', 'are')} not in this packet. Read offset ${recorded.nextPageOffset} with the same continuation to load them; do not describe them before reading.`
+      ? `${notRetained} later ${plural(notRetained, 'entry', 'entries')} on this saved page ${plural(notRetained, 'is', 'are')} not in this packet. Read offset ${recorded.nextPageOffset}${recorded.pageVersion ? ` with pageVersion ${recorded.pageVersion}` : ''} and the same continuation to load them; do not describe them before reading.`
       : `${notRetained} more ${plural(notRetained, 'was', 'were')} not retained because of the agent item limit and ${plural(notRetained, 'is', 'are')} not available in this evidence.`);
     sentences.push(parts.join(' '));
   }

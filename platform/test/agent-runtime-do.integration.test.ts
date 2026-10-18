@@ -2015,3 +2015,29 @@ test('restores exactly delivered metadata snapshots and cited saved-session evid
     for (const turn of (instance as unknown as LineageRuntime).readConversationHistory(probe).slice(1)) expect(turn.evidence).toBeUndefined();
   });
 });
+
+test('reports current-run evidence operations from durable tool and delivery records across a resume', async () => {
+  const { runtime, runId } = await seed('evidence-run-records', 'running');
+  const packet = (packetId: string) => JSON.stringify({ packetId, kind: 'youtube_frames',
+    sources: [{ id: 'f', provider: 'youtube', kind: 'frames', videoId: lineageVideo }],
+    excerpts: [{ id: `${packetId}:0`, sourceId: 'f', text: 'A chart.', startMs: 1000, endMs: 1000 }], artifacts: [], warnings: [], usage: [] });
+  await runInDurableObject(runtime, async instance => {
+    instance.sql`INSERT INTO agent_tool_calls (run_id,tool_call_id,semantic_key,tool_name,operation,status,credits,created_at,updated_at)
+      VALUES (${runId},'analyze','frames-analysis','analyze_video_frames','frames','completed',1,0,0)`;
+    instance.sql`INSERT INTO agent_evidence_packets VALUES (${`packet:${runId}:analyze`},${runId},'analyze',${packet(`packet:${runId}:analyze`)},1000)`;
+    // A stable saved-read ID that history also holds, read again by this run's search.
+    instance.sql`INSERT INTO agent_evidence_delivered_packets VALUES (${runId},'session:v1:0:30:hash','search_context',1001)`;
+    instance.sql`INSERT INTO agent_evidence_delivered_packets VALUES (${runId},'packet:earlier:tool','read_prior_evidence',1002)`;
+    // Another run's search hit with a search: ID is not a read by this run.
+    instance.sql`INSERT INTO agent_evidence_delivered_packets VALUES ('another-run','search:old','search_context',1003)`;
+  });
+  await runInDurableObject(runtime, async instance => {
+    const { evidenceDeliveryOperation } = await import('../src/agents/runtime/model-evidence');
+    const records = (instance as unknown as { evidenceRunRecords(runId: string, ids: readonly string[]): Map<string, import('../src/agents/runtime/model-evidence').EvidenceRunRecord> })
+      .evidenceRunRecords(runId, [`packet:${runId}:analyze`, 'session:v1:0:30:hash', 'packet:earlier:tool', 'search:old']);
+    expect(Object.fromEntries([`packet:${runId}:analyze`, 'session:v1:0:30:hash', 'packet:earlier:tool', 'search:old']
+      .map(id => [id, evidenceDeliveryOperation(records.get(id))]))).toEqual({
+      [`packet:${runId}:analyze`]: 'image_analysis', 'session:v1:0:30:hash': 'saved_read',
+      'packet:earlier:tool': 'inherited', 'search:old': 'inherited' });
+  });
+});

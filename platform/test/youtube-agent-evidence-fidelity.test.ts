@@ -3,13 +3,14 @@ import type { Comment } from 'all-things-youtube';
 import type { EvidencePacket } from '../src/agents/contracts';
 import type { AgentToolContext } from '../src/agents/providers/youtube/tool-context';
 import type { YouTubeAgentProvider } from '../src/agents/providers/youtube/provider';
-import { commentPageSlice, executeGetVideoComments } from '../src/agents/providers/youtube/tools/get-video-comments';
+import { commentPageSlice, commentPassage, commentSearchText, executeGetVideoComments, summarizeComment } from '../src/agents/providers/youtube/tools/get-video-comments';
 import { resolveTranscriptAnalystOutput } from '../src/agents/providers/youtube/transcript-analyst';
-import { visualObservationText } from '../src/agents/providers/youtube/visual-provenance';
-import { evidencePacketForModel, finalizationEvidenceForModel } from '../src/agents/runtime/model-evidence';
-import { earlierTurnPacketIds } from '../src/agents/research/research-agent';
+import { visualAnalysisExcerpts, visualObservationText } from '../src/agents/providers/youtube/visual-provenance';
+import { createCapabilityProvider } from '../src/agents/research/capability-provider';
+import { evidenceDeliveryOperation, evidencePacketForModel, finalizationEvidenceForModel } from '../src/agents/runtime/model-evidence';
 
 const VIDEO = 'abcdefghijk';
+const PAGE = 'a'.repeat(64);
 
 function comments(count: number): Comment[] {
   return Array.from({ length: count }, (_, index) => ({
@@ -18,9 +19,10 @@ function comments(count: number): Comment[] {
   }) as unknown as Comment);
 }
 
-function commentContext(page: Comment[]) {
+function commentContext(page: Comment[], version: string | undefined = PAGE) {
   const provider = {
-    comments: vi.fn(async () => ({ cacheStatus: 'hit' as const, sessionReused: true, assetVersions: ['a'.repeat(64)],
+    comments: vi.fn(async (_id: string, options?: { pageVersion?: string }) => ({ cacheStatus: 'hit' as const, sessionReused: true,
+      ...(version ? { assetVersions: [options?.pageVersion ?? version] } : {}),
       value: { videoId: VIDEO, totalCount: 40, comments: page, continuation: 'next-provider-page', replyContinuations: [],
         meta: { source: 'allthingsyoutube' as const, fetchedAt: new Date(0).toISOString(), partial: false, warnings: [] } } })),
   } as unknown as YouTubeAgentProvider;
@@ -34,22 +36,37 @@ function commentContext(page: Comment[]) {
 }
 
 describe('saved comment pages', () => {
-  it('reports the page size and reaches every saved comment through offsets', async () => {
+  it('pages a saved page in model-visible reads, pinned to its version, so every comment reaches the model', async () => {
     const { context, provider, keys } = commentContext(comments(14));
     const first = await executeGetVideoComments({ videoId: VIDEO }, context, 'first');
-    expect(first.excerpts).toHaveLength(12);
-    expect(first.artifacts[0]!.data).toMatchObject({ returnedCount: 12, nextOffset: 12,
-      collection: { fetchedCount: 14, retainedCount: 12, nextPageOffset: 12, morePages: true, continuationAccepted: true } });
-    expect(first.warnings.map(warning => warning.code)).toContain('COMMENT_PAGE_REMAINING');
-    const rest = await executeGetVideoComments({ videoId: VIDEO, offset: 12 }, context, 'rest');
-    expect(rest.excerpts.map(excerpt => excerpt.id)).toEqual(['comment:comment-13:12', 'comment:comment-14:13']);
-    expect(rest.excerpts[1]!.text).toContain('Author: Gale');
-    expect(rest.artifacts[0]!.data).toMatchObject({ collection: { fetchedCount: 14, retainedCount: 2, pageOffset: 12 } });
-    expect(rest.artifacts[0]!.data).not.toHaveProperty('nextOffset');
-    // Saved-page offsets reread the same provider page, never the provider continuation.
-    expect(provider.comments).toHaveBeenCalledWith(VIDEO, { continuation: undefined });
-    expect(keys[0]).toBe(`comments:${JSON.stringify({ videoId: VIDEO })}`);
-    expect(keys[1]).toBe(`comments:${JSON.stringify({ videoId: VIDEO, offset: 12 })}`);
+    expect(first.excerpts).toHaveLength(8);
+    expect(first.artifacts[0]!.data).toMatchObject({ returnedCount: 8, nextOffset: 8, pageVersion: PAGE,
+      collection: { fetchedCount: 14, retainedCount: 8, nextPageOffset: 8, pageVersion: PAGE } });
+    const rest = await executeGetVideoComments({ videoId: VIDEO, offset: 8, pageVersion: PAGE }, context, 'rest');
+    expect(rest.excerpts.map(excerpt => excerpt.id)).toEqual([9, 10, 11, 12, 13, 14].map(n => `comment:comment-${n}:${n - 1}`));
+    expect(provider.comments).toHaveBeenLastCalledWith(VIDEO, { continuation: undefined, pageVersion: PAGE });
+    expect(keys[1]).toBe(`comments:${JSON.stringify({ videoId: VIDEO, offset: 8, pageVersion: PAGE })}`);
+    // Following nextOffset delivers positions 1 to 14 to finalization with none skipped.
+    const shown = finalizationEvidenceForModel([first, rest], 100_000).evidence.flatMap(packet => packet.excerpts ?? []);
+    expect(shown).toHaveLength(14);
+    expect(shown.map(excerpt => excerpt.text).join('\n')).toContain('Author: Janine');
+    expect(shown.map(excerpt => excerpt.text).join('\n')).toContain('Author: Gale');
+  });
+
+  it('refuses offsets without the pinned page and pages that changed version', async () => {
+    const { context } = commentContext(comments(14));
+    expect(() => executeGetVideoComments({ videoId: VIDEO, offset: 8 }, context, 'unpinned')).toThrow(/pageVersion/);
+    const changed = commentContext(comments(14), 'b'.repeat(64));
+    (changed.provider.comments as ReturnType<typeof vi.fn>).mockResolvedValueOnce({ cacheStatus: 'hit', sessionReused: true, assetVersions: ['b'.repeat(64)],
+      value: { videoId: VIDEO, comments: comments(14), replyContinuations: [], meta: { source: 'allthingsyoutube', fetchedAt: '', partial: false, warnings: [] } } });
+    await expect(executeGetVideoComments({ videoId: VIDEO, offset: 8, pageVersion: PAGE }, changed.context, 'changed')).rejects.toThrow(/no longer available/);
+  });
+
+  it('offers no unpinned later reads when the page was not saved', async () => {
+    const { context } = commentContext(comments(14), undefined);
+    const packet = await executeGetVideoComments({ videoId: VIDEO }, context, 'unsaved');
+    expect(packet.artifacts[0]!.data).not.toHaveProperty('nextOffset');
+    expect(packet.warnings.find(warning => warning.code === 'COMMENT_PAGE_REMAINING')!.message).toContain('was not saved');
   });
 
   it('keeps first-page excerpt IDs and the reuse key unchanged for offset 0', async () => {
@@ -60,13 +77,29 @@ describe('saved comment pages', () => {
     expect(commentPageSlice(comments(3), 9)).toMatchObject({ page: [], start: 3 });
   });
 
-  it('projects the current excerpt limit with honest counts and no silent cut', async () => {
-    const { context } = commentContext(comments(14));
-    const projected = evidencePacketForModel(await executeGetVideoComments({ videoId: VIDEO }, context, 'first'));
-    expect(projected.excerpts).toHaveLength(8);
-    expect(projected.collection).toMatchObject({ entriesShown: 8, entriesRetained: 12, entriesFetched: 14, entriesNotRetained: 2 });
-    expect(projected.collection!.coverage).toContain('Read offset 12 with the same continuation');
-    expect(projected.warnings.map(warning => warning.code)).toEqual(expect.arrayContaining(['COLLECTION_CONTEXT_TRUNCATED', 'COMMENT_PAGE_REMAINING']));
+  it('never refreshes a pinned saved-page read, even on a refresh route', async () => {
+    const saved = { comments: vi.fn(async () => ({ cacheStatus: 'hit' as const, value: {} })) } as unknown as YouTubeAgentProvider;
+    const provider = createCapabilityProvider(saved, { route: 'topic_research', refreshDynamicData: true } as never);
+    await provider.comments(VIDEO, { pageVersion: PAGE });
+    await provider.comments(VIDEO, {});
+    expect(saved.comments).toHaveBeenNthCalledWith(1, VIDEO, { pageVersion: PAGE });
+    expect(saved.comments).toHaveBeenNthCalledWith(2, VIDEO, { refresh: true });
+  });
+
+  it('keeps the author of a long comment and shows a matching tail passage', () => {
+    const long = { ...comments(12)[11]!, text: `${'Setup detail. '.repeat(150)}But the final objection is about tilting the brush.` } as Comment;
+    expect(long.text.length).toBeGreaterThan(2_000);
+    const summary = summarizeComment(long);
+    expect(summary.length).toBeLessThanOrEqual(2_000);
+    expect(summary).toContain('Author: Janine');
+    expect(summary).not.toContain('final objection');
+    const passage = commentPassage(long, ['objection']);
+    expect(passage.start).toBeGreaterThan(0);
+    expect(passage.text).toContain('final objection is about tilting the brush');
+    expect(passage.text).toContain('Author: Janine');
+    expect(passage.text.length).toBeLessThanOrEqual(2_000);
+    expect(commentSearchText(long)).toContain('final objection');
+    expect(commentSearchText(long)).toContain('Janine');
   });
 
   it('states unknown page size for legacy comment packets', () => {
@@ -82,55 +115,107 @@ describe('saved comment pages', () => {
 
 describe('caption-level transcript citations', () => {
   const segment = (text: string, seconds: number) => ({ text, startMs: seconds * 1000, endMs: seconds * 1000 + 3000, durationMs: 3000 });
-  const segments = [
-    segment('Welcome back to the channel.', 0),
-    segment('Today we are brewing pour over coffee.', 3),
-    segment('Use 15 grams of coffee for 250 ml of water.', 52),
-    segment('Some people use 115 grams for a big batch.', 56),
-    segment('Stir gently and wait.', 70),
-    segment('Stir gently and wait.', 80),
+  const painting = [
+    segment('Hi, I am Mara Quinn and this is a watercolor lesson.', 0),
+    segment('Load the brush lightly before you start.', 20),
+    segment('Now use a dry brush and drag it across the paper.', 43),
   ];
-  const quantity = (quote: string) => ({ metric: 'dose', value: 15, unit: 'g', basis: null, kind: 'claimed', quote });
-  const finding = (windowIndexes: number[], quantities: unknown[] = [], entities: unknown[] = []) =>
-    ({ findings: [{ claim: 'A claim.', windowIndexes, quantities, entities, uncertainty: null }] });
+  const finding = (support: string[], extra: Record<string, unknown> = {}) => ({ findings: [{ claim: 'Mara Quinn drags a dry brush across the paper.',
+    windowIndexes: [0], quantities: [], entities: [], support, uncertainty: null, ...extra }] });
+  const window0 = `transcript:${VIDEO}:window:0:0`;
 
-  it('cites the caption cue that uniquely contains a quote', () => {
-    const result = resolveTranscriptAnalystOutput(VIDEO, segments, finding([0], [quantity('Use 15 grams of coffee')]));
-    expect(result.findings[0]!.excerptIds).toEqual([`transcript:${VIDEO}:2:52000:0`]);
-    expect(result.excerpts).toEqual([{ id: `transcript:${VIDEO}:2:52000:0`, text: segments[2]!.text, startMs: 52000, endMs: 55000 }]);
+  it('cites the caption that states the claim, from explicit claim support', () => {
+    const result = resolveTranscriptAnalystOutput(VIDEO, painting, finding(['use a dry brush and drag it across the paper']));
+    expect(result.findings[0]!.excerptIds).toEqual([`transcript:${VIDEO}:2:43000:0`]);
+    expect(result.excerpts).toEqual([{ id: `transcript:${VIDEO}:2:43000:0`, text: painting[2]!.text, startMs: 43000, endMs: 46000 }]);
   });
 
-  it('keeps the window anchor for substring, repeated, translated and missing quotes', () => {
-    const window0 = `transcript:${VIDEO}:window:0:0`;
-    expect(resolveTranscriptAnalystOutput(VIDEO, segments, finding([0], [quantity('15 grams')])).findings[0]!.excerptIds).toEqual([window0]);
-    expect(resolveTranscriptAnalystOutput(VIDEO, segments, finding([0, 1], [], [{ name: 'step', quote: 'Stir gently and wait.', source: 'transcript' }]))
-      .findings[0]!.excerptIds).toEqual([window0, `transcript:${VIDEO}:window:1:70000`]);
-    expect(resolveTranscriptAnalystOutput(VIDEO, segments, finding([0], [], [{ name: 'intro', quote: 'Bienvenue sur la chaîne', source: 'transcript' }]))
-      .findings[0]!.excerptIds).toEqual([window0]);
-    expect(resolveTranscriptAnalystOutput(VIDEO, segments, finding([0])).findings[0]!.excerptIds).toEqual([window0]);
+  it('never narrows a finding to an identity quote', () => {
+    const result = resolveTranscriptAnalystOutput(VIDEO, painting, finding([], {
+      entities: [{ name: 'Mara Quinn', quote: 'I am Mara Quinn and this is a watercolor lesson', source: 'transcript' }] }));
+    expect(result.findings[0]!.excerptIds).toEqual([window0]);
   });
 
-  it('cites every cue a quote spans, in the same IDs as raw transcript evidence', () => {
-    const result = resolveTranscriptAnalystOutput(VIDEO, segments, finding([0], [quantity('pour over coffee. Use 15 grams')]));
-    expect(result.findings[0]!.excerptIds).toEqual([`transcript:${VIDEO}:1:3000:0`, `transcript:${VIDEO}:2:52000:0`]);
-    expect(result.coverage).toMatchObject({ completeTranscriptRead: true, segmentCount: 6, windowCount: 2 });
+  it('keeps the window when support is repeated, a partial word, translated or absent', () => {
+    const repeated = [segment('Stir gently and wait.', 0), segment('Stir gently and wait.', 20)];
+    const keep = (segments: typeof painting, support: string[]) => resolveTranscriptAnalystOutput(VIDEO, segments,
+      { findings: [{ claim: 'A claim.', windowIndexes: [0], quantities: [], entities: [], support, uncertainty: null }] }).findings[0]!.excerptIds;
+    expect(keep(repeated, ['Stir gently and wait.'])).toEqual([window0]);
+    expect(keep(painting, ['se a dry brus'])).toEqual([window0]);
+    expect(keep(painting, ['Utilisez un pinceau sec'])).toEqual([window0]);
+    expect(keep(painting, [])).toEqual([window0]);
+    // One unlocatable passage keeps the whole finding coarse rather than citing half its support.
+    expect(keep(painting, ['use a dry brush and drag it across the paper', 'Utilisez un pinceau sec'])).toEqual([window0]);
+  });
+
+  it('keeps numeric support cited when the claim support is in another caption', () => {
+    const segments = [segment('Mix 15 grams of pigment first.', 0), segment('Then tilt the board so the wash runs down.', 10)];
+    const result = resolveTranscriptAnalystOutput(VIDEO, segments, { findings: [{ claim: 'Mix 15 g of pigment, then tilt the board.',
+      windowIndexes: [0], entities: [], support: ['tilt the board so the wash runs down'], uncertainty: null,
+      quantities: [{ metric: 'pigment', value: 15, unit: 'g', basis: null, kind: 'claimed', quote: 'Mix 15 grams of pigment' }] }] });
+    expect(result.findings[0]!.excerptIds).toEqual([`transcript:${VIDEO}:0:0:0`, `transcript:${VIDEO}:1:10000:0`]);
+    expect(result.coverage).toMatchObject({ completeTranscriptRead: true, segmentCount: 2, windowCount: 1 });
+  });
+
+  it('keeps the window when a quantity in it cannot be located uniquely', () => {
+    const segments = [segment('Use 15 grams here.', 0), segment('Then tilt the board so the wash runs down.', 10), segment('Use 15 grams here.', 20)];
+    const result = resolveTranscriptAnalystOutput(VIDEO, segments, { findings: [{ claim: 'Use 15 g, then tilt the board.',
+      windowIndexes: [0], entities: [], support: ['tilt the board so the wash runs down'], uncertainty: null,
+      quantities: [{ metric: 'dose', value: 15, unit: 'g', basis: null, kind: 'claimed', quote: 'Use 15 grams here.' }] }] });
+    expect(result.findings[0]!.excerptIds).toEqual([window0]);
   });
 });
 
 describe('frame-specific visual provenance', () => {
-  it('names the own frame for atomic observations and every frame for shared ones', () => {
-    expect(visualObservationText('requested', 'White is ahead.', [65_000])).toBe('Visual observation at requested frame 1:05: White is ahead.');
-    expect(visualObservationText('sampled', 'The board is set up.', [70_000, 10_000]))
-      .toBe('Visual observation reported for each of the sampled frames at 0:10, 1:10: The board is set up.');
+  const build = (findings: Array<{ observation: string; frames: number[] }>, sharedFindings: Array<{ observation: string; frames: number[] }> = []) =>
+    visualAnalysisExcerpts({ kind: 'requested', idPrefix: `frames:${VIDEO}:tool`, sourceId: 'f', findings, sharedFindings,
+      timeOf: time => time, assertAvailable: () => {} });
+
+  it('ties each frame-specific observation to exactly its own frame', () => {
+    const { excerpts, sharedObservations } = build([{ observation: 'White is ahead.', frames: [10_000] }, { observation: 'Black is ahead.', frames: [70_000] }]);
+    expect(excerpts).toEqual([
+      { id: `frames:${VIDEO}:tool:0:10000`, sourceId: 'f', text: visualObservationText('requested', 'White is ahead.', 10_000), startMs: 10_000, endMs: 10_000 },
+      { id: `frames:${VIDEO}:tool:1:70000`, sourceId: 'f', text: visualObservationText('requested', 'Black is ahead.', 70_000), startMs: 70_000, endMs: 70_000 },
+    ]);
+    expect(sharedObservations).toEqual([]);
   });
 
-  it('keeps identical observations at different frames as distinct evidence', () => {
-    const excerpts = [10_000, 70_000].map((time, index) => ({ id: `frames:${VIDEO}:tool:${index}:${time}`, sourceId: 'f',
-      text: visualObservationText('requested', 'Black to move.', [time]), startMs: time, endMs: time }));
+  it('keeps a shared observation as one distinct excerpt, never stamped onto each frame', () => {
+    const { excerpts, sharedObservations } = build([], [{ observation: 'The scoreboard reads 2-1.', frames: [70_000, 10_000] }]);
+    expect(excerpts).toHaveLength(1);
+    expect(excerpts[0]).toMatchObject({ id: `frames:${VIDEO}:tool:shared:0`, startMs: 10_000, endMs: 70_000,
+      text: expect.stringContaining('each of the requested frames at 0:10, 1:10') });
+    expect(sharedObservations).toEqual([{ excerptId: `frames:${VIDEO}:tool:shared:0`, framesMs: [10_000, 70_000] }]);
+  });
+
+  it('never attributes a compound multi-frame finding to any single frame', () => {
+    const { excerpts } = build([{ observation: 'Earlier white leads; later black leads.', frames: [10_000, 70_000] }]);
+    expect(excerpts).toHaveLength(1);
+    expect(excerpts[0]!.text).toContain('not attributed to any one frame');
+  });
+
+  it('warns about legacy visual packets that repeat one observation across frames', () => {
+    const legacy: EvidencePacket = { packetId: 'packet:legacy-frames', kind: 'youtube_frames',
+      sources: [{ id: 'f', provider: 'youtube', kind: 'frames', videoId: VIDEO }],
+      excerpts: [10_000, 70_000].map((time, index) => ({ id: `frames:${VIDEO}:old:0:${index}`, sourceId: 'f',
+        text: 'Visual observation at requested frame: Earlier white leads; later black leads.', startMs: time, endMs: time })),
+      artifacts: [{ type: 'youtube_frame_analysis', data: {} }], warnings: [], usage: [] };
+    expect(evidencePacketForModel(legacy).warnings.map(warning => warning.code)).toContain('LEGACY_VISUAL_PROVENANCE');
+    const current = { ...legacy, artifacts: [{ type: 'youtube_frame_analysis', data: { provenanceVersion: 2 } }] };
+    expect(evidencePacketForModel(current).warnings.map(warning => warning.code)).not.toContain('LEGACY_VISUAL_PROVENANCE');
+  });
+
+  it('discloses shown and saved observations in projection and budget reduction', () => {
+    const { excerpts } = build(Array.from({ length: 11 }, (_, index) => ({ observation: `Observation ${index}.`, frames: [index * 1000] })));
     const packet: EvidencePacket = { packetId: 'packet:frames', kind: 'youtube_frames',
       sources: [{ id: 'f', provider: 'youtube', kind: 'frames', videoId: VIDEO }], excerpts,
-      artifacts: [], warnings: [], usage: [] };
-    expect(new Set(evidencePacketForModel(packet).excerpts!.map(excerpt => excerpt.text)).size).toBe(2);
+      artifacts: [{ type: 'youtube_frame_analysis', data: { provenanceVersion: 2 } }], warnings: [], usage: [] };
+    const projected = evidencePacketForModel(packet);
+    expect(projected.visualDelivery).toEqual({ observationsShown: 8, observationsSaved: 11 });
+    expect(projected.warnings.filter(warning => warning.code === 'VISUAL_CONTEXT_TRUNCATED')).toHaveLength(1);
+    const reduced = finalizationEvidenceForModel([packet], JSON.stringify([projected]).length - 1).evidence[0]!;
+    expect(reduced.visualDelivery).toEqual({ observationsShown: 5, observationsSaved: 11 });
+    expect(reduced.warnings.find(warning => warning.code === 'VISUAL_CONTEXT_TRUNCATED')!.message).toContain('Only 5 of 11');
   });
 });
 
@@ -142,6 +227,10 @@ describe('delivered context disclosure', () => {
       findings: Array.from({ length: findings }, (_, index) => ({ claim: `Claim ${index}`, excerptIds: [`${packetId}:w`], entities: [], quantities: [], uncertainty: null })),
       coverage: { completeTranscriptRead: true, segmentCount: 1, startMs: 0, endMs: 1000 }, selectedExcerptCount: 1 } }],
     warnings: [], usage: [] });
+  const frames = (packetId: string): EvidencePacket => ({ packetId, kind: 'youtube_frames',
+    sources: [{ id: 'f', provider: 'youtube', kind: 'frames', videoId: VIDEO }],
+    excerpts: [{ id: `${packetId}:0`, sourceId: 'f', text: visualObservationText('requested', 'A chart.', 1000), startMs: 1000, endMs: 1000 }],
+    artifacts: [{ type: 'youtube_frame_analysis', data: { provenanceVersion: 2 } }], warnings: [], usage: [] });
 
   it('states that analysis findings are not caption text, for old records too', () => {
     const projected = evidencePacketForModel(analysis('packet:old', 3));
@@ -149,20 +238,34 @@ describe('delivered context disclosure', () => {
     expect(projected.transcriptAnalysis!.delivery!.note).toContain('do not claim to have read or reread the transcript');
   });
 
-  it('labels packets from earlier turns without reporting a context cut', () => {
-    const earlier = analysis('packet:run-0:tool', 2);
-    const current = analysis('packet:run-1:tool', 2);
-    const prepared = finalizationEvidenceForModel([earlier, current], 100_000, [], new Set(['packet:run-0:tool']));
-    expect(prepared.evidence.map(packet => packet.delivery?.origin)).toEqual(['earlier_turn', 'this_turn']);
-    expect(prepared.missingInputs).toEqual([]);
-    expect(finalizationEvidenceForModel([current], 100_000).evidence[0]).not.toHaveProperty('delivery');
+  it('classifies operations from run records, not packet IDs', () => {
+    expect(evidenceDeliveryOperation({ createdByTool: 'analyze_video_frames', deliveredSources: [] })).toBe('image_analysis');
+    expect(evidenceDeliveryOperation({ createdByTool: 'analyze_video_storyboard', deliveredSources: [] })).toBe('image_analysis');
+    expect(evidenceDeliveryOperation({ createdByTool: 'analyze_video_transcript', deliveredSources: [] })).toBe('transcript_analysis');
+    expect(evidenceDeliveryOperation({ createdByTool: 'get_video_frames', deliveredSources: [] })).toBe('retrieval');
+    expect(evidenceDeliveryOperation({ deliveredSources: ['search_context'] })).toBe('saved_read');
+    expect(evidenceDeliveryOperation({ deliveredSources: ['read_prior_evidence'] })).toBe('inherited');
+    expect(evidenceDeliveryOperation(undefined)).toBe('inherited');
   });
 
-  it('treats only history packets as earlier, never this run or its search hits', () => {
-    const turn = { userMessageId: 'u', agentMessageId: 'a', user: 'q', assistant: 'a', resourceIds: [],
-      evidence: [analysis('packet:run-0:tool', 1), analysis('search:x', 1)] };
-    const ids = earlierTurnPacketIds([analysis('packet:run-0:tool', 1), analysis('packet:run-1:tool', 1), analysis('search:x', 1),
-      { ...analysis('memory:abcdefghijk:1', 1), kind: 'youtube_video' }], [turn], 'run-1');
-    expect([...ids]).toEqual(['packet:run-0:tool', 'memory:abcdefghijk:1']);
+  it('labels a current reread of a stable ID as read now and an inherited search hit as inherited', () => {
+    const reread = analysis('session:v1:0:30:hash', 1);
+    const oldSearch = frames('search:frames:abcdefghijk:tool:0:1000');
+    const analyzed = frames('packet:run-1:frames');
+    const prepared = finalizationEvidenceForModel([reread, oldSearch, analyzed], 100_000, [], new Map([
+      ['session:v1:0:30:hash', { deliveredSources: ['search_context'] }],
+      ['packet:run-1:frames', { createdByTool: 'analyze_video_frames', deliveredSources: [] }],
+    ]));
+    expect(prepared.evidence.map(packet => packet.delivery?.operation)).toEqual(['saved_read', 'inherited', 'image_analysis']);
+    expect(prepared.evidence[1]!.delivery!.note).toContain('No retrieval, read or analysis of it is recorded for this turn');
+    expect(prepared.missingInputs).toEqual([]);
+  });
+
+  it('never presents a saved visual observation read as viewing images', () => {
+    const read = frames('search:frames:abcdefghijk:tool:0:1000');
+    const label = finalizationEvidenceForModel([read], 100_000, [], new Map([[read.packetId, { deliveredSources: ['search_context'] }]])).evidence[0]!.delivery!;
+    expect(label.operation).toBe('saved_read');
+    expect(label.note).toContain('No images were inspected for it in this turn');
+    expect(finalizationEvidenceForModel([read], 100_000).evidence[0]).not.toHaveProperty('delivery');
   });
 });

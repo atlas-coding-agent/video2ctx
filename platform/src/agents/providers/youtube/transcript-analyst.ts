@@ -18,6 +18,8 @@ const ANALYSIS_WINDOW_TEXT_LIMIT = 2_000;
 const ANALYST_WAIT_MS = 90_000;
 /** Shorter normalized quotes are too likely to recur by chance to locate one caption. */
 const MIN_ANCHOR_QUOTE_CHARACTERS = 8;
+const MAX_SUPPORT_PASSAGES = 2;
+const MAX_SUPPORT_CHARACTERS = 300;
 
 const transcriptAnalystOutputSchema = (maximum: number, repair = false) => z.object({
   findings: z.array(transcriptFactsSchema.extend({
@@ -25,6 +27,8 @@ const transcriptAnalystOutputSchema = (maximum: number, repair = false) => z.obj
     quantities: transcriptFactsSchema.shape.quantities.unwrap().max(repair ? 3 : 10).default([]),
     claim: z.string().trim().min(1).max(280),
     windowIndexes: z.array(z.number().int().nonnegative()).min(1).max(MAX_WINDOWS_PER_FINDING),
+    support: z.array(z.string().trim().min(1).max(MAX_SUPPORT_CHARACTERS)).max(repair ? 1 : MAX_SUPPORT_PASSAGES).default([])
+      .describe('Exact contiguous caption text from the cited windows that states this claim itself, not only a name or a number. Shortest passage that supports the claim. Empty when no exact passage does.'),
   })).max(maximum),
   warnings: z.array(z.string().trim().min(1).max(240)).max(3).default([]).describe('Only limitations this transcript\'s content demonstrates, such as unintelligible or music-only captions. Otherwise empty. Never about other videos, duration or window count.'),
 });
@@ -155,6 +159,7 @@ export async function analyzeTranscriptWithModel(
           'Attribute demonstrations and reported performance to the speaker or cited source. A video reporting a result is not independent verification of that result. Preserve material caveats from the transcript.',
           'Return at most three warnings, only for limitations this transcript\'s content demonstrates, such as unintelligible or music-only captions. The catalog holds every caption supplied. Brevity, duration or a single window is never a limitation by itself; a clear 30-second lesson gets no warning. Do not warn about finding counts, instructions, or unreviewed results, and do not repeat findings or claim caveats in warnings. Put claim-specific caveats in the claim.',
           'Reference only numeric window indexes that appear in the transcript catalog.',
+          `For each finding, copy into support up to ${MAX_SUPPORT_PASSAGES} short exact caption passages from its windows that state the claim itself. The application uses them to cite the exact caption moment. A name or a number alone is not support. Leave support empty rather than paraphrasing or translating.`,
           'Do not invent identifiers, timestamps, or quotations. The application resolves window indexes back to the original text.',
           `Return at most ${attemptMaximum} distinct findings and at most ${MAX_WINDOWS_PER_FINDING} supporting window indexes per finding.`,
           'Return an empty findings array when the transcript does not contain relevant evidence.',
@@ -310,8 +315,8 @@ function resolveAnalysis(
   const selected = new Map<number, TranscriptCatalogEntry>();
   const cuesByWindow = windowCues(videoId, segments);
   const anchoredCues = new Map<string, CaptionCue>();
-  /** Excerpt IDs for one finding: exact caption cues where unambiguous, windows otherwise, at most three. */
-  const citationIds = (finding: { windowIndexes: number[]; quantities: Array<{ quote: string }>; entities: Array<{ quote: string; source: string }> }, windowIndexes: number[]) => {
+  /** Excerpt IDs for one finding: claim-support cues where exact and unambiguous, windows otherwise, at most three. */
+  const citationIds = (finding: { support: readonly string[]; quantities: ReadonlyArray<{ quote: string }> }, windowIndexes: number[]) => {
     const anchors = captionAnchors({ ...finding, windowIndexes }, cuesByWindow);
     const count = () => windowIndexes.reduce((total, index) => total + (anchors.get(index)?.length ?? 1), 0);
     // Fall back to the coarse window where its cues would exceed the citation limit.
@@ -343,7 +348,7 @@ function resolveAnalysis(
     const windows = windowIndexes.map(index => windowByIndex.get(index)!.text);
     try {
       assertTranscriptFacts(finding, windows);
-      excerptIds = citationIds(finding, windowIndexes);
+      excerptIds = citationIds({ support: finding.support, quantities: finding.quantities }, windowIndexes);
     } catch (error) {
       if (!(error instanceof TranscriptGroundingError)) throw error;
       for (const issue of error.issues) onIssue?.({ ...issue, findingIndex });
@@ -359,8 +364,8 @@ function resolveAnalysis(
           return false;
         }
       });
-      // Only checked quotes may anchor a citation; rejected quotes keep the coarse window.
-      if (quantities.length) excerptIds = citationIds({ windowIndexes, quantities, entities: [] }, windowIndexes);
+      // The replacement claim is stated by its checked quotes alone, so they are its support.
+      if (quantities.length) excerptIds = citationIds({ support: quantities.map(quantity => quantity.quote), quantities }, windowIndexes);
       if (quantities.length) return [{
         claim: quantities.map(quantity => `${quantity.kind} ${quantity.metric}: ${quantity.value}${quantity.unit ?? ' (unit unclear)'}`).join('; ') + '.',
         excerptIds, entities: finding.entities, quantities,
@@ -447,35 +452,49 @@ function occurrences(text: string, quote: string, whole: boolean): number[] {
   return found;
 }
 
+/** The single whole-word occurrence of a quote across the cited windows, or undefined if absent, short or repeated. */
+function uniqueOccurrence(quote: string, windows: readonly number[], cuesByWindow: Map<number, { text: string; cues: CaptionCue[] }>) {
+  if (quote.length < MIN_ANCHOR_QUOTE_CHARACTERS) return undefined;
+  const find = (whole: boolean) => windows.flatMap(window =>
+    occurrences(cuesByWindow.get(window)?.text ?? '', quote, whole).map(offset => ({ window, offset })));
+  const whole = find(true);
+  // Any further occurrence, even inside a longer word, makes the location ambiguous.
+  return whole.length === 1 && find(false).length === 1 ? whole[0]! : undefined;
+}
+
+function cuesAt(cuesByWindow: Map<number, { text: string; cues: CaptionCue[] }>, hit: { window: number; offset: number }, length: number) {
+  return cuesByWindow.get(hit.window)!.cues.filter(cue => cue.from < hit.offset + length && cue.to > hit.offset);
+}
+
 /**
- * Exact caption cues for a finding's quotes. A quote anchors only when it occurs exactly
- * once across the finding's cited windows; repeated, too-short, paraphrased or translated
- * quotes leave the window as the citation. A window is replaced only when every quote
- * occurring in it anchored, so support for an ambiguous quote is never dropped.
+ * Exact caption cues for a finding's explicit claim support. Narrowing happens only when
+ * every support passage occurs exactly once across the cited windows; otherwise every
+ * window stays the citation. Names and other advisory quotes never narrow a finding.
+ * A narrowed window also keeps the cue of each checked quantity quote inside it, or
+ * stays whole when that quote cannot be located, so numeric support is never dropped.
  */
 function captionAnchors(
-  finding: { windowIndexes: number[]; quantities: Array<{ quote: string }>; entities: Array<{ quote: string; source: string }> },
+  finding: { windowIndexes: number[]; support: readonly string[]; quantities: ReadonlyArray<{ quote: string }> },
   cuesByWindow: Map<number, { text: string; cues: CaptionCue[] }>,
 ): Map<number, CaptionCue[]> {
-  const quotes = [...new Set([
-    ...finding.quantities.map(item => item.quote),
-    ...finding.entities.filter(item => item.source === 'transcript').map(item => item.quote),
-  ].map(normalizedTranscriptText).filter(Boolean))];
   const anchored = new Map<number, CaptionCue[]>();
-  const blocked = new Set<number>();
-  for (const quote of quotes) {
-    const find = (whole: boolean) => finding.windowIndexes.flatMap(window =>
-      occurrences(cuesByWindow.get(window)?.text ?? '', quote, whole).map(offset => ({ window, offset })));
-    const hits = find(true);
-    const unique = hits.length === 1 && quote.length >= MIN_ANCHOR_QUOTE_CHARACTERS ? hits[0]! : undefined;
-    // Any window where the quote also occurs, even inside a longer word, keeps its coarse anchor.
-    if (!unique) { for (const hit of [...hits, ...find(false)]) blocked.add(hit.window); continue; }
-    for (const hit of find(false)) if (hit.offset !== unique.offset || hit.window !== unique.window) blocked.add(hit.window);
-    const cues = cuesByWindow.get(unique.window)!.cues.filter(cue => cue.from < unique.offset + quote.length && cue.to > unique.offset);
-    const merged = [...(anchored.get(unique.window) ?? []), ...cues];
-    anchored.set(unique.window, [...new Map(merged.map(cue => [cue.id, cue])).values()].sort((a, b) => a.from - b.from));
+  const support = [...new Set(finding.support.map(normalizedTranscriptText).filter(Boolean))];
+  if (!support.length) return anchored;
+  for (const quote of support) {
+    const hit = uniqueOccurrence(quote, finding.windowIndexes, cuesByWindow);
+    if (!hit) return new Map();
+    anchored.set(hit.window, [...(anchored.get(hit.window) ?? []), ...cuesAt(cuesByWindow, hit, quote.length)]);
   }
-  for (const window of blocked) anchored.delete(window);
+  for (const quote of [...new Set(finding.quantities.map(item => normalizedTranscriptText(item.quote)).filter(Boolean))]) {
+    for (const window of [...anchored.keys()]) {
+      if (!occurrences(cuesByWindow.get(window)?.text ?? '', quote, false).length) continue;
+      const hit = uniqueOccurrence(quote, [window], cuesByWindow);
+      if (hit) anchored.set(window, [...anchored.get(window)!, ...cuesAt(cuesByWindow, hit, quote.length)]);
+      else anchored.delete(window);
+    }
+  }
+  for (const [window, cues] of anchored)
+    anchored.set(window, [...new Map(cues.map(cue => [cue.id, cue])).values()].sort((a, b) => a.from - b.from));
   return anchored;
 }
 
