@@ -1220,6 +1220,35 @@ test('one search reads and parses each saved comment page once', async () =>
     expect((await store.search.searchEvidence(store, 'palette note')).packets).toEqual([]);
   }));
 
+test('deleting an unrelated asset during a comment search keeps its other hits', async () =>
+  within('comment-search-unrelated-delete', async (store) => {
+    const p = provider();
+    p.comments = vi.fn(async (_id: string, options?: { continuation?: string }) => ({ cacheStatus: 'miss' as const,
+      value: commentPage(4, index => options?.continuation ? `Unrelated remark ${index + 1}` : `Easel tip ${index + 1}`) }));
+    const session = sessionProvider(p, store);
+    await session.comments(id);
+    const other = (await session.comments(id, { continuation: 'next' })).assetVersions![0]!;
+    await store.ensureSearchIndexed();
+    const read = store.read.bind(store);
+    vi.spyOn(store, 'read').mockImplementationOnce(async version => {
+      await store.delete(other);
+      return read(version);
+    });
+    expect((await store.search.searchEvidence(store, 'easel tip')).packets).toHaveLength(4);
+  }));
+
+test('repeated comment searches showing the same passages reuse their saved rows', async () =>
+  within('comment-search-saved-rows', async (store, _reopen, sql) => {
+    const p = provider();
+    p.comments = vi.fn(async () => ({ cacheStatus: 'miss' as const, value: commentPage(6, index => `Canvas grain opinion ${index + 1}`) }));
+    await sessionProvider(p, store).comments(id);
+    const rows = () => sql.exec<{ count: number }>("SELECT COUNT(*) AS count FROM session_packets WHERE packet_id LIKE 'session:%'").one().count;
+    expect((await store.search.searchEvidence(store, 'canvas')).packets).toHaveLength(6);
+    const after = rows();
+    expect((await store.search.searchEvidence(store, 'grain opinion')).packets).toHaveLength(6);
+    expect(rows()).toBe(after);
+  }));
+
 test('an unfiltered saved comment read names its page version for continuation', async () =>
   within('comment-saved-read-version', async (store) => {
     const page = commentPage(14, index => `Opinion ${index + 1}`);

@@ -562,30 +562,37 @@ export class SessionEvidenceStore implements SessionAccess {
     return { packets: [packet], nextOffset: slice.nextOffset };
   }
   /**
-   * A per-search cache of saved comment pages. Versions are immutable, so a parsed page can
-   * be reused within one search; readSavedComment still rejects a version deleted meanwhile.
+   * A per-search cache of saved comment pages. Versions are content-addressed and never
+   * change, so a parsed page stays valid for as long as its own version exists.
    */
   commentPageCache(): CommentPageCache {
-    return { generation: this.generation(), pages: new Map() };
+    return { pages: new Map() };
   }
-  /** One saved comment for a search hit, shown around the span search reported as `rawMatch`. */
+  /**
+   * One saved comment for a search hit, shown around the span search reported as `rawMatch`.
+   * A hit whose page was deleted or could not be read returns no packet; deleting any other
+   * asset or memory does not affect it.
+   */
   async readSavedComment(version: string, position: number, rawMatch: MatchSpan | undefined, cache?: CommentPageCache) {
-    const cached = cache && cache.generation === this.generation() ? cache.pages.get(version) : undefined;
-    const loaded = cached ?? (async () => {
-      const asset = this.brief().assets.find((item) => item.version === version);
-      if (asset?.kind !== 'comments') throw new Error('Session asset is unavailable or deleted.');
-      return { asset, comments: await this.savedCommentPage(asset), current: this.currentVersions().has(version) };
-    })();
-    if (!cached && cache && cache.generation === this.generation()) cache.pages.set(version, loaded);
+    const loaded = cache?.pages.get(version) ?? this.loadCommentPage(version);
+    cache?.pages.set(version, loaded);
     const page = await loaded;
-    // Deletion advances the generation and removes the asset; never serve a deleted page from memory.
-    if (!this.has(version) || (cache && cache.generation !== this.generation())) throw new Error('Session asset is unavailable or deleted.');
+    // A read interrupted by a deletion elsewhere returns nothing; let a later hit retry it.
+    if (!page) cache?.pages.delete(version);
+    // Never serve a page from memory after its own version is deleted.
+    if (!page || !this.has(version)) return { packets: [] };
     const comment = page.comments[position];
     if (!comment) return { packets: [] };
-    const packet = await this.commentPacket(page.asset, [{ comment, position, rawMatch }], [],
-      `session:${version}:comment:${position}:${rawMatch ? `${rawMatch.at}-${rawMatch.end}` : 'start'}`, { savedPageCount: 1 }, page.current);
+    const packet = await this.commentPacket(page.asset, [{ comment, position, rawMatch }], [], undefined, { savedPageCount: 1 }, page.current);
     this.savePacket(packet);
     return { packets: [packet] };
+  }
+  private async loadCommentPage(version: string): Promise<CommentPage | undefined> {
+    const asset = this.brief().assets.find((item) => item.version === version);
+    if (asset?.kind !== 'comments') return undefined;
+    const value = await this.read(version);
+    const comments = value === null ? undefined : savedComments(value);
+    return comments && { asset, comments, current: this.currentVersions().has(version) };
   }
   private async savedCommentPage(asset: SessionAsset): Promise<Comment[]> {
     const value = await this.read(asset.version);
@@ -593,21 +600,26 @@ export class SessionEvidenceStore implements SessionAccess {
     if (!comments) throw new Error('Session asset is unavailable or deleted.');
     return comments;
   }
+  /**
+   * Without `packetId`, the packet is named after its single excerpt, so repeated searches
+   * that show the same passage replace one saved row instead of adding another.
+   */
   private async commentPacket(asset: SessionAsset, entries: Array<{ comment: Comment; position: number; rawMatch?: MatchSpan }>, terms: readonly string[],
-    packetId: string, data: Record<string, unknown>, current = this.currentVersions().has(asset.version)) {
+    packetId: string | undefined, data: Record<string, unknown>, current = this.currentVersions().has(asset.version)) {
     const sourceId = `youtube:${asset.videoId}:comments`;
+    // Version-specific IDs: a refreshed page can reuse comment IDs with different text.
+    // A passage that does not start at the body start has its own ID, so one ID never names two texts.
+    const excerpts = entries.map(({ comment, position, rawMatch }) => {
+      const passage = commentPassage(comment, terms, rawMatch);
+      return { id: `evidence:${asset.version}:${position}${passage.start === undefined ? '' : `:${passage.start}`}`, sourceId, text: passage.text };
+    });
     return evidencePacketSchema.parse({
-      packetId,
+      packetId: packetId ?? `session:${excerpts[0]!.id}`,
       kind: 'youtube_comments',
       assetVersions: [asset.version],
       sources: [{ id: sourceId, provider: 'youtube', kind: 'comments', videoId: asset.videoId,
         url: `https://www.youtube.com/watch?v=${asset.videoId}` }],
-      // Version-specific IDs: a refreshed page can reuse comment IDs with different text.
-      // A passage that does not start at the body start has its own ID, so one ID never names two texts.
-      excerpts: entries.map(({ comment, position, rawMatch }) => {
-        const passage = commentPassage(comment, terms, rawMatch);
-        return { id: `evidence:${asset.version}:${position}${passage.start === undefined ? '' : `:${passage.start}`}`, sourceId, text: passage.text };
-      }),
+      excerpts,
       artifacts: [{ type: 'youtube_comments', title: `Saved comments for ${asset.videoId}`, data: { returnedCount: entries.length, ...data } }],
       warnings: current ? [] : [{ code: 'SUPERSEDED_SESSION_EVIDENCE',
         message: 'This evidence refers to an older stored comment page. Use the current version for current facts.' }],
@@ -944,10 +956,10 @@ export async function versionEvidencePacket(packet: EvidencePacket): Promise<Evi
   return result;
 }
 
-/** Saved comment pages loaded during one search, valid only for the generation they were read in. */
+interface CommentPage { asset: SessionAsset; comments: Comment[]; current: boolean }
+/** Saved comment pages loaded during one search, by version. */
 export interface CommentPageCache {
-  generation: number;
-  pages: Map<string, Promise<{ asset: SessionAsset; comments: Comment[]; current: boolean }>>;
+  pages: Map<string, Promise<CommentPage | undefined>>;
 }
 
 /** Comments of a saved provider page, or undefined for an unexpected payload. */

@@ -168,8 +168,9 @@ export class SessionSearch {
     // A comment packet repeats entries of its saved page. Once that page is indexed, its rows
     // represent every comment, so the packet copies must not take result slots before the limit.
     // Packets whose page is not indexed, such as unreadable legacy pages, stay searchable.
+    // The bare packet_id comparison uses its primary key rather than scanning every packet per row.
     const duplicates = scope === 'evidence' ? ` AND NOT EXISTS (SELECT 1 FROM session_packets p
-      WHERE owner='packet:' || p.packet_id AND json_extract(p.packet_json,'$.kind')='youtube_comments'
+      WHERE owner LIKE 'packet:%' AND p.packet_id = substr(owner, 8) AND json_extract(p.packet_json,'$.kind')='youtube_comments'
       AND EXISTS (SELECT 1 FROM json_each(p.versions_json) v WHERE v.value IN (SELECT version FROM session_search_assets)))` : '';
     const markers = matchMarkers();
     return this.sql
