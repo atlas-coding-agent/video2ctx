@@ -1220,21 +1220,47 @@ test('one search reads and parses each saved comment page once', async () =>
     expect((await store.search.searchEvidence(store, 'palette note')).packets).toEqual([]);
   }));
 
-test('deleting an unrelated asset during a comment search keeps its other hits', async () =>
-  within('comment-search-unrelated-delete', async (store) => {
+/** Runs `during` after a store read has started but before it resolves, as a concurrent request would. */
+function interleaveReads(store: SessionEvidenceStore, during: () => Promise<void>, times = 1) {
+  const read = store.read.bind(store);
+  const spy = vi.spyOn(store, 'read');
+  for (let index = 0; index < times; index += 1) spy.mockImplementationOnce(async version => {
+    const reading = read(version);
+    await during();
+    return reading;
+  });
+}
+
+test.each([1, 4])('a deletion elsewhere during a page read keeps all %i matching comments', async matches =>
+  within(`comment-search-inflight-${matches}`, async (store) => {
     const p = provider();
-    p.comments = vi.fn(async (_id: string, options?: { continuation?: string }) => ({ cacheStatus: 'miss' as const,
-      value: commentPage(4, index => options?.continuation ? `Unrelated remark ${index + 1}` : `Easel tip ${index + 1}`) }));
-    const session = sessionProvider(p, store);
-    await session.comments(id);
-    const other = (await session.comments(id, { continuation: 'next' })).assetVersions![0]!;
+    p.comments = vi.fn(async () => ({ cacheStatus: 'miss' as const,
+      value: commentPage(6, index => index < matches ? `Easel tip ${index + 1}` : `Other remark ${index + 1}`) }));
+    await sessionProvider(p, store).comments(id);
     await store.ensureSearchIndexed();
-    const read = store.read.bind(store);
-    vi.spyOn(store, 'read').mockImplementationOnce(async version => {
-      await store.delete(other);
-      return read(version);
-    });
-    expect((await store.search.searchEvidence(store, 'easel tip')).packets).toHaveLength(4);
+    // Deleting a memory advances the store generation, so the in-flight page read is fenced.
+    interleaveReads(store, async () => store.deleteMemory('unrelated'));
+    expect((await store.search.searchEvidence(store, 'easel tip')).packets).toHaveLength(matches);
+  }));
+
+test('a comment search that keeps being interrupted asks for a retry instead of returning nothing', async () =>
+  within('comment-search-inflight-exhausted', async (store) => {
+    const p = provider();
+    p.comments = vi.fn(async () => ({ cacheStatus: 'miss' as const, value: commentPage(2, index => `Easel tip ${index + 1}`) }));
+    await sessionProvider(p, store).comments(id);
+    await store.ensureSearchIndexed();
+    interleaveReads(store, async () => store.deleteMemory('unrelated'), 3);
+    await expect(store.search.searchEvidence(store, 'easel tip')).rejects.toThrow('Retry the search');
+  }));
+
+test('deleting the matched page during its read still returns nothing for it', async () =>
+  within('comment-search-inflight-own-delete', async (store) => {
+    const p = provider();
+    p.comments = vi.fn(async () => ({ cacheStatus: 'miss' as const, value: commentPage(2, index => `Easel tip ${index + 1}`) }));
+    const version = (await sessionProvider(p, store).comments(id)).assetVersions![0]!;
+    await store.ensureSearchIndexed();
+    interleaveReads(store, () => store.delete(version));
+    expect((await store.search.searchEvidence(store, 'easel tip')).packets).toEqual([]);
   }));
 
 test('repeated comment searches showing the same passages reuse their saved rows', async () =>
