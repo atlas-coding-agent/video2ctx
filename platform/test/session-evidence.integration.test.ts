@@ -1259,7 +1259,7 @@ test('deleting the matched page during its read still returns nothing for it', a
     p.comments = vi.fn(async () => ({ cacheStatus: 'miss' as const, value: commentPage(2, index => `Easel tip ${index + 1}`) }));
     const version = (await sessionProvider(p, store).comments(id)).assetVersions![0]!;
     await store.ensureSearchIndexed();
-    interleaveReads(store, () => store.delete(version));
+    interleaveReads(store, async () => { await store.delete(version); });
     expect((await store.search.searchEvidence(store, 'easel tip')).packets).toEqual([]);
   }));
 
@@ -1351,4 +1351,72 @@ test.each(Array.from({ length: 11 }, (_, index) => 1975 + index))('a matched tok
     const excerpt = (await store.search.searchEvidence(store, 'needle')).packets[0]!.excerpts[0]!;
     expect(excerpt.text).toMatch(/\bneedle\b/);
     expect(excerpt.text).toContain('Author: Reviewer');
+  }));
+
+// Real SQLite availability/generation checks, with R2 used only to load analyst inputs.
+test.each(['transcript', 'frame', 'storyboard_sheet'] as const)(
+  'saved %s analysis reads once and fences deletion, clearing, and same-version restoration', async kind => {
+    for (const mutation of ['none', 'delete', 'clear', 'restore'] as const) {
+      await within(`analysis-recheck-${kind}-${mutation}`, async store => {
+        const value = kind === 'transcript' ? transcript() : kind === 'frame' ? oneFrame(id) : oneSheet(id);
+        const retrieve = () => store.retrieve(`recheck:${kind}`, kind, id, false,
+          async () => ({ value, cacheStatus: 'miss' as const }),
+          () => kind === 'storyboard_sheet' ? { sheetIndex: 0, manifestVersion: 'manifest' } : {});
+        const version = (await retrieve()).assetVersions![0]!;
+        const ctx = context(store, provider());
+        const duringInference = async () => {
+          if (mutation === 'none') return;
+          await store.delete(mutation === 'clear' ? undefined : version);
+          if (mutation === 'restore') expect((await retrieve()).assetVersions).toEqual([version]);
+        };
+        ctx.analyzeFrames = async () => {
+          await duringInference();
+          return { findings: [{ observation: 'A chart.', timestampsMs: [1000] }], warnings: [] };
+        };
+        ctx.analyzeStoryboard = async () => {
+          await duringInference();
+          return { findings: [{ observation: 'A chart.', frameIndexes: [0] }], warnings: [] };
+        };
+        ctx.transcriptPolicy = { mode: 'contextual_analysis', researchQuestion: 'Describe the opening.',
+          analyze: async () => {
+            await duringInference();
+            return { summary: 'A clear opening sentence.',
+              findings: [{ claim: 'A clear opening sentence.', excerptIds: ['opening'] }],
+              excerpts: [{ id: 'opening', text: 'A clear opening sentence.', startMs: 0, endMs: 5600 }],
+              coverage: { completeTranscriptRead: true, segmentCount: 1, startMs: 0, endMs: 5600 }, warnings: [] };
+          } };
+        const read = vi.spyOn(store, 'read');
+        const pending = kind === 'transcript'
+          ? executeAnalyzeVideoTranscript({ assetVersion: version, focus: 'Describe the opening.' }, ctx, 'analysis')
+          : kind === 'frame'
+            ? executeAnalyzeVideoFrames({ assetVersions: [version], focus: 'Describe the chart.' }, ctx, 'analysis')
+            : executeAnalyzeVideoStoryboard({ assetVersions: [version], focus: 'Describe the chart.' }, ctx, 'analysis');
+        if (mutation === 'none') {
+          await expect(pending).resolves.toMatchObject({ assetVersions: [version] });
+          expect(store.evidence()).toHaveLength(1);
+        } else {
+          await expect(pending).rejects.toThrow('unavailable or deleted');
+          expect(store.evidence()).toEqual([]);
+        }
+        expect(read).toHaveBeenCalledExactlyOnceWith(version);
+      });
+    }
+  },
+);
+
+
+test('failed preview cleanup stays queued across store reconstruction and removes only private objects', async () =>
+  within('preview-cleanup-retry', async (store, reopen, sql) => {
+    const key = 'agent-frames/cleanup-owner/abandoned.jpg';
+    const retained = 'agent-frames/cleanup-owner/published.jpg';
+    await env.RESEARCH.put(key, new Uint8Array([255, 216, 255, 217]));
+    await env.RESEARCH.put(retained, 'retained');
+    store.queueCleanup([key]);
+    const failing = new SessionEvidenceStore(sql, { delete: async () => { throw new Error('R2 unavailable'); } } as unknown as R2Bucket, 'test-session/preview-cleanup-retry/');
+    await expect(failing.cleanup()).rejects.toThrow('R2 unavailable');
+    expect(sql.exec('SELECT * FROM session_blob_deletions').toArray()).toEqual([{ blob_key: key }]);
+    await reopen().cleanup();
+    expect(await env.RESEARCH.head(key)).toBeNull();
+    expect(await env.RESEARCH.head(retained)).not.toBeNull();
+    expect(sql.exec('SELECT * FROM session_blob_deletions').toArray()).toEqual([]);
   }));
