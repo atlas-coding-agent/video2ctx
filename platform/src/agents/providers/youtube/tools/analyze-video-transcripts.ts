@@ -26,7 +26,7 @@ export const analyzeVideoTranscriptsInputSchema = z.object({
 export function createAnalyzeVideoTranscriptsTool(context: AgentToolContext) {
   return tool({
     description:
-      'Analyze complete transcripts already saved in this session. Submit selected transcript assetVersions in one batch and a focused evidence question. Never retrieves transcripts. The runtime may load missing video metadata through get_video. Retrieve missing transcripts first using get_video_transcript. Independent analyses are bounded by the research target; failures do not discard successful evidence.',
+      'Analyze transcripts already saved in this session. A separate analyst receives every caption window of each transcript and returns focused, cited findings, not the caption text. Submit selected transcript assetVersions in one batch and a focused evidence question. Never retrieves transcripts. The runtime may load missing video metadata through get_video. Retrieve missing transcripts first using get_video_transcript. Independent analyses are bounded by the research target; failures do not discard successful evidence.',
     inputSchema: analyzeVideoTranscriptsInputSchema,
     execute: async ({ assetVersions, focus }, { toolCallId }) => {
       const outcomes = await Promise.allSettled(
@@ -150,7 +150,7 @@ async function analystEvidence(
       endMs: excerpt.endMs,
     })),
     artifactType: 'youtube_transcript_analysis',
-    artifactTitle: `Complete transcript analysis for ${input.videoId}`,
+    artifactTitle: `Transcript analysis for ${input.videoId}`,
     artifactData: {
       groundingVersion: analysis.groundingVersion,
       sourceContext: analysis.sourceContext ?? sourceContext,

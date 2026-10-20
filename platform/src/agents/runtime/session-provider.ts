@@ -116,6 +116,13 @@ export function sessionProvider(
     },
     comments: async (id, options = {}) => {
       const key = `comments:${id}:${options.all ?? false}:${options.continuation ?? ''}`;
+      if (options.pageVersion) {
+        // Later entries of a page come from the exact saved version, priced as a session reuse.
+        const pinned = await store.lookupVersion<Awaited<ReturnType<YouTubeAgentProvider['comments']>>['value']>(options.pageVersion, 'comments', id);
+        if (!pinned) throw new Error('The saved comment page is no longer available. Read the page again without an offset.');
+        // Join this run's retrieval claim only when it produced this exact version.
+        return claimed(pinned, store.versionForKey(key) === options.pageVersion ? [key] : []);
+      }
       const fresh = (refresh && !refreshed.has(key)) || !!options.refresh;
       let retrievalClaim: string | undefined;
       const result = await store.retrieve(

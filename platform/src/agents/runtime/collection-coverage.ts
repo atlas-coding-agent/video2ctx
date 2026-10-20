@@ -5,10 +5,18 @@ import type { EvidencePacket } from '../contracts';
 export const COLLECTION_ITEM_LIMIT = 12;
 
 /**
- * Entry-list packets: one excerpt and one source per listed entry. Comments,
- * transcripts and visual packets have their own projections and are excluded.
+ * Comments one read returns. Equal to the comment entries a model context shows per
+ * packet, so following nextOffset delivers every comment of a page and none is skipped.
+ */
+export const COMMENT_READ_LIMIT = 8;
+
+/**
+ * Entry-list packets: one excerpt per listed entry. Comments share one source and
+ * are paged within a saved provider page. Transcripts and visual packets have their
+ * own projections and are excluded.
  */
 export const COLLECTION_ARTIFACT_TYPES = {
+  youtube_comments: 'youtube_comments',
   youtube_playlist: 'youtube_playlist',
   youtube_search: 'youtube_search_candidates',
   youtube_browse: 'youtube_browse_candidates',
@@ -41,6 +49,14 @@ export const collectionRetrievalSchema = z.object({
   morePages: z.boolean(),
   /** Whether the producing tool accepts that token. get_playlist does not. */
   continuationAccepted: z.boolean(),
+  /** Page entries before this packet, read with smaller offsets. Absent means 0. */
+  pageOffset: z.number().int().nonnegative().optional(),
+  /** Offset of the first page entry after this packet, readable from the saved page. */
+  nextPageOffset: z.number().int().nonnegative().optional(),
+  /** Saved page version that later offsets must read. */
+  pageVersion: z.string().regex(/^[a-f0-9]{64}$/).optional(),
+  /** Counts and offsets refer to entries matching a saved-page query, not provider-page positions. */
+  matchesOnly: z.boolean().optional(),
 });
 
 export type CollectionRetrieval = z.infer<typeof collectionRetrievalSchema>;
@@ -53,6 +69,10 @@ export function collectionRetrieval(options: {
   reportedTotalText?: string;
   continuation?: string;
   continuationAccepted: boolean;
+  pageOffset?: number;
+  nextPageOffset?: number;
+  pageVersion?: string;
+  matchesOnly?: boolean;
 }): CollectionRetrieval {
   return {
     version: 1,
@@ -63,6 +83,10 @@ export function collectionRetrieval(options: {
     ...(options.reportedTotalText ? { reportedTotalText: options.reportedTotalText.slice(0, 200) } : {}),
     morePages: !!options.continuation,
     continuationAccepted: options.continuationAccepted,
+    ...(options.pageOffset ? { pageOffset: options.pageOffset } : {}),
+    ...(options.nextPageOffset !== undefined ? { nextPageOffset: options.nextPageOffset } : {}),
+    ...(options.pageVersion ? { pageVersion: options.pageVersion } : {}),
+    ...(options.matchesOnly ? { matchesOnly: true } : {}),
   };
 }
 
@@ -106,7 +130,9 @@ export function modelCollection(options: {
   // Trust recorded counts only when they describe this packet.
   const recorded = retrieval && retrieval.retainedCount === retained ? retrieval : undefined;
   const excluded = recorded?.excludedCount ?? 0;
-  const notRetained = recorded ? Math.max(0, recorded.fetchedCount - excluded - retained) : undefined;
+  const before = recorded?.pageOffset ?? 0;
+  const notRetained = recorded ? Math.max(0, recorded.fetchedCount - excluded - before - retained) : undefined;
+  const pageable = recorded?.nextPageOffset !== undefined;
   const sentences: string[] = [];
 
   if (shown === retained) {
@@ -122,9 +148,19 @@ export function modelCollection(options: {
   if (!recorded) {
     sentences.push('The provider page size before the agent item limit was not recorded for this packet, so it is unknown whether the page had more entries.');
   } else {
-    const parts = [`The provider page had ${recorded.fetchedCount} ${plural(recorded.fetchedCount, 'entry', 'entries')}.`];
+    const parts = [recorded.matchesOnly
+      ? `${recorded.fetchedCount} saved ${plural(recorded.fetchedCount, 'entry matches', 'entries match')} the query.`
+      : `The provider page had ${recorded.fetchedCount} ${plural(recorded.fetchedCount, 'entry', 'entries')}.`];
     if (excluded) parts.push(`${excluded} ${plural(excluded, 'was', 'were')} excluded by agent policy.`);
-    if (notRetained) parts.push(`${notRetained} more ${plural(notRetained, 'was', 'were')} not retained because of the agent item limit and ${plural(notRetained, 'is', 'are')} not available in this evidence.`);
+    if (before) parts.push(recorded.matchesOnly
+      ? `This packet starts at match ${before + 1}; ${before} earlier ${plural(before, 'match is', 'matches are')} in a read with a smaller offset.`
+      : `This packet starts at page entry ${before + 1}; ${before} earlier ${plural(before, 'entry is', 'entries are')} in a read with a smaller offset.`);
+    if (notRetained && recorded.matchesOnly) parts.push(pageable
+      ? `${notRetained} later ${plural(notRetained, 'match is', 'matches are')} not in this packet. Repeat this saved read with the same query at offset ${recorded.nextPageOffset}; offsets count matches, not page positions. Do not describe them before reading.`
+      : `${notRetained} more ${plural(notRetained, 'match was', 'matches were')} not retained and ${plural(notRetained, 'is', 'are')} not available in this evidence.`);
+    else if (notRetained) parts.push(pageable
+      ? `${notRetained} later ${plural(notRetained, 'entry', 'entries')} on this saved page ${plural(notRetained, 'is', 'are')} not in this packet. Read offset ${recorded.nextPageOffset}${recorded.pageVersion ? ` with pageVersion ${recorded.pageVersion}` : ''} and the same continuation to load them; do not describe them before reading.`
+      : `${notRetained} more ${plural(notRetained, 'was', 'were')} not retained because of the agent item limit and ${plural(notRetained, 'is', 'are')} not available in this evidence.`);
     sentences.push(parts.join(' '));
   }
 
@@ -137,7 +173,7 @@ export function modelCollection(options: {
   }
 
   if (recorded?.morePages) {
-    const gap = notRetained ? ` It would not return the ${notRetained} unretained ${plural(notRetained, 'entry', 'entries')} from this page.` : '';
+    const gap = notRetained ? ` It would not return the ${notRetained} ${pageable ? 'later' : 'unretained'} ${plural(notRetained, 'entry', 'entries')} from this page.` : '';
     sentences.push(recorded.continuationAccepted
       ? `The provider reported a further page. Its continuation resumes after the whole fetched page.${gap}${options.continuationShown ? '' : ' The continuation token is not included in this context.'}`
       : `The provider reported a further page, but the tool that produced this packet cannot read further pages.${gap}`);

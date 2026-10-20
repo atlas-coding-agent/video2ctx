@@ -12,7 +12,8 @@ export function createCapabilityProvider(
     ...provider,
     video: (id, options) => decision.refreshDynamicData || decision.refreshEvidence
       ? savedProvider.video(id, { ...options, refresh: true, ...(decision.refreshDynamicData ? { includeSignals: true } : {}) }) : savedProvider.video(id, options),
-    comments: (id, options) => decision.refreshDynamicData
+    // A pinned saved-page read continues a page this session already holds; it never refreshes.
+    comments: (id, options) => decision.refreshDynamicData && !options?.pageVersion
       ? savedProvider.comments(id, { ...options, refresh: true }) : savedProvider.comments(id, options),
   };
   if (decision.useStoryboard === false) provider = { ...provider, storyboard: undefined, frames: undefined };

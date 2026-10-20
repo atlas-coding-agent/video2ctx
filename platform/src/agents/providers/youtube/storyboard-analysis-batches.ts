@@ -17,6 +17,7 @@ export async function analyzeStoryboardBatches(
       sheets.map(sheet => Math.floor(sheet.firstFrameIndex / (input.storyboard.manifest?.framesPerSheet ?? sheet.columns * sheet.rows))) } });
   }
   const findings: VisualAnalysis['findings'] = [];
+  const sharedFindings: NonNullable<VisualAnalysis['sharedFindings']> = [];
   const warnings: string[] = [];
   const analyzedSheets: Storyboard['sheets'] = [];
   let firstFailure: unknown;
@@ -36,7 +37,7 @@ export async function analyzeStoryboardBatches(
       const result = await withRunDeadline(batchDeadlineAt, input.signal, signal => analyze({ ...input, storyboard, signal,
         modelCallId: batches.length === 1 ? input.modelCallId : `${input.modelCallId}:batch:${offset + index}` }),
       'Storyboard batch analysis exceeded its deadline before research handoff.');
-      for (const finding of result.findings) for (const frame of finding.frameIndexes) {
+      for (const finding of [...result.findings, ...result.sharedFindings ?? []]) for (const frame of finding.frameIndexes) {
         if (!storyboard.sheets.some(sheet => frame >= sheet.firstFrameIndex && frame < sheet.firstFrameIndex + sheet.frameCount))
           throw new Error(`Visual analyst referenced unavailable frame ${frame}.`);
       }
@@ -46,6 +47,7 @@ export async function analyzeStoryboardBatches(
     results.forEach((result, index) => {
       if (result.status === 'fulfilled') {
         findings.push(...result.value.findings);
+        sharedFindings.push(...result.value.sharedFindings ?? []);
         warnings.push(...result.value.warnings);
         analyzedSheets.push(...wave[index]!.sheets);
       } else {
@@ -55,5 +57,5 @@ export async function analyzeStoryboardBatches(
     });
   }
   if (!analyzedSheets.length) throw firstFailure ?? new Error('Not enough research time to analyze storyboards.');
-  return { findings, warnings, analyzedSheets, batchCount: batches.length };
+  return { findings, sharedFindings, warnings, analyzedSheets, batchCount: batches.length };
 }

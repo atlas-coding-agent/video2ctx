@@ -46,6 +46,11 @@ export const TRANSCRIPT_GROUNDING_GUIDANCE = [
 
 export const FINAL_FACT_GUIDANCE = 'Preserve transcriptAnalysis.sourceContext and each finding\'s entities, quantities and uncertainty. Use only supported names for that video. Copy numerical values with their original units, basis and claimed/measured distinction; do not convert, round or infer missing units. If a quantity is uncertain, retain that caveat or omit the number. Compare only compatible measurements; never call a lower value higher. An exact source quote supports extraction, not independent verification of the video\'s claims.';
 
+/** The comparison form shared by grounding checks and caption anchoring. */
+export function normalizedTranscriptText(text: string): string {
+  return normalized(text);
+}
+
 function normalized(text: string): string {
   return text.normalize('NFKC').replace(/[‘’]/gu, "'").replace(/[“”]/gu, '"').replace(/[०-९]/gu, c => String(c.charCodeAt(0) - 0x966)).replace(/\s+/gu, ' ').trim().toLowerCase();
 }

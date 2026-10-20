@@ -8,7 +8,7 @@ import {
   evidenceSourceSchema,
   type EvidencePacket,
 } from '../contracts';
-import { isCollectionKind, modelCollection, modelCollectionSchema, readCollectionRetrieval } from './collection-coverage';
+import { COMMENT_READ_LIMIT, isCollectionKind, modelCollection, modelCollectionSchema, readCollectionRetrieval } from './collection-coverage';
 
 const MODEL_EXCERPTS_PER_PACKET = 8;
 const MODEL_EXCERPT_CHARACTERS = 800;
@@ -46,10 +46,12 @@ const transcriptAnalysisDataSchema = z.object({
     excerptIds: z.array(z.string().min(1).max(300)).max(3),
   })),
   coverage: z.object({
+    /** The analyst received every caption window. Legacy records carry only this literal. */
     completeTranscriptRead: z.literal(true),
     segmentCount: z.number().int().nonnegative(),
     startMs: z.number().int().nonnegative().nullable(),
     endMs: z.number().int().nonnegative().nullable(),
+    windowCount: z.number().int().nonnegative().optional(),
   }),
   selectedExcerptCount: z.number().int().nonnegative(),
 });
@@ -74,6 +76,13 @@ export const modelEvidencePacketSchema = z.object({
     })).max(MODEL_ANALYSIS_FINDINGS),
     coverage: transcriptAnalysisDataSchema.shape.coverage,
     selectedExcerptCount: z.number().int().nonnegative(),
+    /** What this context holds of the saved analysis. Caption text is never included. */
+    delivery: z.object({
+      findingsShown: z.number().int().nonnegative(),
+      findingsSaved: z.number().int().nonnegative(),
+      captionTextIncluded: z.literal(false),
+      note: z.string().min(1).max(600),
+    }).optional(),
   }).optional(),
   excerpts: z.array(evidenceExcerptSchema).max(5_000).optional(),
   visualCoverage: visualCoverageSchema.optional(),
@@ -85,6 +94,16 @@ export const modelEvidencePacketSchema = z.object({
   continuation: z.string().max(4_000).optional(),
   /** Entry-list coverage. Counts describe this projection, not the saved packet alone. */
   collection: modelCollectionSchema.optional(),
+  /** Visual observations in this context compared with those saved in the packet. */
+  visualDelivery: z.object({
+    observationsShown: z.number().int().nonnegative(),
+    observationsSaved: z.number().int().nonnegative(),
+  }).optional(),
+  /** What this turn recorded doing to obtain this packet. Derived from run records, not packet IDs. */
+  delivery: z.object({
+    operation: z.enum(['image_analysis', 'transcript_analysis', 'retrieval', 'saved_read', 'inherited']),
+    note: z.string().min(1).max(300),
+  }).optional(),
   warnings: z.array(agentWarningSchema).max(MODEL_WARNINGS),
 });
 
@@ -152,6 +171,7 @@ export function evidencePacketForModel(packet: EvidencePacket): ModelEvidencePac
         })),
         coverage: transcriptAnalysis.coverage,
         selectedExcerptCount: transcriptAnalysis.selectedExcerptCount,
+        delivery: analysisDelivery(Math.min(MODEL_ANALYSIS_FINDINGS, transcriptAnalysis.findings.length), transcriptAnalysis.findings.length),
       },
       warnings: packet.warnings,
     });
@@ -173,6 +193,7 @@ export function evidencePacketForModel(packet: EvidencePacket): ModelEvidencePac
     ...excerpt,
     text: fullMetadata ? excerpt.text : boundedText(excerpt.text, packet.kind === 'youtube_transcript' ? MODEL_TRANSCRIPT_EXCERPT_CHARACTERS : MODEL_EXCERPT_CHARACTERS),
   }));
+  const visual = packet.kind === 'youtube_storyboard' || packet.kind === 'youtube_frames';
   const sourceIds = new Set(excerpts.map((excerpt) => excerpt.sourceId));
   const sources = packet.sources.filter((source) => sourceIds.has(source.id));
 
@@ -184,19 +205,60 @@ export function evidencePacketForModel(packet: EvidencePacket): ModelEvidencePac
     excerpts,
     visualCoverage: coverage?.success ? coverage.data : undefined,
     frameCoverage: frameCoverage?.success ? frameCoverage.data : undefined,
+    ...(visual ? { visualDelivery: { observationsShown: excerpts.length, observationsSaved: packet.excerpts.length } } : {}),
     artifacts: packet.artifacts.map((artifact) => ({
       type: artifact.type,
       title: artifact.title,
     })),
     continuation: packet.continuation,
-    warnings: packet.warnings,
+    warnings: [
+      ...(visual && excerpts.length < packet.excerpts.length ? [visualTruncation(excerpts.length, packet.excerpts.length)] : []),
+      ...withVisualProvenanceWarning(packet).warnings,
+    ].slice(0, MODEL_WARNINGS),
   });
+}
+
+function visualTruncation(shown: number, saved: number) {
+  return { code: 'VISUAL_CONTEXT_TRUNCATED',
+    message: `Only ${shown} of ${saved} saved visual observations fit this context. The others are saved but not shown; do not describe them or claim complete visual coverage.` };
+}
+
+const LEGACY_VISUAL_PROVENANCE_WARNING = { code: 'LEGACY_VISUAL_PROVENANCE',
+  message: 'This visual analysis was saved before observations were tied to single frames. An observation repeated at several frames may describe them together; do not attribute it to any one frame.' };
+
+/**
+ * The packet with a legacy-ownership warning when it needs one. Apply to the whole saved
+ * packet before selecting excerpts from it, since a subset can no longer show the repetition.
+ */
+export function withVisualProvenanceWarning(packet: EvidencePacket): EvidencePacket {
+  if ((packet.kind !== 'youtube_frames' && packet.kind !== 'youtube_storyboard') || !legacyVisualProvenance(packet)
+    || packet.warnings.some(warning => warning.code === LEGACY_VISUAL_PROVENANCE_WARNING.code)) return packet;
+  return { ...packet, warnings: [LEGACY_VISUAL_PROVENANCE_WARNING, ...packet.warnings] };
+}
+
+/** Saved before single-frame ownership, with the same observation text at different frames. */
+function legacyVisualProvenance(packet: EvidencePacket): boolean {
+  if (packet.artifacts.some(artifact => artifact.data.provenanceVersion === 2)) return false;
+  const times = new Map<string, Set<number | undefined>>();
+  for (const excerpt of packet.excerpts) times.set(excerpt.text, (times.get(excerpt.text) ?? new Set()).add(excerpt.startMs));
+  return [...times.values()].some(set => set.size > 1);
+}
+
+/** Coverage statement for a transcript analysis as supplied, never a full-read claim by the answer model. */
+function analysisDelivery(shown: number, saved: number) {
+  return {
+    findingsShown: shown,
+    findingsSaved: saved,
+    captionTextIncluded: false as const,
+    note: `A separate transcript analyst reviewed the caption windows and saved ${saved} focused finding${saved === 1 ? '' : 's'}; ${shown === saved ? 'all are' : `only ${shown} ${shown === 1 ? 'is' : 'are'}`} shown here. Caption text is not included, so do not claim to have read or reread the transcript yourself or that the findings cover everything said.`,
+  };
 }
 
 function distinctVisualFindingsFirst(excerpts: EvidencePacket['excerpts']) {
   const groups = new Map<string, EvidencePacket['excerpts']>();
   for (const excerpt of excerpts) {
-    const key = JSON.stringify([excerpt.sourceId, excerpt.text]);
+    // Frame-specific excerpts name their own frame; group them by the observation itself.
+    const key = JSON.stringify([excerpt.sourceId, excerpt.text.replace(/^Visual observation at (?:requested|sampled) frame [0-9:]+: /, '')]);
     const group = groups.get(key) ?? [];
     group.push(excerpt);
     groups.set(key, group);
@@ -216,20 +278,25 @@ function collectionPacketForModel(
 ): ModelEvidencePacket {
   const retrieval = readCollectionRetrieval(packet);
   const retained = packet.excerpts.length;
-  const shown = Math.max(0, Math.min(retained, options.shown ?? retained));
+  const shown = Math.max(0, Math.min(collectionShownLimit(packet), options.shown ?? retained));
   const textLimit = options.textLimit ?? MODEL_EXCERPT_CHARACTERS;
   // get_playlist never accepted a continuation, including for packets saved before retrieval counts existed.
   const accepted = retrieval?.continuationAccepted ?? packet.kind !== 'youtube_playlist';
   const continuationShown = packet.kind !== 'youtube_search' && (options.continuation ?? true) && accepted && !!packet.continuation;
+  const comments = packet.kind === 'youtube_comments';
   const excerpts = packet.excerpts.slice(0, shown).map(excerpt => ({
     ...excerpt,
-    text: boundedText(excerpt.text, textLimit),
+    text: comments ? boundedCommentText(excerpt.text, textLimit) : boundedText(excerpt.text, textLimit),
   }));
   const sourceIds = new Set(excerpts.map(excerpt => excerpt.sourceId));
   const truncated = shown < retained ? [{
     code: 'COLLECTION_CONTEXT_TRUNCATED',
     message: `Only ${shown} of ${retained} retained list entries fit this context. The rest are saved but not shown.`,
   }] : [];
+  if (comments && excerpts.some((excerpt, index) => excerpt.text !== packet.excerpts[index]!.text.trim())) truncated.push({
+    code: 'COMMENT_TEXT_SHORTENED',
+    message: 'Some comment text was shortened to fit this context; each keeps its author. Do not describe the omitted text.',
+  });
   return modelEvidencePacketSchema.parse({
     packetId: packet.packetId,
     kind: packet.kind,
@@ -243,6 +310,11 @@ function collectionPacketForModel(
   });
 }
 
+/** Comments keep their per-packet limit, which equals one comment read, so paging skips nothing. */
+function collectionShownLimit(packet: EvidencePacket): number {
+  return packet.kind === 'youtube_comments' ? Math.min(packet.excerpts.length, COMMENT_READ_LIMIT) : packet.excerpts.length;
+}
+
 /**
  * Reduced forms of one entry-list packet, most complete first: every entry
  * without the continuation, then shorter entry text, then fewer entries. The
@@ -250,7 +322,7 @@ function collectionPacketForModel(
  * entries can be larger than one), so callers must test each form in order.
  */
 function* collectionReductions(packet: EvidencePacket): Generator<ModelEvidencePacket> {
-  for (let shown = packet.excerpts.length; shown >= 0; shown -= 1) {
+  for (let shown = collectionShownLimit(packet); shown >= 0; shown -= 1) {
     for (const textLimit of COLLECTION_TEXT_LIMITS) {
       yield collectionPacketForModel(packet, { shown, textLimit, continuation: false });
       // Text length is irrelevant once no entries are shown.
@@ -393,21 +465,27 @@ function readTranscriptAnalysis(packet: EvidencePacket) {
 
 function reduceModelEvidencePacket(packet: ModelEvidencePacket): ModelEvidencePacket {
   if (packet.transcriptAnalysis) {
+    const findings = packet.transcriptAnalysis.findings.slice(0, 2);
+    const saved = packet.transcriptAnalysis.delivery?.findingsSaved ?? packet.transcriptAnalysis.findings.length;
     return modelEvidencePacketSchema.parse({
       ...packet,
       transcriptAnalysis: {
         ...packet.transcriptAnalysis,
         summary: boundedText(packet.transcriptAnalysis.summary, 500),
-        findings: packet.transcriptAnalysis.findings.slice(0, 2).map((finding) => ({
+        findings: findings.map((finding) => ({
           ...finding,
           claim: boundedText(finding.claim, 300),
         })),
+        delivery: analysisDelivery(findings.length, saved),
       },
+      warnings: findings.length < saved ? [...packet.warnings, { code: 'TRANSCRIPT_ANALYSIS_TRUNCATED',
+        message: `Only ${findings.length} of ${saved} saved transcript findings fit this context, with shortened claims. Do not claim exhaustive coverage.` }] : packet.warnings,
     });
   }
 
   const completeTranscript = packet.artifacts?.some(artifact => artifact.type === 'youtube_complete_transcript');
-  const excerpts = packet.excerpts?.slice(0, (packet.kind === 'youtube_storyboard' || packet.kind === 'youtube_frames') ? 5 : 1).map((excerpt) => ({
+  const visual = packet.kind === 'youtube_storyboard' || packet.kind === 'youtube_frames';
+  const excerpts = packet.excerpts?.slice(0, visual ? 5 : 1).map((excerpt) => ({
     ...excerpt,
     text: boundedText(excerpt.text, 200),
   }));
@@ -418,9 +496,28 @@ function reduceModelEvidencePacket(packet: ModelEvidencePacket): ModelEvidencePa
     excerpts,
     artifacts: packet.artifacts?.slice(0, 1),
     continuation: undefined,
+    ...(visual && packet.visualDelivery ? { visualDelivery: { ...packet.visualDelivery, observationsShown: excerpts?.length ?? 0 } } : {}),
     warnings: completeTranscript ? [...packet.warnings, { code: 'TRANSCRIPT_CONTEXT_TRUNCATED',
-      message: 'The complete retrieved transcript exceeds the finalization evidence budget. Only a partial excerpt is supplied here; do not claim exhaustive coverage.' }] : packet.warnings,
+      message: 'The complete retrieved transcript exceeds the finalization evidence budget. Only a partial excerpt is supplied here; do not claim exhaustive coverage.' }]
+      : visual && packet.visualDelivery && (excerpts?.length ?? 0) < packet.visualDelivery.observationsSaved
+        ? [visualTruncation(excerpts?.length ?? 0, packet.visualDelivery.observationsSaved), ...packet.warnings.filter(warning => warning.code !== 'VISUAL_CONTEXT_TRUNCATED')].slice(0, MODEL_WARNINGS)
+        : packet.warnings,
   });
+}
+
+/**
+ * A comment excerpt within `maximum` characters that keeps its attribution. The body is
+ * shortened from its end; search passages already begin just before their match.
+ */
+function boundedCommentText(value: string, maximum: number): string {
+  const text = value.trim();
+  if (text.length <= maximum) return text;
+  const at = text.lastIndexOf('\nAuthor: ');
+  if (at < 0) return boundedText(text, maximum);
+  const attribution = text.slice(at + 1).slice(0, Math.max(40, Math.floor(maximum / 2)));
+  const body = text.slice(0, at);
+  const room = Math.max(0, maximum - attribution.length - 2);
+  return `${body.slice(0, room)}…\n${attribution}`;
 }
 
 function boundedText(value: string, maximum: number): string {
@@ -431,9 +528,59 @@ function serializedLength(value: unknown): number {
   return JSON.stringify(value).length;
 }
 
+/** One packet's operations recorded for the current run, including before a resume. */
+export interface EvidenceRunRecord {
+  /** Tool name of the call in this run that produced the packet. */
+  createdByTool?: string;
+  /** Delivery sources recorded for the packet in this run's ledger. */
+  deliveredSources: readonly string[];
+}
+export type EvidenceDeliveryOperation = NonNullable<ModelEvidencePacket['delivery']>['operation'];
+const IMAGE_ANALYSIS_TOOLS = new Set(['analyze_video_frames', 'analyze_video_storyboard']);
+const TRANSCRIPT_ANALYSIS_TOOLS = new Set(['analyze_video_transcript']);
+/** Analysis a retrieval tool can return when asked to analyze content while saving it. */
+const IMAGE_ANALYSIS_ARTIFACTS = new Set(['youtube_frame_analysis', 'youtube_storyboard_analysis']);
+const TRANSCRIPT_ANALYSIS_ARTIFACTS = new Set(['youtube_transcript_analysis']);
+/** Deliveries a model of this run asked for. Other sources load earlier evidence automatically. */
+const EXPLICIT_READ_SOURCES = new Set(['search_context', 'read_prior_evidence', 'read_session_evidence']);
+
+/**
+ * The operation this turn performed for a packet. Anything without a current record is inherited.
+ * A packet this run created is an analysis when its tool analyzes, or when a retrieval tool
+ * returned analyst findings for the content it saved (`artifactTypes` of the packet).
+ */
+export function evidenceDeliveryOperation(record: EvidenceRunRecord | undefined, artifactTypes: readonly string[] = []): EvidenceDeliveryOperation {
+  if (record?.createdByTool) {
+    if (IMAGE_ANALYSIS_TOOLS.has(record.createdByTool) || artifactTypes.some(type => IMAGE_ANALYSIS_ARTIFACTS.has(type))) return 'image_analysis';
+    if (TRANSCRIPT_ANALYSIS_TOOLS.has(record.createdByTool) || artifactTypes.some(type => TRANSCRIPT_ANALYSIS_ARTIFACTS.has(type))) return 'transcript_analysis';
+    return 'retrieval';
+  }
+  return record?.deliveredSources.some(source => EXPLICIT_READ_SOURCES.has(source)) ? 'saved_read' : 'inherited';
+}
+
+function deliveryNote(operation: EvidenceDeliveryOperation, kind: string): string {
+  const visual = kind === 'youtube_frames' || kind === 'youtube_storyboard';
+  switch (operation) {
+    case 'image_analysis': return 'A visual analyst inspected these images during this turn; these are its observations.';
+    case 'transcript_analysis': return 'A transcript analyst reviewed the saved captions during this turn; you receive its findings, not the captions.';
+    case 'retrieval': return visual ? 'Retrieved during this turn. This text is retrieval data, not observations of the images.'
+      : 'Retrieved, or reused from saved storage, by a tool during this turn.';
+    case 'saved_read': return visual ? 'Text of an earlier image analysis, read from saved evidence during this turn. No images were inspected for it in this turn.'
+      : 'Saved text read from session evidence during this turn. It was not fetched again from YouTube.';
+    case 'inherited': return 'Carried from an earlier turn into this context. No retrieval, read or analysis of it is recorded for this turn.';
+  }
+}
+
+/** Upper bound of one serialized delivery label, reserved per packet. */
+const DELIVERY_LABEL_CHARACTERS = Math.max(...(['image_analysis', 'transcript_analysis', 'retrieval', 'saved_read', 'inherited'] as const)
+  .flatMap(operation => ['youtube_frames', 'youtube_transcript'].map(kind =>
+    JSON.stringify({ delivery: { operation, note: deliveryNote(operation, kind) } }).length)));
+
 /** Short references reduce recovery output tokens; full IDs remain persisted. */
 export function finalizationEvidenceForModel(
   packets: readonly EvidencePacket[], maxCharacters: number, comparisonVideoIds: readonly string[] = [],
+  /** This run's recorded operations by packet ID. Omitted for no disclosure. Unrecorded packets are inherited. */
+  runRecords?: ReadonlyMap<string, EvidenceRunRecord>,
 ) {
   // Raw retrieval is not the answer input once a complete analyst result covers
   // that exact saved version. Never substitute an analysis of another version.
@@ -469,13 +616,23 @@ export function finalizationEvidenceForModel(
         })) } } : artifact),
     };
   });
+  // Delivery labels are measured inside the same budget, not added on top of it.
+  const labelled = (budget: number, count: number) => runRecords
+    ? Math.max(0, budget - count * DELIVERY_LABEL_CHARACTERS) : budget;
   const projections = comparisonVideoIds.length
-    ? comparisonVideoIds.map(videoId => projectEvidencePacketsForModel(
-      compact.filter(packet => packet.sources.some(source => source.videoId === videoId)),
-      { maxCharacters: Math.floor(maxCharacters / comparisonVideoIds.length) },
-    ))
-    : [projectEvidencePacketsForModel(compact, { maxCharacters })];
-  const evidence = projections.flatMap(projection => projection.evidence);
+    ? comparisonVideoIds.map(videoId => {
+      const subject = compact.filter(packet => packet.sources.some(source => source.videoId === videoId));
+      return projectEvidencePacketsForModel(subject,
+        { maxCharacters: labelled(Math.floor(maxCharacters / comparisonVideoIds.length), subject.length) });
+    })
+    : [projectEvidencePacketsForModel(compact, { maxCharacters: labelled(maxCharacters, compact.length) })];
+  const projected = projections.flatMap(projection => projection.evidence);
+  const artifactTypes = new Map(compact.map(packet => [packet.packetId, packet.artifacts.map(artifact => artifact.type)]));
+  const evidence = projected.map(packet => {
+    if (!runRecords) return packet;
+    const operation = evidenceDeliveryOperation(runRecords.get(packet.packetId), artifactTypes.get(packet.packetId));
+    return { ...packet, delivery: { operation, note: deliveryNote(operation, packet.kind) } };
+  });
   // A packet shown for one comparison subject is not omitted overall.
   const shownPackets = new Set(evidence.map(packet => packet.packetId));
   const omittedPackets = [...new Map(projections.flatMap(projection => projection.omittedPackets)
@@ -492,7 +649,7 @@ export function finalizationEvidenceForModel(
   // Normal model projection is intentional; additional reduction is a gap.
   for (const packet of compact) {
     const expected = evidencePacketForModel(packet);
-    const actual = evidence.find(item => item.packetId === packet.packetId);
+    const actual = projected.find(item => item.packetId === packet.packetId);
     if (JSON.stringify(expected) !== JSON.stringify(actual)) {
       missingInputs.push({ reason: 'prompt_evidence_cut', packetId: packet.packetId, assetVersions: packet.assetVersions });
     }

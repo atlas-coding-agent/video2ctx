@@ -5,6 +5,7 @@ import { evidencePacketSchema } from '../../../contracts';
 import type { AgentToolContext } from '../tool-context';
 import { readAnalysisAssets, storedVisualInputSchema } from './stored-analysis';
 import { safeIdPart, youtubeVideoUrl } from './provider-evidence';
+import { VISUAL_PROVENANCE_VERSION, visualAnalysisExcerpts } from '../visual-provenance';
 
 export const analyzeVideoFramesInputSchema = storedVisualInputSchema.extend({
   assetVersions: storedVisualInputSchema.shape.assetVersions.max(6),
@@ -81,25 +82,22 @@ export async function analyzeFrameEvidence(frames: z.infer<typeof framesSchema>,
   context.signal.throwIfAborted();
   // Recheck availability after inference so deletion cannot recreate derived evidence.
   const sourceId = `youtube:${videoId}:frames`;
+  const visual = visualAnalysisExcerpts({
+    kind: 'requested', idPrefix: `frames:${videoId}:${safeIdPart(toolCallId)}`, sourceId,
+    findings: analysis.findings.map(finding => ({ observation: finding.observation, frames: finding.timestampsMs })),
+    sharedFindings: (analysis.sharedFindings ?? []).map(finding => ({ observation: finding.observation, frames: finding.timestampsMs })),
+    timeOf: time => time,
+    assertAvailable: time => {
+      if (!frames.frames.some((frame) => frame.timestampMs === time)) throw new Error('Analyst cited an unavailable frame.');
+    },
+  });
   return evidencePacketSchema.parse({
     packetId: `packet:${context.runId}:${safeIdPart(toolCallId)}`,
     kind: 'youtube_frames',
     sources: [
       { id: sourceId, provider: 'youtube', kind: 'frames', videoId, url: youtubeVideoUrl(videoId) },
     ],
-    excerpts: analysis.findings.flatMap((finding, index) =>
-      [...new Set(finding.timestampsMs)].map((time) => {
-        if (!frames.frames.some((frame) => frame.timestampMs === time))
-          throw new Error('Analyst cited an unavailable frame.');
-        return {
-          id: `frames:${videoId}:${safeIdPart(toolCallId)}:${index}:${time}`,
-          sourceId,
-          text: `Visual observation at requested frame: ${finding.observation}`,
-          startMs: time,
-          endMs: time,
-        };
-      }),
-    ),
+    excerpts: visual.excerpts,
     artifacts: [
       {
         type: 'youtube_frame_analysis',
@@ -111,6 +109,8 @@ export async function analyzeFrameEvidence(frames: z.infer<typeof framesSchema>,
           requestedTimestampsMs: [...frames.frames.map(frame => frame.timestampMs), ...frames.failures.map(failure => failure.timestampMs)].sort((a, b) => a - b),
           frames: frames.frames.map(({ imageBase64, ...mapping }) => mapping),
           failures: frames.failures,
+          provenanceVersion: VISUAL_PROVENANCE_VERSION,
+          sharedObservations: visual.sharedObservations,
         },
       },
     ],

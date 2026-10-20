@@ -48,6 +48,7 @@ import {
 } from './research/research-agent';
 import {
   resolveConversationHistory,
+  citedEvidenceForConversation,
   conversationEvidence,
   type LinkedConversationTurn,
   type ConversationTurn,
@@ -71,7 +72,8 @@ import {
   type AgentRequest,
 } from './contracts';
 import { buildAgentTurnResult } from './finalizer';
-import { metadataForConversation, evidenceWithConversationMetadata } from './runtime/conversation-metadata';
+import type { EvidenceRunRecord } from './runtime/model-evidence';
+import { metadataForConversation, unambiguousMetadataRecords, evidenceWithConversationMetadata } from './runtime/conversation-metadata';
 import { AGENT_MODEL_ID, createAgentModel, estimateAgentModelCostMicros } from './model';
 import { normalizeAgentExecutionError } from './runtime/agent-errors';
 import {
@@ -684,6 +686,7 @@ export class AgentRuntimeDO extends Agent<Env, AgentRuntimeState> {
         recoveredToolFailures: this.readEvidenceToolFailures(runId),
         deliverEvidence: (packets, source) => this.deliverEvidence(runId, source, packets),
         deliverSavedAssets: versions => this.deliverSavedAssets(runId, versions),
+        evidenceRunRecords: packetIds => this.evidenceRunRecords(runId, packetIds),
         registerRetrievedAsset: (claim, version) => {
           this.assertRunActive(runId);
           this.evidenceLedger.registerAssetClaim(runId, claim, version);
@@ -1392,7 +1395,7 @@ export class AgentRuntimeDO extends Agent<Env, AgentRuntimeState> {
     await this.sessionStore.delete();
     this.sessionStore.search.clearHistory();
     for (const table of ['agent_trace_payload_chunks', 'agent_call_traces', 'agent_evidence_packets', 'agent_tool_calls', 'agent_routes',
-      'agent_events', 'agent_model_usage', 'agent_memory_jobs', 'agent_evidence_deliveries', 'agent_evidence_delivered_packets', 'agent_evidence_charges', 'agent_evidence_claims', 'agent_evidence_asset_claims', 'agent_memory_cost_reports', 'agent_runs', 'session_run_generations', 'session_memory_writes',
+      'agent_events', 'agent_model_usage', 'agent_memory_jobs', 'agent_evidence_deliveries', 'agent_evidence_delivered_packets', 'agent_evidence_packet_operations', 'agent_evidence_charges', 'agent_evidence_claims', 'agent_evidence_asset_claims', 'agent_memory_cost_reports', 'agent_runs', 'session_run_generations', 'session_memory_writes',
       'agent_trace_run_index', 'agent_trace_publish_order', 'agent_model_attempt_outbox']) {
       this.ctx.storage.sql.exec(`DELETE FROM ${table}`);
     }
@@ -1528,14 +1531,40 @@ export class AgentRuntimeDO extends Agent<Env, AgentRuntimeState> {
       if (!parent || parent.status !== 'completed' || !parent.result_json) return undefined;
       const result = agentTurnResultSchema.parse(JSON.parse(parent.result_json));
       const citedIds = new Set(result.citations.map(citation => citation.id));
-      const evidence = this.readEvidencePackets(parent.id).filter(packet => packet.kind !== 'youtube_video'
-        && !packet.warnings.some(warning=>warning.code==='PARTIAL_TRANSCRIPT' || warning.code==='NO_TRANSCRIPT_EVIDENCE')
-        && packet.excerpts.some(excerpt => citedIds.has(excerpt.id)));
-      const metadata = metadataForConversation(this.sql<{ packet_json: string; created_at: number }>`
-        SELECT packet_json, created_at FROM agent_evidence_packets
-        WHERE run_id = ${parent.id} AND json_extract(packet_json, '$.kind') = 'youtube_video'
-        ORDER BY created_at ASC, packet_id ASC
-      `.map(record => ({ packet: evidencePacketSchema.parse(JSON.parse(record.packet_json)), recordedAt: record.created_at })));
+      // A direct answer can cite saved evidence without creating a new run packet.
+      // Restore only packets admitted to that turn, plus its cited saved assets.
+      // The delivery ledger also covers playlists and legacy packets without assets.
+      const admittedPackets = this.sql<{ packet_json: string }>`
+        SELECT p.packet_json FROM agent_evidence_packets p
+        JOIN agent_runs owner ON owner.id = p.run_id
+        WHERE owner.conversation_id = ${run.conversation_id} AND owner.user_id = ${run.user_id}
+          AND (p.run_id = ${parent.id} OR p.packet_id IN (
+            SELECT packet_id FROM agent_evidence_delivered_packets WHERE run_id = ${parent.id}
+          ))
+        ORDER BY p.created_at ASC
+      `.map(row => evidencePacketSchema.parse(JSON.parse(row.packet_json)));
+      const evidence = citedEvidenceForConversation(
+        result.citations, admittedPackets, this.sessionStore.evidenceForCitations([...citedIds]),
+      );
+      const metadataRecords = this.sql<{ run_id: string; packet_json: string; created_at: number }>`
+        SELECT p.run_id, p.packet_json, p.created_at FROM agent_evidence_packets p
+        JOIN agent_runs owner ON owner.id = p.run_id
+        WHERE owner.conversation_id = ${run.conversation_id} AND owner.user_id = ${run.user_id}
+          AND json_extract(p.packet_json, '$.kind') = 'youtube_video'
+          AND (p.run_id = ${parent.id} OR EXISTS (
+            SELECT 1 FROM agent_evidence_delivered_packets d, json_each(p.packet_json, '$.sources') source
+            WHERE d.run_id = ${parent.id}
+              AND d.packet_id = 'memory:' || json_extract(source.value, '$.videoId') || ':' || p.created_at
+          ))
+        ORDER BY p.created_at ASC, p.packet_id ASC
+      `.map(record => ({ runId: record.run_id, packet: evidencePacketSchema.parse(JSON.parse(record.packet_json)), recordedAt: record.created_at }));
+      const deliveredIds = new Set(this.sql<{ packet_id: string }>`
+        SELECT packet_id FROM agent_evidence_delivered_packets WHERE run_id = ${parent.id}
+      `.map(record => record.packet_id));
+      const metadata = metadataForConversation([
+        ...unambiguousMetadataRecords(metadataRecords.filter(record => record.runId !== parent.id), deliveredIds),
+        ...metadataRecords.filter(record => record.runId === parent.id),
+      ]);
       return {
         userMessageId: parent.user_message_id,
         agentMessageId: parent.agent_message_id,
@@ -1562,6 +1591,25 @@ export class AgentRuntimeDO extends Agent<Env, AgentRuntimeState> {
       );
     }
     return resolution.history;
+  }
+
+  /**
+   * Operations this run recorded for each packet: the tool call that produced it and its
+   * delivery ledger sources. Both are SQLite records, so they survive a resume.
+   */
+  private evidenceRunRecords(runId: string, packetIds: readonly string[]): Map<string, EvidenceRunRecord> {
+    const ids = JSON.stringify([...new Set(packetIds)]);
+    const records = new Map<string, { createdByTool?: string; deliveredSources: string[] }>();
+    const entry = (id: string) => records.get(id) ?? (records.set(id, { deliveredSources: [] }), records.get(id)!);
+    for (const row of this.sql<{ packet_id: string; tool_name: string | null }>`
+      SELECT p.packet_id, c.tool_name FROM agent_evidence_packets p
+      LEFT JOIN agent_tool_calls c ON c.run_id = p.run_id AND c.tool_call_id = p.tool_call_id
+      WHERE p.run_id = ${runId} AND p.packet_id IN (SELECT value FROM json_each(${ids}))
+    `) entry(row.packet_id).createdByTool = row.tool_name ?? 'unknown_tool';
+    // The operations table records every delivery; the billing ledger only the first one.
+    for (const [packetId, sources] of this.evidenceLedger.packetOperations(runId, JSON.parse(ids)))
+      entry(packetId).deliveredSources.push(...sources);
+    return records;
   }
 
   private readRun(runId: string): RunRow | undefined {

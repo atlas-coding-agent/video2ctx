@@ -293,7 +293,7 @@ describe('collection evidence projection (QA 027)', () => {
     }
   });
 
-  it('leaves non-list projections unchanged', () => {
+  it('leaves non-list projections unchanged and reports comment coverage within the same limit', () => {
     const video: EvidencePacket = {
       packetId: 'packet:video', kind: 'youtube_video',
       sources: [{ id: 'source:video', provider: 'youtube', kind: 'video', videoId: 'abcdefghijk' }],
@@ -304,11 +304,14 @@ describe('collection evidence projection (QA 027)', () => {
       sources: [{ id: 'source:comments', provider: 'youtube', kind: 'comments', videoId: 'abcdefghijk' }],
       excerpts: video.excerpts.map(excerpt => ({ ...excerpt, sourceId: 'source:comments' })),
       artifacts: [{ type: 'youtube_comments', data: {} }] };
-    for (const packet of [video, comments]) {
-      const projected = evidencePacketForModel(packet);
-      expect(projected.excerpts).toHaveLength(8);
-      expect(projected).not.toHaveProperty('collection');
-    }
+    const projectedVideo = evidencePacketForModel(video);
+    expect(projectedVideo.excerpts).toHaveLength(8);
+    expect(projectedVideo).not.toHaveProperty('collection');
+    // Comments keep their eight-excerpt limit but no longer drop the rest silently.
+    const projectedComments = evidencePacketForModel(comments);
+    expect(projectedComments.excerpts).toHaveLength(8);
+    expect(projectedComments.collection).toMatchObject({ entriesShown: 8, entriesRetained: 10, retainedEntriesNotShown: 2 });
+    expect(projectedComments.warnings.map(warning => warning.code)).toContain('COLLECTION_CONTEXT_TRUNCATED');
   });
 });
 

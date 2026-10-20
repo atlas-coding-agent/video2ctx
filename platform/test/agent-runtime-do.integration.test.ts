@@ -1961,6 +1961,171 @@ test.each([false, true])('automatic metadata leaves four provider slots for late
   });
 });
 
+type LineageRuntime = { readConversationHistory(row: unknown): ConversationTurn[] };
+const lineageVideo = 'abcdefghijk';
+const lineageSource = { id: `youtube:${lineageVideo}:transcript`, provider: 'youtube', kind: 'transcript',
+  videoId: lineageVideo, url: `https://www.youtube.com/watch?v=${lineageVideo}` } as const;
+const lineageCitation = (excerpt: { id: string; text: string; startMs?: number; endMs?: number }) => ({
+  id: excerpt.id, sourceId: lineageSource.id, provider: 'youtube', videoId: lineageVideo, url: lineageSource.url,
+  excerpt: excerpt.text, startMs: excerpt.startMs, endMs: excerpt.endMs, sourceKind: 'transcript' });
+
+/** Completed follow-up runs, each a child of the previous agent message, citing the given excerpts. */
+function insertFollowUps(instance: { sql: (strings: TemplateStringsArray, ...values: unknown[]) => Array<Record<string, unknown>> },
+  options: { userId: string; conversationId: string; parentRunId: string; count: number;
+    citations: unknown[]; delivered: string[] }) {
+  let parent = instance.sql`SELECT * FROM agent_runs WHERE id = ${options.parentRunId}`[0]!;
+  const runIds: string[] = [];
+  for (let turn = 0; turn < options.count; turn += 1) {
+    const runId = crypto.randomUUID(), userMessageId = crypto.randomUUID(), agentMessageId = crypto.randomUUID();
+    const result = JSON.stringify({ runId, conversationId: options.conversationId, userMessageId, agentMessageId,
+      intent: 'context_answer', answer: `Follow-up ${turn + 1}.`, confidence: 'medium', citations: options.citations,
+      artifacts: [], warnings: [], billing: { creditsCharged: 0, creditsRemaining: 999 } });
+    instance.sql`INSERT INTO agent_runs (id,user_id,conversation_id,parent_message_id,user_message_id,agent_message_id,
+      turn_ordinal,message,status,phase,result_json,credits_remaining_at_admission,created_at,updated_at,research_deadline_at)
+      VALUES (${runId},${options.userId},${options.conversationId},${String(parent.agent_message_id)},${userMessageId},${agentMessageId},
+      ${turn + 2},${`And then ${turn + 1}?`},'completed','completed',${result},1000,${3000 + turn},${3000 + turn},0)`;
+    for (const packetId of options.delivered)
+      instance.sql`INSERT INTO agent_evidence_delivered_packets VALUES (${runId},${packetId},'read_prior_evidence',${3000 + turn})`;
+    runIds.push(runId);
+    parent = instance.sql`SELECT * FROM agent_runs WHERE id = ${runId}`[0]!;
+  }
+  return { runIds, probe: { ...parent, id: crypto.randomUUID(), parent_message_id: parent.agent_message_id } };
+}
+
+test('preserves admitted cited lineage across bounded follow-ups, excludes uncited and foreign packets, and revokes it on deletion', async () => {
+  const { runtime, userId, runId, conversationId } = await seed('lineage-follow-ups', 'completed');
+  await runInDurableObject(runtime, async instance => {
+    const { SessionEvidenceStore } = await import('../src/agents/runtime/session-evidence');
+    const store = (instance as unknown as { sessionStore: InstanceType<typeof SessionEvidenceStore> }).sessionStore;
+    const raw = await store.retrieve(`transcript:${lineageVideo}:default`, 'transcript', lineageVideo, false, async () => ({
+      value: { videoId: lineageVideo, text: 'Cited caption', segments: [{ text: 'Cited caption', startMs: 0, endMs: 1000, durationMs: 1000 }] },
+      cacheStatus: 'miss' }), () => ({ complete: true }));
+    const version = raw.assetVersions![0]!;
+    const cited = { id: 'transcript:cited', sourceId: lineageSource.id, text: 'Cited caption', startMs: 0, endMs: 1000 };
+    const packet = (packetId: string, excerpt: typeof cited) => JSON.stringify({ packetId, kind: 'youtube_transcript', assetVersions: [version],
+      sources: [lineageSource], excerpts: [excerpt], artifacts: [], warnings: [], usage: [] });
+    const parent = instance.sql`SELECT * FROM agent_runs WHERE id = ${runId}`[0]!;
+    instance.sql`UPDATE agent_runs SET result_json = ${JSON.stringify({ runId, conversationId, userMessageId: parent.user_message_id,
+      agentMessageId: parent.agent_message_id, intent: 'inspect_video', answer: 'A caption.', confidence: 'medium',
+      citations: [lineageCitation(cited)], artifacts: [], warnings: [], billing: { creditsCharged: 1, creditsRemaining: 999 } })} WHERE id = ${runId}`;
+    instance.sql`INSERT INTO agent_evidence_packets VALUES (${`packet:${runId}:cited`},${runId},'tool',${packet(`packet:${runId}:cited`, cited)},2000)`;
+    instance.sql`INSERT INTO agent_evidence_packets VALUES (${`packet:${runId}:uncited`},${runId},'tool',
+      ${packet(`packet:${runId}:uncited`, { ...cited, id: 'transcript:uncited', text: 'Uncited caption' })},2001)`;
+    // A packet owned by another conversation never joins this lineage, even with a ledger row.
+    const foreignRun = crypto.randomUUID();
+    instance.sql`INSERT INTO agent_runs (id,user_id,conversation_id,user_message_id,agent_message_id,turn_ordinal,message,status,phase,
+      credits_remaining_at_admission,created_at,updated_at,research_deadline_at)
+      VALUES (${foreignRun},${userId},${crypto.randomUUID()},${crypto.randomUUID()},${crypto.randomUUID()},1,'Other','completed','completed',1000,0,0,0)`;
+    instance.sql`INSERT INTO agent_evidence_packets VALUES ('packet:foreign',${foreignRun},'tool',${packet('packet:foreign', cited)},2002)`;
+    const { probe } = insertFollowUps(instance as never, { userId, conversationId, parentRunId: runId, count: 11,
+      citations: [lineageCitation(cited)], delivered: [`packet:${runId}:cited`, `packet:${runId}:uncited`, 'packet:foreign'] });
+    const methods = instance as unknown as LineageRuntime;
+    const history = methods.readConversationHistory(probe);
+    expect(history).toHaveLength(8);
+    // Delivered, cited scope survives each reuse-only follow-up instead of collapsing after one turn.
+    for (const turn of history) expect(turn.evidence?.map(item => item.packetId)).toEqual([`packet:${runId}:cited`]);
+    expect(() => methods.readConversationHistory({ ...probe, user_id: 'another-user' })).toThrow(/parent/);
+    await instance.deleteSessionAssets(conversationId, userId, version);
+    for (const turn of methods.readConversationHistory(probe)) expect(turn.evidence).toBeUndefined();
+  });
+});
+
+test('restores exactly delivered metadata snapshots and cited saved-session evidence without delivery packets', async () => {
+  const { runtime, userId, runId, conversationId } = await seed('lineage-saved-evidence', 'completed');
+  await runInDurableObject(runtime, async instance => {
+    const { SessionEvidenceStore } = await import('../src/agents/runtime/session-evidence');
+    const store = (instance as unknown as { sessionStore: InstanceType<typeof SessionEvidenceStore> }).sessionStore;
+    const raw = await store.retrieve(`transcript:${lineageVideo}:default`, 'transcript', lineageVideo, false, async () => ({
+      value: { videoId: lineageVideo, text: 'Saved caption', segments: [{ text: 'Saved caption', startMs: 0, endMs: 1000, durationMs: 1000 }] },
+      cacheStatus: 'miss' }), () => ({ complete: true }));
+    const version = raw.assetVersions![0]!;
+    const hit = { id: `evidence:${version}:0`, sourceId: lineageSource.id, text: 'Saved caption', startMs: 0, endMs: 1000 };
+    store.savePacket({ packetId: `session:${version}:0:30:hash`, kind: 'youtube_transcript', assetVersions: [version],
+      sources: [lineageSource], excerpts: [hit, { ...hit, id: `evidence:${version}:1`, text: 'Neighbouring caption' }],
+      artifacts: [], warnings: [], usage: [] });
+    const parent = instance.sql`SELECT * FROM agent_runs WHERE id = ${runId}`[0]!;
+    instance.sql`UPDATE agent_runs SET result_json = ${JSON.stringify({ runId, conversationId, userMessageId: parent.user_message_id,
+      agentMessageId: parent.agent_message_id, intent: 'inspect_video', answer: 'A video.', confidence: 'medium', citations: [],
+      artifacts: [], warnings: [], billing: { creditsCharged: 1, creditsRemaining: 999 } })} WHERE id = ${runId}`;
+    instance.sql`INSERT INTO agent_evidence_packets VALUES (${`packet:${runId}:video`},${runId},'tool',${JSON.stringify({
+      packetId: `packet:${runId}:video`, kind: 'youtube_video', sources: [{ id: 'video', provider: 'youtube', kind: 'video', videoId: lineageVideo, title: 'A video' }],
+      excerpts: [], artifacts: [{ type: 'youtube_video_metadata', title: 'A video', data: { id: lineageVideo, viewCount: 404433 } }],
+      warnings: [], usage: [] })},2000)`;
+    // The follow-ups found the caption through search and reused the metadata snapshot without new packets.
+    const { probe } = insertFollowUps(instance as never, { userId, conversationId, parentRunId: runId, count: 3,
+      citations: [lineageCitation(hit)], delivered: [`search:${hit.id}`, `memory:${lineageVideo}:2000`] });
+    const history = (instance as unknown as LineageRuntime).readConversationHistory(probe);
+    for (const turn of history.slice(1)) {
+      expect(turn.evidence).toMatchObject([{ packetId: `session:${version}:0:30:hash`, excerpts: [{ id: hit.id }], artifacts: [] }]);
+      expect(turn.evidence![0]!.excerpts).toHaveLength(1);
+      expect(turn.metadata?.map(item => item.packetId)).toEqual([`memory:${lineageVideo}:2000`]);
+    }
+    await instance.deleteSessionAssets(conversationId, userId, version);
+    for (const turn of (instance as unknown as LineageRuntime).readConversationHistory(probe).slice(1)) expect(turn.evidence).toBeUndefined();
+  });
+});
+
+test('reports current-run evidence operations from durable tool and delivery records across a resume', async () => {
+  const { runtime, runId } = await seed('evidence-run-records', 'running');
+  const packet = (packetId: string) => JSON.stringify({ packetId, kind: 'youtube_frames',
+    sources: [{ id: 'f', provider: 'youtube', kind: 'frames', videoId: lineageVideo }],
+    excerpts: [{ id: `${packetId}:0`, sourceId: 'f', text: 'A chart.', startMs: 1000, endMs: 1000 }], artifacts: [], warnings: [], usage: [] });
+  await runInDurableObject(runtime, async instance => {
+    instance.sql`INSERT INTO agent_tool_calls (run_id,tool_call_id,semantic_key,tool_name,operation,status,credits,created_at,updated_at)
+      VALUES (${runId},'analyze','frames-analysis','analyze_video_frames','frames','completed',1,0,0)`;
+    instance.sql`INSERT INTO agent_evidence_packets VALUES (${`packet:${runId}:analyze`},${runId},'analyze',${packet(`packet:${runId}:analyze`)},1000)`;
+    // A stable saved-read ID that history also holds, read again by this run's search.
+    instance.sql`INSERT INTO agent_evidence_delivered_packets VALUES (${runId},'session:v1:0:30:hash','search_context',1001)`;
+    instance.sql`INSERT INTO agent_evidence_delivered_packets VALUES (${runId},'packet:earlier:tool','read_prior_evidence',1002)`;
+    // Another run's search hit with a search: ID is not a read by this run.
+    instance.sql`INSERT INTO agent_evidence_delivered_packets VALUES ('another-run','search:old','search_context',1003)`;
+  });
+  await runInDurableObject(runtime, async instance => {
+    const { evidenceDeliveryOperation } = await import('../src/agents/runtime/model-evidence');
+    const records = (instance as unknown as { evidenceRunRecords(runId: string, ids: readonly string[]): Map<string, import('../src/agents/runtime/model-evidence').EvidenceRunRecord> })
+      .evidenceRunRecords(runId, [`packet:${runId}:analyze`, 'session:v1:0:30:hash', 'packet:earlier:tool', 'search:old']);
+    expect(Object.fromEntries([`packet:${runId}:analyze`, 'session:v1:0:30:hash', 'packet:earlier:tool', 'search:old']
+      .map(id => [id, evidenceDeliveryOperation(records.get(id))]))).toEqual({
+      [`packet:${runId}:analyze`]: 'image_analysis', 'session:v1:0:30:hash': 'saved_read',
+      'packet:earlier:tool': 'saved_read', 'search:old': 'inherited' });
+  });
+});
+
+test('an inherited packet read explicitly later is reported as read after a resume, without a second charge', async () => {
+  const { runtime, runId } = await seed('inherited-then-read', 'running');
+  let packetId = '';
+  await runInDurableObject(runtime, async instance => {
+    const { SessionEvidenceStore } = await import('../src/agents/runtime/session-evidence');
+    const store = (instance as unknown as { sessionStore: InstanceType<typeof SessionEvidenceStore> }).sessionStore;
+    const raw = await store.retrieve(`transcript:${lineageVideo}:default`, 'transcript', lineageVideo, false, async () => ({
+      value: { videoId: lineageVideo, text: 'Saved caption', segments: [{ text: 'Saved caption', startMs: 0, endMs: 1000, durationMs: 1000 }] },
+      cacheStatus: 'miss' }), () => ({ complete: true }));
+    packetId = 'packet:earlier-run:transcript';
+    const packet: EvidencePacket = { packetId, kind: 'youtube_transcript', assetVersions: raw.assetVersions,
+      sources: [lineageSource], excerpts: [{ id: 'saved', sourceId: lineageSource.id, text: 'Saved caption', startMs: 0, endMs: 1000 }],
+      artifacts: [], warnings: [], usage: [] };
+    const runtimeMethods = instance as unknown as {
+      deliverEvidence(runId: string, source: string, packets: EvidencePacket[]): { admitted: EvidencePacket[] };
+      evidenceLedger: { committed(runId: string): number };
+    };
+    expect(runtimeMethods.deliverEvidence(runId, 'inherited_subject', [packet]).admitted).toHaveLength(1);
+    const charged = runtimeMethods.evidenceLedger.committed(runId);
+    expect(runtimeMethods.deliverEvidence(runId, 'read_prior_evidence', [packet]).admitted).toHaveLength(1);
+    // Billing keeps its first-delivery row and charges once; disclosure records both deliveries.
+    expect(runtimeMethods.evidenceLedger.committed(runId)).toBe(charged);
+    expect(instance.sql`SELECT source FROM agent_evidence_delivered_packets WHERE run_id = ${runId} AND packet_id = ${packetId}`)
+      .toEqual([{ source: 'inherited_subject' }]);
+    expect(instance.sql`SELECT source FROM agent_evidence_packet_operations WHERE run_id = ${runId} AND packet_id = ${packetId} ORDER BY source`)
+      .toEqual([{ source: 'inherited_subject' }, { source: 'read_prior_evidence' }]);
+  });
+  // A fresh object access stands in for the resumed run reading only persisted state.
+  await runInDurableObject(runtime, async instance => {
+    const { evidenceDeliveryOperation } = await import('../src/agents/runtime/model-evidence');
+    const records = (instance as unknown as { evidenceRunRecords(runId: string, ids: readonly string[]): Map<string, import('../src/agents/runtime/model-evidence').EvidenceRunRecord> })
+      .evidenceRunRecords(runId, [packetId]);
+    expect(evidenceDeliveryOperation(records.get(packetId))).toBe('saved_read');
+  });
+});
 
 test.each(['recover', 'fail-again', 'deleted', 'cancelled'] as const)(
   'combined transcript retry %s uses saved inputs and preserves billing', async scenario => {

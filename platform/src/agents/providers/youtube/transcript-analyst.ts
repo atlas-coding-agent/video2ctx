@@ -7,7 +7,8 @@ import { transcriptDiagnosticSchema, type TranscriptDiagnostic, type TranscriptD
 import { z } from 'zod';
 import { assertModelCostAvailable, type AgentModelCostBudget } from '../../runtime/model-budget';
 
-import { assertTranscriptFacts, transcriptFactsSchema, TranscriptGroundingError, TRANSCRIPT_GROUNDING_GUIDANCE, type TranscriptFacts, type TranscriptSourceContext } from '../../runtime/transcript-grounding';
+import { assertTranscriptFacts, normalizedTranscriptText, transcriptFactsSchema, TranscriptGroundingError, TRANSCRIPT_GROUNDING_GUIDANCE, type TranscriptFacts, type TranscriptSourceContext } from '../../runtime/transcript-grounding';
+import { transcriptCueExcerpts } from './tools/get-video-transcript';
 import { fireworksModelPricing } from '../../fireworks-finalizer';
 
 const MAX_FINDINGS = 5;
@@ -16,6 +17,10 @@ const MAX_ANALYST_OUTPUT_TOKENS = 2_400;
 const ANALYSIS_WINDOW_DURATION_MS = 60_000;
 const ANALYSIS_WINDOW_TEXT_LIMIT = 2_000;
 const ANALYST_WAIT_MS = 90_000;
+/** Shorter normalized quotes are too likely to recur by chance to locate one caption. */
+const MIN_ANCHOR_QUOTE_CHARACTERS = 8;
+const MAX_SUPPORT_PASSAGES = 2;
+const MAX_SUPPORT_CHARACTERS = 300;
 
 const transcriptAnalystOutputSchema = (maximum: number, repair = false) => z.object({
   findings: z.array(transcriptFactsSchema.extend({
@@ -23,6 +28,8 @@ const transcriptAnalystOutputSchema = (maximum: number, repair = false) => z.obj
     quantities: transcriptFactsSchema.shape.quantities.unwrap().max(repair ? 3 : 10).default([]),
     claim: z.string().trim().min(1).max(280),
     windowIndexes: z.array(z.number().int().nonnegative()).min(1).max(MAX_WINDOWS_PER_FINDING),
+    support: z.array(z.string().trim().min(1).max(MAX_SUPPORT_CHARACTERS)).max(repair ? 1 : MAX_SUPPORT_PASSAGES).default([])
+      .describe('Exact contiguous caption text from the cited windows that states this claim itself, not only a name or a number. Shortest passage that supports the claim. Empty when no exact passage does.'),
   })).max(maximum),
   warnings: z.array(z.string().trim().min(1).max(240)).max(3).default([]).describe('Only limitations this transcript\'s content demonstrates, such as unintelligible or music-only captions. Otherwise empty. Never about other videos, duration or window count.'),
 });
@@ -65,10 +72,12 @@ export interface TranscriptAnalystResult {
   excerpts: TranscriptAnalystExcerpt[];
   warnings: string[];
   coverage: {
+    /** The analyst received every caption window. Its answer input is the findings below, not the captions. */
     completeTranscriptRead: true;
     segmentCount: number;
     startMs: number | null;
     endMs: number | null;
+    windowCount?: number;
   };
 }
 
@@ -109,7 +118,7 @@ export async function analyzeTranscriptWithModel(
       findings: [],
       excerpts: [],
       warnings: ['The selected video has no usable transcript segments.'],
-      coverage: completeCoverage(input.segments),
+      coverage: completeCoverage(input.segments, 0),
     };
   }
 
@@ -152,6 +161,7 @@ export async function analyzeTranscriptWithModel(
           'Attribute demonstrations and reported performance to the speaker or cited source. A video reporting a result is not independent verification of that result. Preserve material caveats from the transcript.',
           'Return at most three warnings, only for limitations this transcript\'s content demonstrates, such as unintelligible or music-only captions. The catalog holds every caption supplied. Brevity, duration or a single window is never a limitation by itself; a clear 30-second lesson gets no warning. Do not warn about finding counts, instructions, or unreviewed results, and do not repeat findings or claim caveats in warnings. Put claim-specific caveats in the claim.',
           'Reference only numeric window indexes that appear in the transcript catalog.',
+          `For each finding, copy into support up to ${attempt > 0 ? 1 : MAX_SUPPORT_PASSAGES} short exact caption passage${attempt > 0 ? '' : 's'} from its windows that state the claim itself. The application uses them to cite the exact caption moment. A name or a number alone is not support. Leave support empty rather than paraphrasing or translating.`,
           'Do not invent identifiers, timestamps, or quotations. The application resolves window indexes back to the original text.',
           `Return at most ${attemptMaximum} distinct findings and at most ${MAX_WINDOWS_PER_FINDING} supporting window indexes per finding.`,
           'Return an empty findings array when the transcript does not contain relevant evidence.',
@@ -169,7 +179,7 @@ export async function analyzeTranscriptWithModel(
         }),
         output: Output.object({
           name: 'TranscriptAnalysis',
-          description: 'A complete-video analysis that references application-owned transcript window indexes.',
+          description: 'Focused findings from every supplied caption window, referencing application-owned transcript window indexes.',
           schema: transcriptAnalystOutputSchema(attemptMaximum, attempt > 0),
         }),
         temperature: 0.1,
@@ -251,9 +261,10 @@ export async function analyzeTranscriptWithModel(
   throw new Error('Transcript analysis did not produce a result.');
 }
 
-function transcriptCatalog(segments: TranscriptSegment[]): TranscriptCatalogEntry[] {
+/** `membership`, when supplied, receives the segment indexes merged into each window. */
+function transcriptCatalog(segments: TranscriptSegment[], membership?: Set<number>[]): TranscriptCatalogEntry[] {
   const windows: TranscriptCatalogEntry[] = [];
-  for (const segment of segments) {
+  for (const [segmentIndex, segment] of segments.entries()) {
     for (const text of transcriptTextChunks(segment.text)) {
       const current = windows.at(-1);
       const joinedText = current ? `${current.text}\n${text}` : text;
@@ -268,13 +279,21 @@ function transcriptCatalog(segments: TranscriptSegment[]): TranscriptCatalogEntr
           endMs: segment.endMs,
           text,
         });
+        membership?.push(new Set([segmentIndex]));
         continue;
       }
       current.endMs = Math.max(current.endMs, segment.endMs);
       current.text = joinedText;
+      membership?.at(-1)?.add(segmentIndex);
     }
   }
   return windows;
+}
+
+/** Resolve one analyst output against its transcript, as an accepted model response would be. */
+export function resolveTranscriptAnalystOutput(videoId: string, segments: TranscriptSegment[], output: unknown): TranscriptAnalystResult {
+  const parsed = transcriptAnalystOutputSchema(20).parse(output);
+  return resolveAnalysis(videoId, segments, transcriptCatalog(segments), parsed);
 }
 
 function transcriptTextChunks(value: string): string[] {
@@ -296,10 +315,28 @@ function resolveAnalysis(
 ): TranscriptAnalystResult {
   const windowByIndex = new Map(catalog.map((window) => [window.index, window]));
   const selected = new Map<number, TranscriptCatalogEntry>();
+  const cuesByWindow = windowCues(videoId, segments);
+  const anchoredCues = new Map<string, CaptionCue>();
+  /** Excerpt IDs for one finding: claim-support cues where exact and unambiguous, windows otherwise, at most three. */
+  const citationIds = (finding: { support: readonly string[]; quantities: ReadonlyArray<{ quote: string }> }, windowIndexes: number[]) => {
+    const anchors = captionAnchors({ ...finding, windowIndexes }, cuesByWindow);
+    const count = () => windowIndexes.reduce((total, index) => total + (anchors.get(index)?.length ?? 1), 0);
+    // Fall back to the coarse window where its cues would exceed the citation limit.
+    while (count() > MAX_WINDOWS_PER_FINDING) {
+      const widest = [...anchors.entries()].sort((a, b) => b[1].length - a[1].length)[0]!;
+      anchors.delete(widest[0]);
+    }
+    return windowIndexes.flatMap(index => {
+      const cues = anchors.get(index);
+      if (!cues) return [transcriptWindowId(videoId, windowByIndex.get(index)!)];
+      for (const cue of cues) anchoredCues.set(cue.id, cue);
+      return cues.map(cue => cue.id);
+    });
+  };
   let unverifiedFindings = 0;
   const findings = output.findings.flatMap((finding, findingIndex) => {
     const windowIndexes = [...new Set(finding.windowIndexes)];
-    const excerptIds = windowIndexes.map((windowIndex) => {
+    let excerptIds = windowIndexes.map((windowIndex) => {
       const window = windowByIndex.get(windowIndex);
       if (!window) {
         onIssue?.({ code: 'UNKNOWN_WINDOW', findingIndex, windowIndex, message: `Unknown window ${windowIndex}; available indexes are 0 through ${Math.max(0, catalog.length - 1)}.` });
@@ -313,6 +350,7 @@ function resolveAnalysis(
     const windows = windowIndexes.map(index => windowByIndex.get(index)!.text);
     try {
       assertTranscriptFacts(finding, windows);
+      excerptIds = citationIds({ support: finding.support, quantities: finding.quantities }, windowIndexes);
     } catch (error) {
       if (!(error instanceof TranscriptGroundingError)) throw error;
       for (const issue of error.issues) onIssue?.({ ...issue, findingIndex });
@@ -328,6 +366,8 @@ function resolveAnalysis(
           return false;
         }
       });
+      // The replacement claim is stated by its checked quotes alone, so they are its support.
+      if (quantities.length) excerptIds = citationIds({ support: quantities.map(quantity => quantity.quote), quantities }, windowIndexes);
       if (quantities.length) return [{
         claim: quantities.map(quantity => `${quantity.kind} ${quantity.metric}: ${quantity.value}${quantity.unit ?? ' (unit unclear)'}`).join('; ') + '.',
         excerptIds, entities: finding.entities, quantities,
@@ -344,14 +384,12 @@ function resolveAnalysis(
   });
 
   const acceptedIds = new Set(findings.flatMap(finding => finding.excerptIds));
-  const excerpts = [...selected.values()].filter(window => acceptedIds.has(transcriptWindowId(videoId, window)))
-    .sort((a, b) => a.startMs - b.startMs)
-    .map((window) => ({
-      id: transcriptWindowId(videoId, window),
-      text: window.text,
-      startMs: window.startMs,
-      endMs: window.endMs,
-    }));
+  const excerpts = [
+    ...[...selected.values()].filter(window => acceptedIds.has(transcriptWindowId(videoId, window)))
+      .map((window) => ({ id: transcriptWindowId(videoId, window), text: window.text, startMs: window.startMs, endMs: window.endMs })),
+    ...[...anchoredCues.values()].filter(cue => acceptedIds.has(cue.id))
+      .map(({ id, text, startMs, endMs }) => ({ id, text, startMs, endMs })),
+  ].sort((a, b) => a.startMs - b.startMs || a.endMs - b.endMs || a.id.localeCompare(b.id));
 
   return {
     // Retain the existing artifact shape without generating a redundant summary.
@@ -362,17 +400,104 @@ function resolveAnalysis(
     findings,
     excerpts,
     warnings: [...output.warnings, ...(unverifiedFindings ? [`Some figures in ${unverifiedFindings} transcript finding${unverifiedFindings === 1 ? '' : 's'} could not be matched to the transcript and are marked unverified.`] : [])],
-    coverage: completeCoverage(segments),
+    coverage: completeCoverage(segments, catalog.length),
   };
 }
 
-function completeCoverage(segments: TranscriptSegment[]): TranscriptAnalystResult['coverage'] {
+function completeCoverage(segments: TranscriptSegment[], windowCount: number): TranscriptAnalystResult['coverage'] {
   return {
     completeTranscriptRead: true,
     segmentCount: segments.length,
     startMs: segments[0]?.startMs ?? null,
     endMs: segments.length ? Math.max(...segments.map((segment) => segment.endMs)) : null,
+    windowCount,
   };
+}
+
+interface CaptionCue extends TranscriptAnalystExcerpt {
+  /** Offsets of this cue in the window's normalized cue text. */
+  from: number;
+  to: number;
+}
+
+/** Original caption cues per window, in the same IDs and text as raw transcript evidence. */
+function windowCues(videoId: string, segments: TranscriptSegment[]): Map<number, { text: string; cues: CaptionCue[] }> {
+  const membership: Set<number>[] = [];
+  transcriptCatalog(segments, membership);
+  const result = new Map<number, { text: string; cues: CaptionCue[] }>();
+  // A caption longer than one window is split across windows; each of them lists all of
+  // its chunks, so a quote found in two windows counts as ambiguous rather than misplaced.
+  for (const [window, members] of membership.entries()) {
+    const entry = { text: '', cues: [] as CaptionCue[] };
+    for (const segmentIndex of [...members].sort((a, b) => a - b)) {
+      for (const cue of transcriptCueExcerpts(videoId, segments[segmentIndex]!, segmentIndex, '')) {
+        const normalized = normalizedTranscriptText(cue.text);
+        if (!normalized) continue;
+        const from = entry.text ? entry.text.length + 1 : 0;
+        entry.text = entry.text ? `${entry.text} ${normalized}` : normalized;
+        entry.cues.push({ id: cue.id, text: cue.text, startMs: cue.startMs, endMs: cue.endMs, from, to: from + normalized.length });
+      }
+    }
+    result.set(window, entry);
+  }
+  return result;
+}
+
+/** Offsets of `quote` in `text`. `whole` rejects matches inside a longer word or number, such as 15 g in 115 g. */
+function occurrences(text: string, quote: string, whole: boolean): number[] {
+  const found: number[] = [];
+  const edge = (character: string | undefined) => !character || !/[\p{L}\p{M}\p{N}]/u.test(character);
+  for (let offset = text.indexOf(quote); offset >= 0; offset = text.indexOf(quote, offset + 1)) {
+    if (!whole || ((!/[\p{L}\p{M}\p{N}]/u.test(quote[0]!) || edge(text[offset - 1]))
+      && (!/[\p{L}\p{M}\p{N}]/u.test(quote.at(-1)!) || edge(text[offset + quote.length])))) found.push(offset);
+  }
+  return found;
+}
+
+/** The single whole-word occurrence of a quote across the cited windows, or undefined if absent, short or repeated. */
+function uniqueOccurrence(quote: string, windows: readonly number[], cuesByWindow: Map<number, { text: string; cues: CaptionCue[] }>) {
+  if (quote.length < MIN_ANCHOR_QUOTE_CHARACTERS) return undefined;
+  const find = (whole: boolean) => windows.flatMap(window =>
+    occurrences(cuesByWindow.get(window)?.text ?? '', quote, whole).map(offset => ({ window, offset })));
+  const whole = find(true);
+  // Any further occurrence, even inside a longer word, makes the location ambiguous.
+  return whole.length === 1 && find(false).length === 1 ? whole[0]! : undefined;
+}
+
+function cuesAt(cuesByWindow: Map<number, { text: string; cues: CaptionCue[] }>, hit: { window: number; offset: number }, length: number) {
+  return cuesByWindow.get(hit.window)!.cues.filter(cue => cue.from < hit.offset + length && cue.to > hit.offset);
+}
+
+/**
+ * Exact caption cues for a finding's explicit claim support. Narrowing happens only when
+ * every support passage occurs exactly once across the cited windows; otherwise every
+ * window stays the citation. Names and other advisory quotes never narrow a finding.
+ * A narrowed window also keeps the cue of each checked quantity quote inside it, or
+ * stays whole when that quote cannot be located, so numeric support is never dropped.
+ */
+function captionAnchors(
+  finding: { windowIndexes: number[]; support: readonly string[]; quantities: ReadonlyArray<{ quote: string }> },
+  cuesByWindow: Map<number, { text: string; cues: CaptionCue[] }>,
+): Map<number, CaptionCue[]> {
+  const anchored = new Map<number, CaptionCue[]>();
+  const support = [...new Set(finding.support.map(normalizedTranscriptText).filter(Boolean))];
+  if (!support.length) return anchored;
+  for (const quote of support) {
+    const hit = uniqueOccurrence(quote, finding.windowIndexes, cuesByWindow);
+    if (!hit) return new Map();
+    anchored.set(hit.window, [...(anchored.get(hit.window) ?? []), ...cuesAt(cuesByWindow, hit, quote.length)]);
+  }
+  for (const quote of [...new Set(finding.quantities.map(item => normalizedTranscriptText(item.quote)).filter(Boolean))]) {
+    for (const window of [...anchored.keys()]) {
+      if (!occurrences(cuesByWindow.get(window)?.text ?? '', quote, false).length) continue;
+      const hit = uniqueOccurrence(quote, [window], cuesByWindow);
+      if (hit) anchored.set(window, [...anchored.get(window)!, ...cuesAt(cuesByWindow, hit, quote.length)]);
+      else anchored.delete(window);
+    }
+  }
+  for (const [window, cues] of anchored)
+    anchored.set(window, [...new Map(cues.map(cue => [cue.id, cue])).values()].sort((a, b) => a.from - b.from));
+  return anchored;
 }
 
 function transcriptWindowId(videoId: string, window: TranscriptCatalogEntry): string {

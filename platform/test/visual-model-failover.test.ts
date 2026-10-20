@@ -20,8 +20,12 @@ it.each([['frames', false], ['frames', true], ['storyboard', false], ['storyboar
   vi.useFakeTimers();
   vi.spyOn(console, 'log').mockImplementation(() => {});
   const requests: Array<{ model: string; messages: unknown; service_tier: string; reasoning_effort: string; response_format: unknown; stream: boolean }> = [];
-  const output = { findings: [{ observation: 'Two colored boxes are visible.',
-    ...(kind === 'frames' ? { timestampsMs: [1000, 5000] } : { frameIndexes: [0, 10] }) }], warnings: [] };
+  // One frame-specific finding and one finding shared by both images, in the analyst's current contract.
+  const output = kind === 'frames'
+    ? { findings: [{ observation: 'Two colored boxes are visible.', timestampsMs: [1000] }],
+      sharedFindings: [{ observation: 'A white background is visible.', timestampsMs: [1000, 5000] }], warnings: [] }
+    : { findings: [{ observation: 'Two colored boxes are visible.', frameIndexes: [0] }],
+      sharedFindings: [{ observation: 'A white background is visible.', frameIndexes: [0, 10] }], warnings: [] };
   vi.spyOn(globalThis, 'fetch').mockImplementation(async (_url, init) => {
     const body = JSON.parse(String(init?.body)); requests.push(body);
     if (body.model === FIREWORKS_GLM_MODEL_ID) return new Promise(() => {});
@@ -66,7 +70,7 @@ it.each([['frames', false], ['frames', true], ['storyboard', false], ['storyboar
 it.each(['frames', 'storyboard'] as const)('%s allows active output, fallback and research cancellation', async kind => {
   vi.useFakeTimers();
   vi.spyOn(console, 'log').mockImplementation(() => {});
-  const output = { findings: [], warnings: [] };
+  const output = { findings: [], sharedFindings: [], warnings: [] };
   const completed = () => streamOf({ content: [{ type: 'text', text: JSON.stringify(output) }],
     finishReason: { unified: 'stop', raw: 'stop' }, warnings: [],
     usage: { inputTokens: { total: 1, noCache: 1, cacheRead: 0, cacheWrite: 0 },

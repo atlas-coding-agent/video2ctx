@@ -3,6 +3,8 @@ import { tool, type ToolSet } from 'ai';
 import { z } from 'zod';
 import type { EvidencePacket } from '../contracts';
 import type { SessionEvidenceStore } from './session-evidence';
+import { firstMatchSpan, matchMarkers, type MatchMarkers } from './search-highlight';
+import { withVisualProvenanceWarning } from './model-evidence';
 
 export interface HistoryEntry {
   id: string;
@@ -13,7 +15,10 @@ export interface HistoryEntry {
   createdAt: number;
 }
 
-type SearchRow = { id: string; owner: string; content: string; metadata: string };
+type SearchRow = { id: string; owner: string; content: string; metadata: string; marked?: string };
+/** A matched row with the markers its highlight() used. */
+type MatchedRow = SearchRow & { markers?: MatchMarkers };
+
 
 /** The only dependency on the experimental SDK. agents is pinned in package.json. */
 export class SessionSearch {
@@ -133,10 +138,14 @@ export class SessionSearch {
     for (const excerpt of packet.excerpts) this.insert(excerpt.id, owner, 'evidence', excerpt.text, { packetId: id });
   }
   indexTranscript(version: string, excerpts: EvidencePacket['excerpts']) {
+    this.indexAsset(version, excerpts.map(excerpt => excerpt.text));
+  }
+  /** Index one saved asset by entry position. Row IDs equal the saved-read citation IDs. */
+  indexAsset(version: string, texts: readonly string[], extra: { kind?: 'comments' } = {}) {
     const owner = `asset:${version}`;
     this.sql.exec('DELETE FROM session_context_fts WHERE owner=?', owner);
-    excerpts.forEach((excerpt, index) =>
-      this.insert(`evidence:${version}:${index}`, owner, 'evidence', excerpt.text, { version, offset: index }),
+    texts.forEach((text, index) =>
+      this.insert(`evidence:${version}:${index}`, owner, 'evidence', text, { version, offset: index, ...extra }),
     );
     this.sql.exec('INSERT OR IGNORE INTO session_search_assets VALUES (?)', version);
   }
@@ -150,24 +159,33 @@ export class SessionSearch {
       JSON.stringify(metadata),
     );
   }
-  private matches(scope: 'memory' | 'evidence', query: string, excludedOwners: readonly string[] = []): SearchRow[] {
+  private matches(scope: 'memory' | 'evidence', query: string, excludedOwners: readonly string[] = []): MatchedRow[] {
     // Literal tokens joined with AND support nonadjacent terms without exposing FTS operators.
-    const tokens = query
-      .slice(0, 200)
-      .match(/[\p{L}\p{N}_]+/gu)
-      ?.slice(0, 20);
-    if (!tokens?.length) return [];
+    const tokens = queryTokens(query);
+    if (!tokens.length) return [];
     // Exclusions apply before the limit, so excluded rows can never fill the top 20.
     const excluded = excludedOwners.length ? ` AND owner NOT IN (${excludedOwners.map(() => '?').join(',')})` : '';
+    // A comment packet repeats entries of its saved page. Once that page is indexed, its rows
+    // represent every comment, so the packet copies must not take result slots before the limit.
+    // Packets whose page is not indexed, such as unreadable legacy pages, stay searchable.
+    // The bare packet_id comparison uses its primary key rather than scanning every packet per row.
+    const duplicates = scope === 'evidence' ? ` AND NOT EXISTS (SELECT 1 FROM session_packets p
+      WHERE owner LIKE 'packet:%' AND p.packet_id = substr(owner, 8) AND json_extract(p.packet_json,'$.kind')='youtube_comments'
+      AND EXISTS (SELECT 1 FROM json_each(p.versions_json) v WHERE v.value IN (SELECT version FROM session_search_assets)))` : '';
+    const markers = matchMarkers();
     return this.sql
       .exec<SearchRow>(
-        `SELECT id,owner,content,metadata FROM session_context_fts
-      WHERE session_context_fts MATCH ? AND scope=?${excluded} ORDER BY rank LIMIT 20`,
+        // highlight() reports where the tokenizer itself matched, so passages never re-derive matching.
+        `SELECT id,owner,content,metadata,highlight(session_context_fts, 3, ?, ?) AS marked FROM session_context_fts
+      WHERE session_context_fts MATCH ? AND scope=?${excluded}${duplicates} ORDER BY rank LIMIT 20`,
+        markers.start,
+        markers.end,
         tokens.map((t) => `"${t}"`).join(' AND '),
         scope,
         ...excludedOwners,
       )
-      .toArray();
+      .toArray()
+      .map((row) => ({ ...row, markers }));
   }
   searchMemory(query: string) {
     return this.matches('memory', query).flatMap((row) => {
@@ -184,9 +202,21 @@ export class SessionSearch {
     // Long transcripts indexed before the length limit existed are left out of the query itself.
     // Their index rows stay, so raising the limit makes them searchable again without reindexing.
     const excluded = store.overLimitTranscriptVersions().map((version) => `asset:${version}`);
+    // One parsed page and asset record per version for this search; availability is rechecked per hit.
+    const pages = store.commentPageCache();
     for (const row of this.matches('evidence', query, excluded)) {
       if (seen.has(row.id)) continue;
-      const metadata = JSON.parse(row.metadata) as { version?: string; offset?: number; packetId?: string };
+      const metadata = JSON.parse(row.metadata) as { version?: string; offset?: number; packetId?: string; kind?: string };
+      if (metadata.kind === 'comments' && metadata.version) {
+        // A comment hit is shown around the matched terms, which may lie past one excerpt's length.
+        const found = store.has(metadata.version) ? (await store.readSavedComment(metadata.version, metadata.offset ?? 0, firstMatchSpan(row), pages)).packets : [];
+        const excerpt = found[0]?.excerpts[0];
+        if (found[0] && excerpt) {
+          packets.push({ ...found[0], packetId: `search:${excerpt.id}`, excerpts: [excerpt], artifacts: [] });
+          seen.add(row.id);
+        }
+        continue;
+      }
       const found = metadata.version
         // Backstop for a version that crossed the limit between the query and this read.
         ? store.has(metadata.version) && !store.transcriptOverLimit(metadata.version)
@@ -197,7 +227,8 @@ export class SessionSearch {
         if (packet.assetVersions?.some((version) => !store.has(version))) continue;
         const excerpts = packet.excerpts.filter((excerpt) => excerpt.id === row.id);
         if (!excerpts.length) continue;
-        packets.push({ ...packet, packetId: `search:${row.id}`, excerpts, artifacts: [] });
+        // A single hit cannot show that its packet repeated one observation across frames, so warn first.
+        packets.push({ ...withVisualProvenanceWarning(packet), packetId: `search:${row.id}`, excerpts, artifacts: [] });
         seen.add(row.id);
         break;
       }
@@ -239,7 +270,7 @@ export class SessionSearch {
       .withContext('evidence', {
         provider: {
           get: async () =>
-            'Search transcript passages and saved visual/comment analysis across session assets. Queries match all words. Results contain version-specific citation IDs; older versions are labelled.',
+            'Search transcript passages, every saved comment on fetched comment pages, and saved visual analysis across session assets. Queries match all words, for example an author name. Results contain version-specific citation IDs; older versions are labelled.',
           search: async (query) => {
             check();
             const found = await this.searchEvidence(store, query);
@@ -267,4 +298,8 @@ export class SessionSearch {
       }),
     };
   }
+}
+
+function queryTokens(query: string): string[] {
+  return query.slice(0, 200).match(/[\p{L}\p{N}_]+/gu)?.slice(0, 20) ?? [];
 }

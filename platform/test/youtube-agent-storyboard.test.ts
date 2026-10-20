@@ -322,7 +322,7 @@ describe('storyboard agent tool', () => {
 });
 
 describe('visual evidence presented to synthesis', () => {
-  it('preserves late distinct findings when earlier findings have repeated frame citations', async () => {
+  it('preserves late distinct findings ahead of repeated single-frame observations and discloses the cut', async () => {
     const { evidencePacketForModel, finalizationEvidenceForModel } = await import('../src/agents/runtime/model-evidence');
     const ctx = context();
     const sheet = storyboard.sheets[0]!;
@@ -331,16 +331,19 @@ describe('visual evidence presented to synthesis', () => {
         { ...sheet, firstFrameIndex: 0, frameCount: 25, columns: 5, rows: 5 },
         { ...sheet, firstFrameIndex: 100, frameCount: 2, columns: 5, rows: 5 },
       ] } });
+    const repeated = (observation: string, frames: number[]) => frames.map(frame => ({ observation, frameIndexes: [frame] }));
     ctx.analyzeStoryboard = async () => ({ findings: [
-      { observation: 'Early editor.', frameIndexes: [0, 1, 2] },
-      { observation: 'Large presenter.', frameIndexes: [6, 7, 8] },
-      { observation: 'Another layout.', frameIndexes: [9, 10, 11] },
-      { observation: 'Final screen.', frameIndexes: [100, 101] },
+      ...repeated('Early editor.', [0, 1, 2]),
+      ...repeated('Large presenter.', [6, 7, 8]),
+      ...repeated('Another layout.', [9, 10, 11]),
+      ...repeated('Final screen.', [100, 101]),
     ], warnings: [] });
     const packet = await retrieveAndAnalyze({ videoId: storyboard.videoId, maxSheets: 2, focus: 'Overview' }, ctx, 'overview');
     const projected = evidencePacketForModel(packet);
     expect(projected.excerpts).toHaveLength(8);
     expect(projected.excerpts!.slice(0, 4).map(e => e.startMs)).toEqual([0, 30000, 45000, 500000]);
+    expect(projected.visualDelivery).toEqual({ observationsShown: 8, observationsSaved: 11 });
+    expect(projected.warnings.map(warning => warning.code)).toContain('VISUAL_CONTEXT_TRUNCATED');
     expect(projected.visualCoverage).toMatchObject({ selection: { mode: 'indexes' },
       sampledRanges: [{ startMs: 0, endMs: 120000 }, { startMs: 500000, endMs: 505000 }] });
     const finalizer = finalizationEvidenceForModel([packet], 20000);

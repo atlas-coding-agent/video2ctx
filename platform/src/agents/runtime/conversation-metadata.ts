@@ -73,6 +73,21 @@ export function metadataForConversation(records: readonly { packet: EvidencePack
   return selected;
 }
 
+/** Generated memory IDs predate packet provenance. Reject collisions rather than
+ * reconstructing a delivered observation from an arbitrary same-millisecond packet. */
+export function unambiguousMetadataRecords<T extends { packet: EvidencePacket; recordedAt: number }>(records: readonly T[], deliveredIds: ReadonlySet<string>): T[] {
+  const candidates = records.flatMap(record => metadataForConversation([record])
+    .filter(snapshot => deliveredIds.has(snapshot.packetId))
+    .map(snapshot => ({ record, id: snapshot.packetId, content: JSON.stringify(snapshot) })));
+  const contents = new Map<string, Set<string>>();
+  for (const candidate of candidates) {
+    const values = contents.get(candidate.id) ?? new Set<string>();
+    values.add(candidate.content);
+    contents.set(candidate.id, values);
+  }
+  return candidates.filter(candidate => contents.get(candidate.id)?.size === 1).map(candidate => candidate.record);
+}
+
 /** Current-run metadata supersedes historical observations of the same video. */
 export function preferCurrentMetadata(packets: readonly EvidencePacket[]): EvidencePacket[] {
   const currentVideos = new Set(packets.filter(packet => packet.kind === 'youtube_video' && !packet.packetId.startsWith('memory:'))

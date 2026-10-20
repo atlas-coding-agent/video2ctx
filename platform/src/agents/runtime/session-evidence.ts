@@ -4,8 +4,12 @@ import type { VerifiedImage } from '../../lib/verified-image';
 import { SessionSearch } from './session-search';
 import { VideoTooLongError } from './video-duration-limit';
 import type { ToolSet } from 'ai';
-import type { Transcript } from 'all-things-youtube';
+import type { Comment, Transcript } from 'all-things-youtube';
 import { completeTranscriptEvidence } from '../providers/youtube/tools/get-video-transcript';
+import { commentPageSlice, commentPassage, commentSearchText } from '../providers/youtube/tools/get-video-comments';
+import { COMMENT_READ_LIMIT, collectionRetrieval } from './collection-coverage';
+import { withVisualProvenanceWarning } from './model-evidence';
+import type { MatchSpan } from './search-highlight';
 import { sha256 } from '../../lib/http';
 import type { CachedResult } from '../../lib/youtube';
 import { memoryUpdateSchema, evidencePacketSchema, type EvidencePacket } from '../contracts';
@@ -166,17 +170,23 @@ export class SessionEvidenceStore implements SessionAccess {
     const generation = this.generation();
     const rows = this.sql
       .exec<{ version: string; video_id: string; details_json: string }>(
-        `SELECT version, video_id, details_json FROM session_assets WHERE kind='transcript'
+        `SELECT version, kind, video_id, details_json FROM session_assets WHERE kind IN ('transcript','comments')
       AND version NOT IN (SELECT version FROM session_search_assets)`,
       )
-      .toArray();
-    for (const { version, video_id: videoId, details_json: details } of rows) {
+      .toArray() as { version: string; kind: SessionAssetKind; video_id: string; details_json: string }[];
+    for (const { version, kind, video_id: videoId, details_json: details } of rows) {
       // Over-limit transcripts saved before the limit existed stay out of the search index.
-      if (this.overLimit({ kind: 'transcript', videoId, details: JSON.parse(details) })) continue;
-      const transcript = (await this.read(version)) as Transcript | null;
+      if (this.overLimit({ kind, videoId, details: JSON.parse(details) })) continue;
+      const value = await this.read(version);
       if (generation !== this.generation())
         throw new Error('Session evidence changed during indexing. Retry the search.');
-      if (transcript) this.indexTranscript(version, transcript);
+      if (!value) continue;
+      if (kind === 'transcript') this.indexTranscript(version, value as Transcript);
+      else {
+        // Index every saved comment by its whole body and author, never a shortened excerpt.
+        const comments = savedComments(value);
+        if (comments) this.search.indexAsset(version, comments.map(commentSearchText), { kind: 'comments' });
+      }
     }
   }
   private indexTranscript(version: string, transcript: Transcript) {
@@ -522,16 +532,121 @@ export class SessionEvidenceStore implements SessionAccess {
         nextOffset: offset + page.length < matching.length ? offset + page.length : undefined,
       };
     }
+    if (asset.kind === 'comments') return this.readCommentEvidence(asset, offset, query);
     const packets = this.evidence(version);
     const selected = packets
       .flatMap((packet) => {
         const matching = query
           ? packet.excerpts.filter((e) => e.text.toLowerCase().includes(query.toLowerCase()))
           : packet.excerpts;
-        return matching.length ? [{ ...packet, excerpts: matching.slice(offset, offset + 30) }] : [];
+        // Judge legacy frame ownership on the whole packet, before narrowing hides repeated observations.
+        return matching.length ? [{ ...withVisualProvenanceWarning(packet), excerpts: matching.slice(offset, offset + 30) }] : [];
       })
       .slice(0, 4);
     return { packets: selected, needsInspection: selected.length === 0 };
+  }
+  /**
+   * A bounded read of one saved comment page, by offset and optional literal text. A query
+   * matches the whole body and the author; matching long comments return the passage
+   * around the match with their attribution.
+   */
+  private async readCommentEvidence(asset: SessionAsset, offset: number, query?: string) {
+    const comments = await this.savedCommentPage(asset);
+    const needle = query?.trim().toLowerCase();
+    const positions = comments.map((comment, position) => ({ comment, position }))
+      .filter(({ comment }) => !needle || commentSearchText(comment).toLowerCase().includes(needle));
+    const slice = commentPageSlice(positions, offset, COMMENT_READ_LIMIT);
+    const packet = await this.commentPacket(asset, slice.page.map(({ comment: entry }) => entry), needle ? [needle] : [],
+      `session:${asset.version}:${slice.start}:${COMMENT_READ_LIMIT}:${await sha256(query ?? '')}`, {
+        savedPageCount: comments.length,
+        ...(query ? { matchingCount: positions.length } : {}),
+        ...(slice.nextOffset !== undefined ? { nextOffset: slice.nextOffset } : {}),
+        // With a query, counts and offsets count matching entries, not saved-page positions.
+        // Without one they are page positions, readable from this exact version.
+        collection: collectionRetrieval({ fetchedCount: positions.length, retainedCount: slice.page.length,
+          continuationAccepted: true, pageOffset: slice.start, nextPageOffset: slice.nextOffset,
+          ...(needle ? { matchesOnly: true } : { pageVersion: slice.nextOffset !== undefined ? asset.version : undefined }) }),
+      });
+    this.savePacket(packet);
+    return { packets: [packet], nextOffset: slice.nextOffset };
+  }
+  /**
+   * A per-search cache of saved comment pages. Versions are content-addressed and never
+   * change, so a parsed page stays valid for as long as its own version exists.
+   */
+  commentPageCache(): CommentPageCache {
+    return { pages: new Map() };
+  }
+  /**
+   * One saved comment for a search hit, shown around the span search reported as `rawMatch`.
+   * A hit whose own page was deleted or is unreadable returns no packet. A read interrupted
+   * by deleting another asset or memory is retried, so that deletion never drops this hit;
+   * if the session keeps changing, the search fails with a retry message instead.
+   */
+  async readSavedComment(version: string, position: number, rawMatch: MatchSpan | undefined, cache?: CommentPageCache) {
+    const load = () => {
+      const loading = this.loadCommentPage(version);
+      cache?.pages.set(version, loading);
+      return loading;
+    };
+    let page = await (cache?.pages.get(version) ?? load());
+    for (let attempt = 1; page === 'interrupted' && attempt < COMMENT_PAGE_READ_ATTEMPTS; attempt += 1) page = await load();
+    if (page === 'interrupted') {
+      cache?.pages.delete(version);
+      throw new Error('Session evidence changed during the search. Retry the search.');
+    }
+    // Never serve a page from memory after its own version is deleted.
+    if (!page || !this.has(version)) return { packets: [] };
+    const comment = page.comments[position];
+    if (!comment) return { packets: [] };
+    const packet = await this.commentPacket(page.asset, [{ comment, position, rawMatch }], [], undefined, { savedPageCount: 1 }, page.current);
+    this.savePacket(packet);
+    return { packets: [packet] };
+  }
+  /**
+   * The parsed page, undefined when it is not a readable comment page, or 'interrupted' when
+   * another deletion fenced the read while this version still exists.
+   */
+  private async loadCommentPage(version: string): Promise<CommentPage | 'interrupted' | undefined> {
+    const asset = this.brief().assets.find((item) => item.version === version);
+    if (asset?.kind !== 'comments') return undefined;
+    const generation = this.generation();
+    const value = await this.read(version);
+    if (value === null) return generation !== this.generation() && this.has(version) ? 'interrupted' : undefined;
+    const comments = savedComments(value);
+    return comments && { asset, comments, current: this.currentVersions().has(version) };
+  }
+  private async savedCommentPage(asset: SessionAsset): Promise<Comment[]> {
+    const value = await this.read(asset.version);
+    const comments = value === null ? undefined : savedComments(value);
+    if (!comments) throw new Error('Session asset is unavailable or deleted.');
+    return comments;
+  }
+  /**
+   * Without `packetId`, the packet is named after its single excerpt, so repeated searches
+   * that show the same passage replace one saved row instead of adding another.
+   */
+  private async commentPacket(asset: SessionAsset, entries: Array<{ comment: Comment; position: number; rawMatch?: MatchSpan }>, terms: readonly string[],
+    packetId: string | undefined, data: Record<string, unknown>, current = this.currentVersions().has(asset.version)) {
+    const sourceId = `youtube:${asset.videoId}:comments`;
+    // Version-specific IDs: a refreshed page can reuse comment IDs with different text.
+    // A passage that does not start at the body start has its own ID, so one ID never names two texts.
+    const excerpts = entries.map(({ comment, position, rawMatch }) => {
+      const passage = commentPassage(comment, terms, rawMatch);
+      return { id: `evidence:${asset.version}:${position}${passage.start === undefined ? '' : `:${passage.start}`}`, sourceId, text: passage.text };
+    });
+    return evidencePacketSchema.parse({
+      packetId: packetId ?? `session:${excerpts[0]!.id}`,
+      kind: 'youtube_comments',
+      assetVersions: [asset.version],
+      sources: [{ id: sourceId, provider: 'youtube', kind: 'comments', videoId: asset.videoId,
+        url: `https://www.youtube.com/watch?v=${asset.videoId}` }],
+      excerpts,
+      artifacts: [{ type: 'youtube_comments', title: `Saved comments for ${asset.videoId}`, data: { returnedCount: entries.length, ...data } }],
+      warnings: current ? [] : [{ code: 'SUPERSEDED_SESSION_EVIDENCE',
+        message: 'This evidence refers to an older stored comment page. Use the current version for current facts.' }],
+      usage: [],
+    });
   }
   alias(key: string, version: string) {
     if (this.has(version)) this.sql.exec('INSERT OR REPLACE INTO session_asset_keys VALUES (?, ?)', key, version);
@@ -548,6 +663,17 @@ export class SessionEvidenceStore implements SessionAccess {
       )
       .toArray())
       this.alias(row.resource_key, version);
+  }
+  /** One exact saved version of the given kind and video, as a session reuse. */
+  async lookupVersion<T>(version: string, kind: SessionAssetKind, videoId: string): Promise<CachedResult<T> | undefined> {
+    const asset = this.assetInfo(version);
+    if (!asset || asset.kind !== kind || asset.videoId !== videoId) return undefined;
+    const value = await this.read(version);
+    return value === null ? undefined : { value: value as T, cacheStatus: 'hit', sessionReused: true, assetVersions: [version] };
+  }
+  /** The saved version a reuse key currently points to. */
+  versionForKey(key: string): string | undefined {
+    return this.sql.exec<{ version: string }>('SELECT version FROM session_asset_keys WHERE resource_key=?', key).toArray()[0]?.version;
   }
   async lookup<T>(key: string): Promise<CachedResult<T> | undefined> {
     return visualSpan('session_asset_lookup', () => this.lookupValue<T>(key));
@@ -842,6 +968,26 @@ export async function versionEvidencePacket(packet: EvidencePacket): Promise<Evi
             : {}),
         };
       });
+    // Shared visual observations name their excerpt; keep that reference resolvable.
+    if (Array.isArray(artifact.data.sharedObservations))
+      artifact.data.sharedObservations = artifact.data.sharedObservations.map((shared) =>
+        shared && typeof shared === 'object' && typeof (shared as { excerptId?: unknown }).excerptId === 'string'
+          ? { ...shared, excerptId: ids.get((shared as { excerptId: string }).excerptId) ?? (shared as { excerptId: string }).excerptId }
+          : shared);
   }
   return result;
+}
+
+interface CommentPage { asset: SessionAsset; comments: Comment[]; current: boolean }
+/** Saved comment pages loaded during one search, by version. */
+export interface CommentPageCache {
+  pages: Map<string, Promise<CommentPage | 'interrupted' | undefined>>;
+}
+/** Reads of one comment page per hit, so a burst of unrelated deletions cannot drop it silently. */
+const COMMENT_PAGE_READ_ATTEMPTS = 3;
+
+/** Comments of a saved provider page, or undefined for an unexpected payload. */
+function savedComments(value: unknown): Comment[] | undefined {
+  const comments = (value as { comments?: unknown } | null)?.comments;
+  return Array.isArray(comments) ? comments as Comment[] : undefined;
 }
