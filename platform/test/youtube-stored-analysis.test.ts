@@ -1,7 +1,7 @@
 import { describe, expect, it, vi } from 'vitest';
 import { z } from 'zod';
 import type { AgentToolContext } from '../src/agents/providers/youtube/tool-context';
-import type { EvidencePacket } from '../src/agents/contracts';
+import { evidencePacketSchema, type EvidencePacket } from '../src/agents/contracts';
 import { createCapabilityToolSet } from '../src/agents/providers/youtube/tool-library';
 import { executeGetVideoTranscriptForModel } from '../src/agents/providers/youtube/tools/get-video-transcript';
 import { executeGetVideoFrames } from '../src/agents/providers/youtube/tools/get-video-frames';
@@ -390,4 +390,76 @@ describe('saved-analysis input billing', () => {
     expect(deliverSavedAssets).not.toHaveBeenCalled();
     expect(analyst(context, 'transcript')).not.toHaveBeenCalled();
   });
+});
+
+ it('keeps warnings from every selected saved storyboard sheet and deduplicates them', async () => {
+  const { context, store, storyboard } = setup();
+  const versions = [0, 1].map(index => store.put('storyboard_sheet', videoId, {
+    ...storyboard, frameCount: 4,
+    manifest: { ...storyboard.manifest, totalSheets: 2, lastSampleMs: 3000 },
+    sheets: [{ ...storyboard.sheets[0], firstFrameIndex: index * 2 }],
+    meta: { partial: true, warnings: [`Sheet ${index} is blurred.`, 'Shared warning.'] },
+  }, { sheetIndex: index, manifestVersion: 'two-sheets' }));
+  const packet = await executeAnalyzeVideoStoryboard({ assetVersions: versions, focus: 'Read chart' }, context, 'warnings');
+  expect(packet.warnings.filter(warning => warning.code === 'PARTIAL_STORYBOARD').map(warning => warning.message).sort())
+    .toEqual(['Shared warning.', 'Sheet 0 is blurred.', 'Sheet 1 is blurred.']);
+});
+
+it('caps the final saved-storyboard warnings after combining valid per-sheet inputs', async () => {
+  const { context, store, storyboard } = setup();
+  const versions = [0, 1, 2].map(index => store.put('storyboard_sheet', videoId, {
+    ...storyboard, frameCount: 6,
+    manifest: { ...storyboard.manifest, totalSheets: 3, lastSampleMs: 5000 },
+    sheets: [{ ...storyboard.sheets[0], firstFrameIndex: index * 2 }],
+    meta: { partial: true, warnings: Array.from({ length: 20 }, (_, n) => `Sheet ${index} warning ${n}`) },
+  }, { sheetIndex: index, manifestVersion: 'three-sheets' }));
+  store.saved.get(versions[0]!)!.asset.current = false;
+  const packet = await executeAnalyzeVideoStoryboard({ assetVersions: versions, focus: 'Read chart' }, context, 'warning-cap');
+  expect(packet.warnings).toHaveLength(50);
+  expect(packet.warnings[0]?.code).toBe('SUPERSEDED_SESSION_EVIDENCE');
+  expect(packet.warnings.some(warning => warning.message.startsWith('Sheet 2'))).toBe(true);
+});
+
+
+it.each(['frames', 'storyboard', 'inspection-transcript'] as const)('%s wires retries to saved analysis without retrieving again', async kind => {
+  const { context, provider } = setup();
+  const model = kind === 'frames' ? context.analyzeFrames! : kind === 'storyboard' ? context.analyzeStoryboard!
+    : context.transcriptPolicy.mode === 'contextual_analysis' ? context.transcriptPolicy.analyze : undefined!;
+  vi.mocked(model).mockRejectedValueOnce(new Error('temporary analysis failure'));
+  if (kind === 'inspection-transcript') {
+    context.analyzeTranscript = context.transcriptPolicy.mode === 'contextual_analysis' ? context.transcriptPolicy.analyze : undefined;
+    context.transcriptPolicy = { mode: 'complete_transcript' };
+  }
+  let retry: import('../src/agents/providers/youtube/tool-context').EvidenceToolExecution['retrySavedAnalysis'];
+  context.executeEvidenceTool = async execution => {
+    if (execution.retrySavedAnalysis) retry = execution.retrySavedAnalysis;
+    return execution.execute();
+  };
+  const packet = kind === 'frames' ? await executeGetVideoFrames({ videoId, timestampsMs: [0], analysis: 'Read chart' }, context, 'first')
+    : kind === 'storyboard' ? await executeGetVideoStoryboard({ videoId, analysis: 'Read chart' }, context, 'first')
+    : await executeGetVideoTranscriptForModel({ videoId, analysis: 'Read chart' }, context, 'first');
+  expect(packet.warnings.some(warning => warning.code === 'RETRIEVAL_ANALYSIS_FAILED')).toBe(true);
+  const recovered = await retry!(packet);
+  expect(recovered.warnings.some(warning => warning.code === 'RETRIEVAL_ANALYSIS_FAILED')).toBe(false);
+  expect(recovered.excerpts.length).toBeGreaterThan(0);
+  expect(model).toHaveBeenCalledTimes(2);
+  expect(kind === 'frames' ? provider.frames : kind === 'storyboard' ? provider.storyboard : provider.transcript).toHaveBeenCalledTimes(1);
+});
+
+
+it.each(['frame', 'transcript'] as const)('caps final saved %s warnings and retains the superseded warning', async kind => {
+  const { context, store, versions } = setup();
+  const version = versions[kind];
+  store.saved.get(version)!.asset.current = false;
+  // Boundary contract test: current production analysts emit fewer warnings.
+  const warnings = Array.from({ length: kind === 'frame' ? 49 : 50 }, (_, index) => `Warning ${index}`);
+  if (kind === 'frame') context.analyzeFrames = async () => ({ findings: [], warnings });
+  else if (context.transcriptPolicy.mode === 'contextual_analysis') {
+    const original = context.transcriptPolicy.analyze;
+    context.transcriptPolicy.analyze = async input => ({ ...await original(input), warnings });
+  }
+  const packet = await analyze(kind, version, context);
+  expect(packet.warnings).toHaveLength(50);
+  expect(packet.warnings[0]?.code).toBe('SUPERSEDED_SESSION_EVIDENCE');
+  expect(evidencePacketSchema.parse(JSON.parse(JSON.stringify(packet))).warnings).toHaveLength(50);
 });

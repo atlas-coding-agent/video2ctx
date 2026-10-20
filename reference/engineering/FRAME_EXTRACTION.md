@@ -42,8 +42,9 @@ creates request-local frame receipts tied to the bucket, immutable catalog refer
 and exact frame payload. Session attachment can consume a matching receipt without
 downloading the newly saved images again. Receipts cannot be serialized or supplied
 by tool input. Missing, mismatched, cache-hit, and stale receipts use the existing
-catalog verification path. Later session reads still load the immutable stored
-version. Session generation checks, cancellation, and preview revocation are retained.
+catalog verification path. Later session reads load the immutable stored
+version. Within the same research run, analysis can reuse the bounded cache of published
+frame payloads while checking current session ownership and deletion generation. Session generation checks, cancellation, and preview revocation are retained.
 Preview references can resolve either a shared JPEG or the JPEG inside a frame
 object. They remain private, individually revocable R2 records. Roll back decoding
 with the backend flag while retaining this compatible reader; older Worker builds
@@ -611,3 +612,15 @@ work lifetime and concurrent admission under slowdown. Before moving release off
 the critical path, track its completion and verify that subsequent acquisitions
 do not wait on finished work. Neither change is a prerequisite for the corrected
 preview and recovery paths, but sustained-load validation remains outstanding.
+
+
+## Optional analysis during persistence
+
+Agent frame and storyboard retrieval accept an optional `analysis` question. The
+private coordinator signals when the full requested selection is available, while
+catalog writes may still be pending. The tool analyzes these bytes and returns
+findings only after persistence and session attachment succeed. Retrieval-only and
+public API responses retain their existing persistence guarantee. A save failure
+rejects the combined result; an analyst failure returns saved handles with an
+explicit retry warning. See [session evidence](SESSION_EVIDENCE.md#retrieval-and-analysis-in-one-call)
+for deletion fencing, billing, coalesced callers and test coverage.
