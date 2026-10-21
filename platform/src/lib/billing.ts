@@ -8,6 +8,9 @@ import type { CreditEnv } from './entitlements';
 import { ApiError, now, sha256 } from './http';
 import { paymentReceipt, refundReconciliationStatements } from './credit-continuity';
 
+// Refunds retain the standard balance reset, independent of temporary signup offers.
+const REFUND_STARTER_CREDITS = 1000;
+
 interface BillingAccountRow {
   plan: 'starter' | 'builder';
   has_payment_history: number;
@@ -324,7 +327,7 @@ export async function applyRefundedOrder(env: PaymentWebhookEnv, payload: Webhoo
     return;
   }
 
-  const starterCredits = Number(env.STARTER_ONBOARDING_CREDITS);
+  const starterCredits = REFUND_STARTER_CREDITS;
   const subscription = order.subscription;
   const eventAt = payload.timestamp.getTime();
   const state: BillingState = {
@@ -360,7 +363,7 @@ async function reconcileDeletedRefund(
   await env.DB.batch([
     ...refundReconciliationStatements(env.DB, {
       orderId: payload.data.id, userId, customerId,
-      eventAt: payload.timestamp.getTime(), starterCredits: Number(env.STARTER_ONBOARDING_CREDITS),
+      eventAt: payload.timestamp.getTime(), starterCredits: REFUND_STARTER_CREDITS,
     }),
     refundEventStatement(env.DB, eventId, payload.data.id, await eventFingerprint(payload)),
   ]);

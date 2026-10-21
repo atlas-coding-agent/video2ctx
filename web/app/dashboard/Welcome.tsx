@@ -26,7 +26,7 @@ export function Welcome({ name }: { name?: string | null }) {
     toast(firstName ? `Welcome to video2ctx, ${firstName}! 🎉` : 'Welcome to video2ctx! 🎉', {
       id: 'welcome',
       className: TOAST_CLASS,
-      description: "1,000 free credits are in your account. Can't wait to see what you build.",
+      description: "Your $10 launch gift is ready. We've added 5,000 free credits to your account.",
     });
 
     // Burst from just inside the toast's top edge, centred, once it has slid into place.

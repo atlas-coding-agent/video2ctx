@@ -914,6 +914,7 @@ test('signup welcome celebration still works after sharing confetti with checkou
   await expect(welcome).toHaveCount(0);
   await page.getByRole('button', { name: 'Skip for now' }).click();
   await expect(welcome).toBeVisible();
+  await expect(welcome).toContainText("Your $10 launch gift is ready. We've added 5,000 free credits to your account.");
   await expect(page.locator('body > [data-confetti]')).toHaveCount(1);
   await expect(page.getByRole('dialog', { name: 'Welcome to Builder!' })).toHaveCount(0);
   await expect(page).toHaveURL(/\/dashboard\/settings$/);

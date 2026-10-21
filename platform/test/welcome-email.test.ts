@@ -44,7 +44,7 @@ describe('welcome email queueing', () => {
     return {
       env: {
         APP_ORIGIN: 'https://www.video2ctx.dev',
-        STARTER_ONBOARDING_CREDITS: '1000',
+        STARTER_ONBOARDING_CREDITS: '5000',
         WELCOME_EMAIL_FROM: 'himanshu@notify.video2ctx.dev',
         EMAIL_TASKS: { send },
       } as unknown as Env,
@@ -70,7 +70,7 @@ describe('welcome email queueing', () => {
     });
     expect(message.unsubscribeUrl).toBeUndefined();
     expect(message.html).toContain('https://www.video2ctx.dev/dashboard/sessions');
-    expect(message.text).toContain('1,000 free credits');
+    expect(message.text).toContain('5,000 free credits');
   });
 
   test('uses a neutral subject when the account has no name', async () => {

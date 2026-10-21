@@ -19,7 +19,7 @@ sequenceDiagram
     participant App as Platform Worker
     participant DB as D1
     App->>DB: Create user at signup
-    Note over DB: Create balance row and grant 1,000 credits atomically
+    Note over DB: Create balance row and grant signup credits atomically
     DB-->>App: Account ready
     App->>DB: Insert reservation if stored balance covers cost
     Note over DB: Insert ledger entry and trigger balance deduction<br/>Commit both or roll back both
@@ -56,7 +56,7 @@ confirmed before changing shared state.
 
 Apply `platform/migrations/0018_signup_credit_grant.sql` before deploying the
 Worker that removes lazy grants. The standard `deploy:production` command runs
-account migrations first. New user creation, the balance row, and the 1,000-credit
+account migrations first. New user creation, the balance row, and the recorded
 signup grant commit together. A grant failure rolls back signup so it can retry;
 an account cannot be created successfully without its grant.
 
@@ -67,11 +67,18 @@ they have spent their allowance. Existing adjustments count toward this one-time
 catch-up. The unique ledger operation prevents an old Worker from granting twice
 during rollout. Retain the trigger on Worker rollback.
 
-The SQL trigger uses the current 1,000-credit signup policy. Future allowance
-changes must update the trigger in a new migration and update
-`STARTER_ONBOARDING_CREDITS` together; changing the environment variable alone
-only affects entitlement display and refund policy. Builder top-ups, refund
-resets, and per-operation credit prices are unchanged.
+Migration `0028_launch_signup_credits.sql` changes the signup trigger from 1,000
+to 5,000 credits. It has no backfill or date check. Existing balances and returning
+account carryovers remain unchanged. `STARTER_ONBOARDING_CREDITS` is also 5,000
+for the current Starter offer and welcome email. Refund resets remain 1,000.
+
+End the launch week manually with a new migration restoring 1,000 for future
+signups, and reset the configuration and launch copy in the same PR. Keep existing
+balances intact. The standard hero copy is "Get started for free" and "1,000
+credits · No card required". Restore the welcome description to "1,000 free credits
+are in your account. Can't wait to see what you build." Remove the Product Hunt
+navbar badge and mobile menu link, and restore the pricing, FAQ, demo, and closing
+copy. There is no scheduled expiry or automatic copy change.
 
 ## Manual credits
 
@@ -179,14 +186,14 @@ cascades to both their account and ledger.
 ## Deleted-account credit continuity
 
 Migration `0026_deleted_accounts.sql` replaces the signup grant trigger. A new
-email receives the one-time 1,000-credit grant. A returning email receives an
+email receives the one-time signup grant, raised to 5,000 by migration 0028. A returning email receives an
 `adjustment` with operation ID `returning-account:v1`, equal to the newest
 recorded deletion's unclaimed carryover balance. Database insertion order, rather
 than wall-clock timestamps, determines the latest record using a monotonic
 sequence. Signup claims that snapshot for the new user ID in the same transaction.
 The claim survives admin email changes. A signup using an already claimed email
 snapshot starts at zero and cannot claim an older snapshot or another free grant.
-Zero, negative and balances above 1,000 are preserved. Signup, the opening ledger entry and the projected account balance
+Zero, negative and balances above the signup allowance are preserved. Signup, the opening ledger entry and the projected account balance
 remain one atomic D1 operation. Ordinary balance reads and reservations keep
 their existing round trips. Builder subscription state is not restored.
 
