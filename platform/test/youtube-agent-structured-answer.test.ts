@@ -185,6 +185,15 @@ describe('structured answer citations', () => {
   it.each(['The', "I'll look up the transcript."])('rejects a filler-only answer for one repair: %s', text => {
     expect(() => renderStructuredAnswer({ ...base, blocks: [{ text, evidenceIds: ['e1'] }] })).toThrow(/fragment or promise/);
   });
+  // A placeholder would otherwise render as citation chips with no answer and complete the run.
+  it.each(['…', '...', '… [cite:ref_1]', '【ref_1】…', '[ref_1] [ref_2]', '(ref_1) — ref_2', '**…**', '\u200b', '[cite:ref_1'])(
+    'rejects a placeholder-only answer for one repair: %j', text => {
+      expect(() => renderStructuredAnswer({ ...base, blocks: [{ text, evidenceIds: ['e1'] }] }, new Map([['ref_1', 'e1'], ['ref_2', 'e1']])))
+        .toThrow(/placeholder with no answer text/);
+    });
+  it.each(['Sí.', 'El orador recomienda grabar en 4K.', '42 [cite:ref_1]', '【注意】 [cite:ref_1]'])('keeps a short answer with text in any language: %s', text => {
+    expect(() => renderStructuredAnswer({ ...base, blocks: [{ text, evidenceIds: ['e1'] }] }, new Map([['ref_1', 'e1']]))).not.toThrow();
+  });
   it('renders bounded provisional text without model-written source markers', () => {
     expect(renderPartialAnswer({ blocks: [
       { text: 'First draft [cite:ref_1]' },
@@ -210,6 +219,9 @@ describe('structured answer citations', () => {
   it('flags filler-only answers as a signal', () => {
     expect(fillerOnlyAnswer({ blocks: [{ text: "I'll look up the transcript." }] })).toBe(true);
     expect(fillerOnlyAnswer({ blocks: [{ text: 'The' }, { text: 'No.' }] })).toBe(false);
+    expect(fillerOnlyAnswer({ blocks: [{ text: '… [cite:e1]' }, { text: '...' }] })).toBe(true);
+    // One substantive block is an answer; any further placeholder is a formatting issue.
+    expect(fillerOnlyAnswer({ blocks: [{ text: '… [cite:e1]' }, { text: 'La respuesta. [cite:e1]' }] })).toBe(false);
   });
   it('allows a complete long paragraph without forcing a citation into a word at 2000 characters', () => {
     const text = 'A complete supported sentence. '.repeat(75).trim();

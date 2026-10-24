@@ -52,11 +52,17 @@ export function numberedItemsMismatch(output: Pick<z.infer<typeof finalizationOu
   return numbers.size !== expected || !Array.from({ length: expected }, (_, index) => index + 1).every(number => numbers.has(number));
 }
 
-/** An answer made only of filler or a promise of future work is not an answer. */
+/** Citation markers in every form a model may write. They render as source chips, not prose. */
+const CITATION_MARKUP = /\[cite:[^\]]*\]?|\(source marker:[^\]]*\]?|【\s*ref_[^】]*】?|\[\s*ref_[^\]]*\]?|\(\s*ref_[^)]*\)?|\bref_\d+\b/giu;
+
+/** An answer made only of filler, a promise of future work, or a placeholder is not an answer.
+ * A placeholder holds no letter or digit in any language once its citation markers are
+ * removed, such as "…" with citations: it would render as citation chips with no answer. */
 export function fillerOnlyAnswer(output: { blocks: { text: string }[] }): boolean {
   const fragment = /^(?:the|a|an|and|but|because|however|therefore)[,:]?$/i;
   const promise = /^(?:I(?:['’]ll| will| am going to)|Let me) (?:first )?(?:look up|check|search|retrieve|fetch|inspect|read|analy[sz]e)\b[^.!?]*(?:[.!?])?$/i;
-  return output.blocks.every(block => fragment.test(block.text.trim()) || promise.test(block.text.trim()));
+  const placeholder = (text: string) => !/[\p{L}\p{N}]/u.test(text.replace(CITATION_MARKUP, ''));
+  return output.blocks.every(block => fragment.test(block.text.trim()) || promise.test(block.text.trim()) || placeholder(block.text));
 }
 
 /** Keep the complete blocks of an answer cut off at the output-token limit. A block
@@ -254,7 +260,7 @@ export function renderStructuredAnswer(value: z.infer<typeof structuredAnswerSch
     : value.intent === 'context_answer' ? contextAnswerSchema.parse(value) : structuredAnswerSchema.parse(value);
   // Not an answer at all: the one content check that still earns a repair.
   if (fillerOnlyAnswer(input)) throw new z.ZodError([{ code: 'custom', path: ['blocks'],
-    message: 'The answer is only a fragment or promise of future work. Answer the request now, or state the concrete missing context. Do not report planned work as completed.' }]);
+    message: 'The answer is only a fragment or promise of future work, or a placeholder with no answer text. Answer the request now, or state the concrete missing context. Do not report planned work as completed.' }]);
   const answer = input.blocks.map(block => {
     const declared = new Set(block.evidenceIds.map(id => aliases.get(id) ?? id));
     const placed = new Set<string>();
