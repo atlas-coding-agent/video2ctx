@@ -186,13 +186,24 @@ describe('structured answer citations', () => {
     expect(() => renderStructuredAnswer({ ...base, blocks: [{ text, evidenceIds: ['e1'] }] })).toThrow(/fragment or promise/);
   });
   // A placeholder would otherwise render as citation chips with no answer and complete the run.
-  it.each(['…', '...', '… [cite:ref_1]', '【ref_1】…', '[ref_1] [ref_2]', '(ref_1) — ref_2', '**…**', '\u200b', '[cite:ref_1'])(
+  const placeholderAliases = new Map([['ref_1', 'e1'], ['ref_2', 'e2']]);
+  it.each(['…', '...', '… [cite:ref_1]', '【ref_1】…', '[ref_1] [ref_2]', '(ref_1) — ref_2', '**…**', '\u200b',
+    // The renderer turns a whole supported range into citations, separator word included.
+    'ref_1 through ref_2', 'ref_1 to ref_2', '… (ref_1 thru ref_2).', '[ref_1 through ref_2]'])(
     'rejects a placeholder-only answer for one repair: %j', text => {
-      expect(() => renderStructuredAnswer({ ...base, blocks: [{ text, evidenceIds: ['e1'] }] }, new Map([['ref_1', 'e1'], ['ref_2', 'e1']])))
+      expect(() => renderStructuredAnswer({ ...base, blocks: [{ text, evidenceIds: ['e1'] }] }, placeholderAliases))
         .toThrow(/placeholder with no answer text/);
     });
-  it.each(['Sí.', 'El orador recomienda grabar en 4K.', '42 [cite:ref_1]', '【注意】 [cite:ref_1]'])('keeps a short answer with text in any language: %s', text => {
-    expect(() => renderStructuredAnswer({ ...base, blocks: [{ text, evidenceIds: ['e1'] }] }, new Map([['ref_1', 'e1']]))).not.toThrow();
+  it.each(['Sí.', 'El orador recomienda grabar en 4K.', '42 [cite:ref_1]', '【注意】 [cite:ref_1]',
+    // Code, links, URLs, quotes and unsupported ranges are preserved by the renderer as visible text.
+    '`ref_1`', '"(ref_1)"', '"(ref_1 through ref_2)"', '    [ref_1, ref_2]', '[ref_1](https://example.com)',
+    'https://example.com/ref_1', 'ref_2 to ref_1'])('keeps an answer whose rendered text remains: %j', text => {
+    expect(() => renderStructuredAnswer({ ...base, blocks: [{ text, evidenceIds: ['e1'] }] }, placeholderAliases)).not.toThrow();
+  });
+  it('judges a bare range by the aliases that render it', () => {
+    // Without the aliases the renderer leaves the range as literal text, so it is text.
+    expect(fillerOnlyAnswer({ blocks: [{ text: 'ref_1 through ref_2' }] })).toBe(false);
+    expect(fillerOnlyAnswer({ blocks: [{ text: 'ref_1 through ref_2' }] }, placeholderAliases)).toBe(true);
   });
   it('renders bounded provisional text without model-written source markers', () => {
     expect(renderPartialAnswer({ blocks: [
