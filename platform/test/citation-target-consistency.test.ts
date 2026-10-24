@@ -6,8 +6,9 @@ import { compactAgentResult } from '../src/agents/response';
 import { renderStructuredAnswer } from '../src/agents/structured-answer';
 
 // Synthetic captions shaped like the reported chess session 426fcd5f-11a8-4413-88bb-321f4112cd88.
-// Times match the reported captions; wording is illustrative. Analysis windows start at
-// 0:58 and 1:54 here, the two wrong chip times users saw.
+// Times match the reported captions; wording is illustrative. Analysis windows here start at
+// 0:58 and 1:54, matching two reported chip times. This characterizes a plausible mechanism.
+// The live sessions' stored citation IDs were not inspected, so it does not establish their cause.
 const VIDEO = 'chessPuzzle';
 const caption = (text: string, start: number, end: number) => ({ text, startMs: start * 1000, endMs: end * 1000, durationMs: (end - start) * 1000 });
 const captions = [
@@ -53,7 +54,7 @@ function publish(blocks: Array<{ text: string; evidenceIds: string[] }>) {
 const labelSeconds = (answer: string) => [...answer.matchAll(/\[\d+ · (\d+):(\d{2})\]/g)].map(([, m, s]) => Number(m) * 60 + Number(s));
 
 describe('citation target consistency (session 426fcd5f, synthetic captions)', () => {
-  it('resolves the analyst output into the windows and caption the report describes', () => {
+  it('resolves the synthetic analyst output into two windows and one exact caption', () => {
     expect(analysis.findings.map(item => item.excerptIds)).toEqual([[cueQh2], [window0], [window1]]);
     expect(analysis.excerpts.map(({ id, startMs, endMs }) => [id, startMs, endMs])).toEqual([
       [window0, 58_000, 110_000], [cueQh2, 104_000, 107_000], [window1, 114_000, 167_000]]);
